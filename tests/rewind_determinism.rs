@@ -1,5 +1,6 @@
 use alembic::{Cell, Element, HISTORY_CAPACITY, H, W, World};
 use macroquad::prelude::Vec2;
+use serial_test::serial;
 
 const TEST_SEED: u64 = 0xD3AD_B33F;
 
@@ -61,6 +62,7 @@ fn assert_cells_eq(a: &[Cell], b: &[Cell], context_msg: &str) {
 }
 
 #[test]
+#[serial]
 fn ring_buffer_bounds_hold_and_count_saturates() {
     macroquad::rand::srand(TEST_SEED);
     let mut world = World::new();
@@ -94,6 +96,7 @@ fn ring_buffer_bounds_hold_and_count_saturates() {
 }
 
 #[test]
+#[serial]
 fn stepping_while_rewound_resets_rewind_offset() {
     macroquad::rand::srand(TEST_SEED + 1);
     let mut world = World::new();
@@ -113,6 +116,7 @@ fn stepping_while_rewound_resets_rewind_offset() {
 }
 
 #[test]
+#[serial]
 fn snapshot_storage_is_deep_copy_not_alias() {
     macroquad::rand::srand(TEST_SEED + 2);
     let mut world = World::new();
@@ -134,6 +138,7 @@ fn snapshot_storage_is_deep_copy_not_alias() {
 }
 
 #[test]
+#[serial]
 fn forward_then_rewind_returns_byte_identical_cells() {
     macroquad::rand::srand(TEST_SEED + 3);
     let mut world = World::new();
@@ -153,6 +158,7 @@ fn forward_then_rewind_returns_byte_identical_cells() {
 }
 
 #[test]
+#[serial]
 fn rewind_is_idempotent_at_oldest_boundary() {
     macroquad::rand::srand(TEST_SEED + 4);
     let mut world = World::new();
@@ -174,6 +180,7 @@ fn rewind_is_idempotent_at_oldest_boundary() {
 }
 
 #[test]
+#[serial]
 fn fixed_seed_produces_deterministic_cells() {
     let steps = 8;
     macroquad::rand::srand(TEST_SEED + 5);
@@ -184,20 +191,9 @@ fn fixed_seed_produces_deterministic_cells() {
     let mut b = World::new();
     deterministic_paint_and_step(&mut b, steps);
 
-    let mut a_cells = a.cells.clone();
-    let mut b_cells = b.cells.clone();
-    for cell in &mut a_cells {
-        cell.seed = 0;
-        cell.pressure = 0;
-    }
-    for cell in &mut b_cells {
-        cell.seed = 0;
-        cell.pressure = 0;
-    }
-
     assert_cells_eq(
-        &a_cells,
-        &b_cells,
+        &a.cells,
+        &b.cells,
         "same seed and same inputs should produce identical cell grids",
     );
 }
