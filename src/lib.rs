@@ -103,7 +103,7 @@ pub enum Kind { Empty, Solid, Gravel, Powder, Liquid, Gas, Fire }
 enum ToolMode { Paint, Heat, Vacuum, Pipet, Prefab, Wire }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PrefabKind { Beaker, Box, Battery }
+pub enum PrefabKind { Beaker, Box, Battery }
 
 impl Kind {
     // "Rigid" matter — solids, stones, and powders — can't be pushed aside by
@@ -5979,7 +5979,7 @@ impl World {
     // the given material and per-cell disk thickness. Cells are placed
     // frozen (wires are structural). Empty targets only — won't overwrite
     // existing matter (same protection as the paint tool).
-    fn place_wire_line(
+    pub fn place_wire_line(
         &mut self, x0: i32, y0: i32, x1: i32, y1: i32,
         el: Element, thickness: i32,
     ) {
@@ -6020,7 +6020,7 @@ impl World {
         }
     }
 
-    fn place_prefab(
+    pub fn place_prefab(
         &mut self, cx: i32, cy: i32,
         kind: PrefabKind, el: Element,
         thickness: i32, w: i32, h: i32, rotation: u8,
