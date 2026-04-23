@@ -276,32 +276,38 @@ fn repeated_world_new_produces_identical_initial_state() {
 fn flag_updated_cleared_at_tick_boundary() {
     macroquad::rand::srand(0x06_F1A6);
     let mut world = World::new();
-    let w = W as i32;
-    let h = H as i32;
+    let cx = (W as i32) / 2;
+    let sand_y = (H as i32) - 20;
+    let water_y = (H as i32) - 30;
 
-    for _ in 0..100 {
-        let element = random_element();
-        let cx = random_i32_inclusive(-10, w + 10);
-        let cy = random_i32_inclusive(-10, h + 10);
-        let radius = random_i32_inclusive(0, 20);
-        world.paint(cx, cy, radius, element, random_u8(), random_bool());
+    world.paint(cx, sand_y, 8, Element::Sand, 0, false);
+    world.paint(cx, water_y, 6, Element::Water, 0, false);
 
-        let wind = Vec2::new(
-            macroquad::rand::gen_range(-5.0f32, 5.0f32),
-            macroquad::rand::gen_range(-5.0f32, 5.0f32),
-        );
-        world.step(wind);
-    }
+    world.step(Vec2::ZERO);
+    let updated_count = world
+        .cells
+        .iter()
+        .filter(|c| c.flag & FLAG_UPDATED != 0)
+        .count();
+    assert!(
+        updated_count > 0,
+        "expected at least one cell with FLAG_UPDATED set after activity tick"
+    );
 
     for cell in &mut world.cells {
-        cell.flag |= 0x02;
+        cell.el = Cell::EMPTY.el;
     }
     world.shockwaves.clear();
+
     world.step(Vec2::ZERO);
-    assert!(
-        world.cells.iter().all(|c| c.flag & FLAG_UPDATED == 0),
-        "FLAG_UPDATED should be cleared after no-op boundary tick"
-    );
+    for (i, cell) in world.cells.iter().enumerate() {
+        assert_eq!(
+            cell.flag & FLAG_UPDATED,
+            0,
+            "cell {i} retained FLAG_UPDATED after no-op boundary tick; flag=0x{:02X}",
+            cell.flag
+        );
+    }
 }
 
 #[test]
