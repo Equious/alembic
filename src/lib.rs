@@ -2176,7 +2176,7 @@ impl Element {
 
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub el: Element,
     // When el == Element::Derived, this indexes into the runtime compound
@@ -2266,7 +2266,7 @@ impl Cell {
     }
 }
 
-const HISTORY_CAPACITY: usize = 240;   // ~4 seconds of rewind at 60 fps
+pub const HISTORY_CAPACITY: usize = 240;   // ~4 seconds of rewind at 60 fps
 
 pub struct World {
     pub cells: Vec<Cell>,
@@ -2302,7 +2302,8 @@ pub struct World {
     pub shockwaves: Vec<Shockwave>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
+// Eq omitted: f32 fields block derivation.
 pub struct Shockwave {
     pub cx: f32,
     pub cy: f32,
@@ -2538,7 +2539,7 @@ impl World {
 
     // Capture the current grid into the ring buffer. Called at the end of
     // each completed sim step.
-    fn snapshot(&mut self) {
+    pub fn snapshot(&mut self) {
         self.history[self.history_write].copy_from_slice(&self.cells);
         self.history_write = (self.history_write + 1) % HISTORY_CAPACITY;
         if self.history_count < HISTORY_CAPACITY {
@@ -2549,7 +2550,7 @@ impl World {
 
     // Move the rewind cursor. `delta > 0` goes back in time. Loads the
     // snapshot at the new cursor into `cells`.
-    fn seek(&mut self, delta: i32) {
+    pub fn seek(&mut self, delta: i32) {
         if self.history_count == 0 { return; }
         let max_back = self.history_count - 1;
         let target = (self.rewind_offset as i32 + delta)
