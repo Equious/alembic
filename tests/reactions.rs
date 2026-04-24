@@ -2,6 +2,7 @@
 
 use alembic::{Cell, Element, World, H, W};
 use macroquad::prelude::Vec2;
+use serial_test::serial;
 
 #[inline]
 fn idx(x: i32, y: i32) -> usize {
@@ -270,6 +271,7 @@ fn collect_derived_ids_in_region(
 // -----------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn fuzzed_reactive_mix_completes_without_panic() {
     // Complements tick_robustness.rs by focusing specifically on reactive mixes.
     // Per-reaction chemical correctness is covered by the emergence tests below.
@@ -324,6 +326,7 @@ fn derived_compound_indices_are_valid() {
 }
 
 #[test]
+#[serial]
 fn reactions_do_not_spawn_out_of_bounds() {
     macroquad::rand::srand(0x05A_C102);
     let mut world = World::new();
@@ -366,6 +369,7 @@ fn reactions_do_not_spawn_out_of_bounds() {
 // -----------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn solute_identity_resets_when_amt_zero() {
     macroquad::rand::srand(0x05A_C201);
     let mut world = World::new();
@@ -397,6 +401,7 @@ fn solute_identity_resets_when_amt_zero() {
 }
 
 #[test]
+#[serial]
 fn no_mixed_solutes_per_water_cell() {
     macroquad::rand::srand(0x05A_C202);
     let mut world = World::new();
@@ -431,6 +436,7 @@ fn no_mixed_solutes_per_water_cell() {
 // -----------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn formula_strings_are_unique() {
     macroquad::rand::srand(0x05A_C301);
     let mut world = World::new();
@@ -510,6 +516,7 @@ fn registry_capacity_u8() {
 // -----------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn ca_plus_water_produces_h2_byproduct() {
     macroquad::rand::srand(0x05A_C401);
     let mut world = World::new();
@@ -546,6 +553,7 @@ fn ca_plus_water_produces_h2_byproduct() {
 }
 
 #[test]
+#[serial]
 fn na_plus_water_produces_h2_byproduct() {
     macroquad::rand::srand(0x05A_C402);
     let mut world = World::new();
@@ -581,6 +589,7 @@ fn na_plus_water_produces_h2_byproduct() {
 }
 
 #[test]
+#[serial]
 fn fe_plus_o_plus_water_preserves_h2_when_applicable() {
     macroquad::rand::srand(0x05A_C403);
     let mut world = World::new();
@@ -632,6 +641,7 @@ fn derived_compound_preserves_emergent_byproduct() {
 // -----------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn atom_count_bounded_across_ticks() {
     macroquad::rand::srand(0x05A_C501);
     let mut world = World::new();
@@ -661,6 +671,7 @@ fn atom_count_bounded_across_ticks() {
 }
 
 #[test]
+#[serial]
 fn no_reaction_spawns_atoms_from_nothing() {
     macroquad::rand::srand(0x05A_C502);
     let mut world = World::new();
@@ -692,6 +703,7 @@ fn no_reaction_spawns_atoms_from_nothing() {
 // -----------------------------------------------------------------------------
 
 #[test]
+#[serial]
 fn flammables_do_not_ignite_below_threshold() {
     macroquad::rand::srand(0x05A_C601);
     let mut world = World::new();
@@ -712,6 +724,7 @@ fn flammables_do_not_ignite_below_threshold() {
 }
 
 #[test]
+#[serial]
 fn gunpowder_no_spontaneous_shockwave_below_ignition() {
     macroquad::rand::srand(0x05A_C602);
     let mut world = World::new();
