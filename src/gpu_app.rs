@@ -1074,6 +1074,50 @@ fn vertical_fall(x: u32) {
     }
 }
 
+// Pass 2/3 — diagonal slide for powder/gravel/liquid. Each thread is
+// one column, walks bottom-up. For cells where straight-down was
+// blocked (sand-on-sand from vfall), try diagonally — this is what
+// turns a vertical sand pillar into a triangular pile.
+//
+// Race-free via column parity: pass 2 only acts on even columns,
+// pass 3 only acts on odd. Each pass writes to its own column AND
+// the diagonal target column, but in pass 2 the diagonal target is
+// ODD (even+1 or even-1), and odd columns aren't running — so no
+// races. Same logic in pass 3.
+//
+// Direction alternates by frame parity to avoid one-sided drift.
+fn diagonal_slide(x: u32, parity: u32) {
+    if ((x & 1u) != parity) { return; }
+    let dir: i32 = select(-1, 1, (u.frame & 1u) == 0u);
+    let nx = i32(x) + dir;
+    if (nx < 0 || nx >= i32(u.width)) { return; }
+
+    var y = i32(u.height) - 2;
+    loop {
+        if (y < 0) { break; }
+        let i_here = cell_idx(x, u32(y));
+        let i_below = cell_idx(x, u32(y + 1));
+        let i_diag  = cell_idx(u32(nx), u32(y + 1));
+        let c_here  = cells[i_here];
+        let c_below = cells[i_below];
+        let c_diag  = cells[i_diag];
+
+        if (!cell_frozen(c_here) && !cell_frozen(c_diag)) {
+            let kh = cell_kind(c_here);
+            let kb = cell_kind(c_below);
+            let kd = cell_kind(c_diag);
+            let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
+            let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
+            let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
+            if (h_slides && b_blocks && d_open) {
+                cells[i_here] = c_diag;
+                cells[i_diag] = c_here;
+            }
+        }
+        y = y - 1;
+    }
+}
+
 // Pass 1 — liquid horizontal spread: one thread per row. Walks
 // left-to-right on even frames, right-to-left on odd, swapping
 // liquid with adjacent empty/gas. Each row is independent (no cross-
@@ -1119,10 +1163,18 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x = gid.x;
         if (x >= u.width) { return; }
         vertical_fall(x);
-    } else {
+    } else if (u.pass_id == 1u) {
         let y = gid.x;
         if (y >= u.height - 1u) { return; }
         liquid_spread(y);
+    } else if (u.pass_id == 2u) {
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        diagonal_slide(x, 0u);
+    } else if (u.pass_id == 3u) {
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        diagonal_slide(x, 1u);
     }
 }
 "#;
@@ -1149,12 +1201,12 @@ struct MotionUniforms {
 /// every dispatch see the same value).
 struct MotionComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    pass_uniform_bufs: [wgpu::Buffer; 2],
+    pass_uniform_bufs: [wgpu::Buffer; 4],
     #[allow(dead_code)]
     motion_props_buf: wgpu::Buffer,
     cells_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
-    pass_bind_groups: [wgpu::BindGroup; 2],
+    pass_bind_groups: [wgpu::BindGroup; 4],
     write_idx: usize,
     has_data: [bool; 2],
 }
@@ -1185,9 +1237,11 @@ impl MotionComputeCtx {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        let pass_uniform_bufs: [wgpu::Buffer; 2] = [
+        let pass_uniform_bufs: [wgpu::Buffer; 4] = [
             mk_pass_uniform(0, "alembic-motion-uniforms-vfall"),
             mk_pass_uniform(1, "alembic-motion-uniforms-lspread"),
+            mk_pass_uniform(2, "alembic-motion-uniforms-dslide-even"),
+            mk_pass_uniform(3, "alembic-motion-uniforms-dslide-odd"),
         ];
         let _ = queue;
 
@@ -1238,7 +1292,7 @@ impl MotionComputeCtx {
                 wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
             ],
         });
-        let pass_bind_groups: [wgpu::BindGroup; 2] = [mk_bind(0), mk_bind(1)];
+        let pass_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-motion-shader"),
             source: wgpu::ShaderSource::Wgsl(MOTION_COMPUTE_SHADER.into()),
@@ -1276,34 +1330,29 @@ impl MotionComputeCtx {
         queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&world.cells));
     }
 
-    /// Encode the 2 motion passes for one frame.
+    /// Encode all 4 motion passes for one frame.
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
         let cell_count = W * H;
         let frame_arr = [frame];
         let frame_bytes = bytemuck::cast_slice(&frame_arr);
-        for i in 0..2 {
+        for i in 0..4 {
             queue.write_buffer(&self.pass_uniform_bufs[i], 12, frame_bytes);
         }
-        // Pass 0: vertical fall, 1 thread per column.
-        {
-            let wg = (W as u32 + 63) / 64;
+        let wg_col = (W as u32 + 63) / 64;
+        let wg_row = (H as u32 + 63) / 64;
+        let labels_dispatches = [
+            ("alembic-motion-vfall",       wg_col, 0usize),
+            ("alembic-motion-lspread",     wg_row, 1usize),
+            ("alembic-motion-dslide-even", wg_col, 2usize),
+            ("alembic-motion-dslide-odd",  wg_col, 3usize),
+        ];
+        for (label, wg, idx) in labels_dispatches {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("alembic-motion-vfall"),
+                label: Some(label),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.pass_bind_groups[0], &[]);
-            cpass.dispatch_workgroups(wg, 1, 1);
-        }
-        // Pass 1: liquid spread, 1 thread per row.
-        {
-            let wg = (H as u32 + 63) / 64;
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("alembic-motion-lspread"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.pass_bind_groups[1], &[]);
+            cpass.set_bind_group(0, &self.pass_bind_groups[idx], &[]);
             cpass.dispatch_workgroups(wg, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
