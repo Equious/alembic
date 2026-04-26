@@ -404,37 +404,67 @@ impl GpuState {
         by_w.max(by_h)
     }
 
-    /// Reset camera to the default fit-to-window view (sim centered,
-    /// scale = fit_scale). Bound to Backspace.
+    /// Reset camera to the default view: centered, zoomed in 2× past
+    /// cover-fit so zooming out actually reveals more grid (instead of
+    /// stranding the user at maximum cover-fit with nothing to expand
+    /// to). Bound to Backspace.
     fn camera_reset(&mut self) {
         self.cam_center_x = W as f32 * 0.5;
         self.cam_center_y = H as f32 * 0.5;
-        self.cam_scale = self.fit_scale();
+        self.cam_scale = self.fit_scale() * 2.0;
+        self.clamp_camera();
     }
 
     /// Cursor-anchored zoom. The cell currently under the cursor stays
     /// under the cursor across the zoom — the camera center shifts to
-    /// preserve that invariant.
+    /// preserve that invariant. Zoom-out is hard-capped at cover-fit
+    /// (`fit_scale`): you can never see void around the grid; the
+    /// minimum zoom is "as much grid as fits without bars."
     fn zoom_at(&mut self, screen_x: f32, screen_y: f32, factor: f32) {
         let win_w = self.surface_config.width as f32;
         let win_h = self.surface_config.height as f32;
-        // Cell under cursor at the *current* scale.
         let cell_x = self.cam_center_x + (screen_x - win_w * 0.5) / self.cam_scale;
         let cell_y = self.cam_center_y + (screen_y - win_h * 0.5) / self.cam_scale;
         let fit = self.fit_scale();
-        // Bound to a reasonable range — too small loses the sim in a
-        // sea of void; too large makes individual cells fill the screen.
-        let new_scale = (self.cam_scale * factor).clamp(fit * 0.25, fit * 16.0);
-        // After zoom, solve for cam_center such that cell_x maps to screen_x.
+        // Min = cover-fit (no void, may crop one axis). Max = 16× zoom in.
+        let new_scale = (self.cam_scale * factor).clamp(fit, fit * 16.0);
         self.cam_center_x = cell_x - (screen_x - win_w * 0.5) / new_scale;
         self.cam_center_y = cell_y - (screen_y - win_h * 0.5) / new_scale;
         self.cam_scale = new_scale;
+        self.clamp_camera();
     }
 
     /// Pan the camera by a screen-pixel delta. Used by middle-mouse drag.
     fn pan_pixels(&mut self, dx: f32, dy: f32) {
         self.cam_center_x -= dx / self.cam_scale;
         self.cam_center_y -= dy / self.cam_scale;
+        self.clamp_camera();
+    }
+
+    /// Keep the camera center inside the grid: the visible window edges
+    /// can never extend past the grid boundary, so the user never sees
+    /// void around the playable area. Run after any camera-mutating op
+    /// (zoom, pan, reset).
+    fn clamp_camera(&mut self) {
+        let win_w = self.surface_config.width as f32;
+        let win_h = self.surface_config.height as f32;
+        let half_x = (win_w * 0.5) / self.cam_scale;
+        let half_y = (win_h * 0.5) / self.cam_scale;
+        // If the visible half-extent exceeds the grid half-extent on
+        // either axis, the grid is fully visible on that axis — pin
+        // the camera center to the grid center for that axis.
+        let w = W as f32;
+        let h = H as f32;
+        self.cam_center_x = if half_x >= w * 0.5 {
+            w * 0.5
+        } else {
+            self.cam_center_x.clamp(half_x, w - half_x)
+        };
+        self.cam_center_y = if half_y >= h * 0.5 {
+            h * 0.5
+        } else {
+            self.cam_center_y.clamp(half_y, h - half_y)
+        };
     }
 
     /// Sim render rectangle in framebuffer pixels, derived from the
