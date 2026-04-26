@@ -12,7 +12,7 @@ const ALL_ELEMENTS: &[Element] = &[
     Element::Stone,
     Element::Wood,
     Element::Fire,
-    Element::Smoke,
+    Element::CO2,
     Element::Steam,
     Element::Lava,
     Element::Obsidian,
