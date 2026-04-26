@@ -407,14 +407,82 @@ pub fn flame_color_flag_props(id: u8) -> [u32; 4] {
 }
 
 /// Per-element flag: 1 if this element has an `ignite_above` thermal
-/// threshold (i.e., is flammable). Used by the GPU thermal_post pass
-/// to gate combustion checks. Currently only used as a placeholder —
-/// the bespoke combustion logic stays on CPU.
+/// threshold (i.e., is flammable).
 pub fn flammable_props(id: u8) -> [u32; 4] {
     let i = id as usize;
     if i >= ELEMENT_COUNT { return [0; 4]; }
     let el: Element = unsafe { std::mem::transmute(id) };
     [if el.thermal().ignite_above.is_some() { 1 } else { 0 }, 0, 0, 0]
+}
+
+/// Sentinel for "no threshold" in the GPU thermal LUT (an unreachable
+/// temperature value — i16 min cast to f32).
+pub const NO_THERMAL_THRESHOLD: f32 = -32768.0;
+
+/// Per-element combustion data for the GPU thermal_post compute.
+///   x = ignite_above threshold (NO_THERMAL_THRESHOLD if not flammable)
+///   y = burn_duration (0 if not flammable; otherwise frames-of-burn)
+///   z = burn_temp (sustained combustion temperature)
+///   w = self_oxidizing flag (1 for Gunpowder, 0 otherwise)
+pub fn thermal_burn_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [NO_THERMAL_THRESHOLD, 0.0, 0.0, 0.0]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    let t = el.thermal();
+    let ignite = t.ignite_above.map(|v| v as f32).unwrap_or(NO_THERMAL_THRESHOLD);
+    let dur = t.burn_duration.unwrap_or(0) as f32;
+    let btemp = t.burn_temp.unwrap_or(0) as f32;
+    let self_ox = if matches!(el, Element::Gunpowder) { 1.0 } else { 0.0 };
+    [ignite, dur, btemp, self_ox]
+}
+
+/// Per-element low-side phase transitions (freeze + condense).
+///   x = freeze_below threshold, y = freeze_target_el
+///   z = condense_below threshold, w = condense_target_el
+pub fn thermal_phase_lo_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [NO_THERMAL_THRESHOLD, 0.0, NO_THERMAL_THRESHOLD, 0.0]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    let t = el.thermal();
+    let freeze_thr = t.freeze_below.map(|p| p.threshold as f32).unwrap_or(NO_THERMAL_THRESHOLD);
+    let freeze_tgt = t.freeze_below.map(|p| p.target as u32 as f32).unwrap_or(0.0);
+    let cond_thr = t.condense_below.map(|p| p.threshold as f32).unwrap_or(NO_THERMAL_THRESHOLD);
+    let cond_tgt = t.condense_below.map(|p| p.target as u32 as f32).unwrap_or(0.0);
+    [freeze_thr, freeze_tgt, cond_thr, cond_tgt]
+}
+
+/// Per-element high-side phase transitions (melt + boil).
+///   x = melt_above threshold, y = melt_target_el
+///   z = boil_above threshold, w = boil_target_el
+pub fn thermal_phase_hi_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [NO_THERMAL_THRESHOLD, 0.0, NO_THERMAL_THRESHOLD, 0.0]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    let t = el.thermal();
+    let melt_thr = t.melt_above.map(|p| p.threshold as f32).unwrap_or(NO_THERMAL_THRESHOLD);
+    let melt_tgt = t.melt_above.map(|p| p.target as u32 as f32).unwrap_or(0.0);
+    let boil_thr = t.boil_above.map(|p| p.threshold as f32).unwrap_or(NO_THERMAL_THRESHOLD);
+    let boil_tgt = t.boil_above.map(|p| p.target as u32 as f32).unwrap_or(0.0);
+    [melt_thr, melt_tgt, boil_thr, boil_tgt]
+}
+
+/// Per-element burn-out decay product. Most flammables become CO2;
+/// Wood has a probabilistic Charcoal byproduct (handled in shader).
+///   x.byte0 = primary decay element id (CO2 for most)
+///   x.byte1 = secondary decay element id (Charcoal for Wood, 0 elsewhere)
+///   x.byte2 = secondary probability /16 (3 = ~30% for Wood)
+pub fn burn_decay_props(id: u8) -> [u32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0; 4]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    if el.thermal().ignite_above.is_none() { return [0; 4]; }
+    let primary = Element::CO2 as u32;
+    let (secondary, prob_16) = match el {
+        Element::Wood => (Element::Charcoal as u32, 3u32),
+        _ => (0u32, 0u32),
+    };
+    let packed = primary | (secondary << 8) | (prob_16 << 16);
+    [packed, 0, 0, 0]
 }
 
 /// Per-element permeability for the GPU pressure-diffusion shader.
@@ -3988,6 +4056,7 @@ pub struct GpuChem {
     pub color_fires: bool,
     pub flame_test_emission: bool,
     pub tree_support: bool,
+    pub thermal_post: bool,
 }
 
 impl World {
@@ -4111,9 +4180,10 @@ impl World {
         }
         if run_thermal_diffuse {
             self.thermal();          mark!("thermal");
-        } else {
-            // GPU compute path dispatches thermal_diffuse externally;
-            // CPU still handles moisture + combustion.
+        } else if !gpu_chem.thermal_post {
+            // GPU compute path dispatches thermal_diffuse externally.
+            // CPU runs thermal_post (combustion + moisture + phase
+            // changes) only when GPU isn't doing it.
             self.thermal_post();     mark!("thermal_post");
         }
         self.chemical_reactions();   mark!("chem_reactions");

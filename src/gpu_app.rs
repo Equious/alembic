@@ -1602,6 +1602,335 @@ impl MotionComputeCtx {
 //   * flame_test_emission — Margolus 2x2, 4 phases, neighbor write
 //                           lives entirely within the same block
 
+const THERMAL_POST_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    frame: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element combustion data:
+//   x = ignite_above (NO_THRESHOLD if not flammable)
+//   y = burn_duration   z = burn_temp   w = self_oxidizing
+@group(0) @binding(2) var<uniform> burn_data: array<vec4<f32>, 96>;
+// Low-side phase transitions: x=freeze_thr, y=freeze_target, z=condense_thr, w=condense_target
+@group(0) @binding(3) var<uniform> phase_lo: array<vec4<f32>, 96>;
+// High-side phase transitions: x=melt_thr, y=melt_target, z=boil_thr, w=boil_target
+@group(0) @binding(4) var<uniform> phase_hi: array<vec4<f32>, 96>;
+// Per-element burn decay product:
+//   .x byte0 = primary el (CO2), byte1 = secondary el (Charcoal for Wood),
+//      byte2 = secondary prob /16 (3 = ~30%)
+@group(0) @binding(5) var<uniform> burn_decay: array<vec4<u32>, 24>;
+
+const NO_THRESHOLD: f32 = -32768.0;
+
+fn tp_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn tp_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn tp_moisture(c: vec4<u32>) -> u32 { return c.z & 0xFFu; }
+fn tp_burn(c: vec4<u32>) -> u32 { return (c.z >> 8u) & 0xFFu; }
+
+fn tp_set_temp(c: vec4<u32>, t: i32) -> vec4<u32> {
+    let clamped = clamp(t, -273, 5000);
+    let raw = u32(clamped) & 0xFFFFu;
+    let lo_y = c.y & 0xFFFFu;
+    return vec4<u32>(c.x, lo_y | (raw << 16u), c.z, c.w);
+}
+fn tp_set_burn(c: vec4<u32>, b: u32) -> vec4<u32> {
+    let z = c.z & 0xFFFF00FFu;
+    return vec4<u32>(c.x, c.y, z | ((b & 0xFFu) << 8u), c.w);
+}
+fn tp_set_moisture(c: vec4<u32>, m: u32) -> vec4<u32> {
+    let z = c.z & 0xFFFFFF00u;
+    return vec4<u32>(c.x, c.y, z | (m & 0xFFu), c.w);
+}
+fn tp_set_el(c: vec4<u32>, el: u32) -> vec4<u32> {
+    let x = (c.x & 0xFFFFFF00u) | (el & 0xFFu);
+    return vec4<u32>(x, c.y, c.z, c.w);
+}
+
+fn tp_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Faithful port of the per-cell parts of `World::thermal_post` —
+// ignition, burn-out, and phase changes. The bespoke gunpowder/Cs
+// detonation path and latent-heat neighbor temperature transfers
+// are NOT yet ported (those need shockwave/Margolus support).
+//
+// All data is element-driven via burn_data + phase_lo + phase_hi
+// LUTs — no element-specific code in the shader, just table lookups.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    var c = cells[i];
+    let el = tp_el(c);
+    if (el == 0u) { return; } // Empty cells are inert.
+
+    let t = tp_temp(c);
+    let moisture = tp_moisture(c);
+    let burn_in = tp_burn(c);
+    let bd = burn_data[el];
+    let ignite_thr = bd.x;
+    let burn_dur = u32(bd.y);
+    let burn_temp = i32(bd.z);
+    let self_ox = bd.w > 0.5;
+    let has_ignite = ignite_thr > -1000.0;
+
+    // ---- Combustion ignition ----
+    if (has_ignite && burn_in == 0u) {
+        let normal = (f32(t) > ignite_thr) && (moisture < 20u);
+        let flash = f32(t) > ignite_thr + 300.0;
+        // Simplified O2: assume always available. Once electrolysis +
+        // explicit O2 are on GPU we can read the real oxygen mask.
+        let has_o2 = true;
+        if ((normal || flash) && has_o2 && burn_dur > 0u) {
+            c = tp_set_burn(c, burn_dur);
+            c = tp_set_moisture(c, 0u);
+        }
+    }
+
+    // ---- Burn-out tick ----
+    let burn_now = tp_burn(c);
+    if (burn_now > 0u) {
+        // Drowning.
+        if (moisture > 150u) {
+            c = tp_set_burn(c, 0u);
+            if (has_ignite && f32(t) > ignite_thr - 20.0) {
+                c = tp_set_temp(c, i32(ignite_thr - 20.0));
+            }
+        } else {
+            // Burn decrement: 1 per frame baseline (we don't have
+            // per-cell oxygen on GPU yet).
+            let next_burn = burn_now - 1u;
+            c = tp_set_burn(c, next_burn);
+            if (next_burn == 0u) {
+                // Decay product: CO2 by default, Charcoal probabilistic for Wood.
+                let bdec = burn_decay[el / 4u][el % 4u];
+                let primary_el = bdec & 0xFFu;
+                let secondary_el = (bdec >> 8u) & 0xFFu;
+                let sec_prob = (bdec >> 16u) & 0xFFu;
+                var decay_el = primary_el;
+                if (secondary_el != 0u && sec_prob > 0u) {
+                    let r = tp_hash(i, u.frame);
+                    if ((r & 0xFu) < sec_prob) { decay_el = secondary_el; }
+                }
+                // Hot smoke / charcoal residue: temp ~500.
+                c = vec4<u32>(decay_el, 0u, 0u, 0u);
+                c = tp_set_temp(c, 500);
+            } else {
+                // Sustain combustion temperature.
+                if (i32(burn_temp) > t) {
+                    c = tp_set_temp(c, burn_temp);
+                }
+            }
+        }
+        // (Skip flame emission above — would need parity sub-pass for
+        // the multi-cell write. Add later.)
+    }
+
+    // ---- Phase changes (only if combustion didn't already replace cell) ----
+    let cur_el = tp_el(c);
+    if (cur_el == el && tp_burn(c) == 0u) {
+        let cur_t = tp_temp(c);
+        let plo = phase_lo[el];
+        let phi = phase_hi[el];
+        // Try freeze.
+        if (plo.x > -1000.0 && f32(cur_t) < plo.x) {
+            let target_el = u32(plo.y);
+            c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
+            c = tp_set_temp(c, cur_t);
+        }
+        // Try condense.
+        else if (plo.z > -1000.0 && f32(cur_t) < plo.z) {
+            let target_el = u32(plo.w);
+            c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
+            c = tp_set_temp(c, cur_t);
+        }
+        // Try melt.
+        else if (phi.x > -1000.0 && f32(cur_t) > phi.x) {
+            let target_el = u32(phi.y);
+            c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
+            c = tp_set_temp(c, cur_t);
+        }
+        // Try boil.
+        else if (phi.z > -1000.0 && f32(cur_t) > phi.z) {
+            let target_el = u32(phi.w);
+            c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
+            // CPU adds 15° gas overshoot.
+            c = tp_set_temp(c, i32(phi.z) + 15);
+        }
+    }
+
+    cells[i] = c;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ThermalPostUniforms {
+    width: u32,
+    height: u32,
+    frame: u32,
+    _pad: u32,
+}
+
+/// GPU port of the per-cell core of `World::thermal_post`: combustion
+/// ignition, burn-out tick, and phase changes (freeze/melt/boil/condense).
+/// Latent heat with neighbor temp transfer and bespoke gunpowder/Cs
+/// detonations are NOT yet on GPU — those need additional infrastructure
+/// (Margolus or shockwave queues). CPU thermal_post still handles those
+/// pieces when run.
+struct ThermalPostCtx {
+    pipeline: wgpu::ComputePipeline,
+    uniform_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    burn_data_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    phase_lo_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    phase_hi_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    burn_decay_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl ThermalPostCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let uniforms = ThermalPostUniforms {
+            width: W as u32, height: H as u32, frame: 0, _pad: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-tpost-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let mk_lut_f32 = |label: &str, f: fn(u8) -> [f32; 4]| {
+            let mut data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+            for el_id in 0u32..96u32 {
+                data[el_id as usize] = f(el_id as u8);
+            }
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&data),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let burn_data_buf = mk_lut_f32("alembic-tpost-burn", crate::thermal_burn_props);
+        let phase_lo_buf  = mk_lut_f32("alembic-tpost-phase-lo", crate::thermal_phase_lo_props);
+        let phase_hi_buf  = mk_lut_f32("alembic-tpost-phase-hi", crate::thermal_phase_hi_props);
+        // Burn decay: 96 u32 packed in 24 vec4<u32>.
+        let mut decay: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let p = crate::burn_decay_props(el_id as u8);
+            decay[(el_id / 4) as usize][(el_id % 4) as usize] = p[0];
+        }
+        let burn_decay_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-tpost-burn-decay"),
+            contents: bytemuck::cast_slice(&decay),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-tpost-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-tpost-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: burn_data_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: phase_lo_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: phase_hi_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: burn_decay_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-tpost-shader"),
+            source: wgpu::ShaderSource::Wgsl(THERMAL_POST_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-tpost-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-tpost-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        ThermalPostCtx {
+            pipeline,
+            uniform_buf,
+            burn_data_buf,
+            phase_lo_buf,
+            phase_hi_buf,
+            burn_decay_buf,
+            bind_group,
+        }
+    }
+
+    fn update_frame(&self, queue: &wgpu::Queue, frame: u32) {
+        // Update only `frame` field at offset 8 (after width, height).
+        let arr = [frame];
+        queue.write_buffer(&self.uniform_buf, 8, bytemuck::cast_slice(&arr));
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-tpost-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -2888,6 +3217,9 @@ struct GpuState {
     /// wood with life=1; the wood-life-fall branch in vertical_fall
     /// then makes those cells fall.
     tree_support_compute: TreeSupportCtx,
+    /// GPU port of the per-cell core of `World::thermal_post` —
+    /// combustion ignition, burn-out, and phase changes.
+    thermal_post_compute: ThermalPostCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -3218,6 +3550,7 @@ impl GpuState {
         let flame_emit_compute = FlameTestEmissionCtx::new(&device, &queue, &cells_buf);
         let lifecycle_compute = LifecycleCtx::new(&device, &queue, &cells_buf);
         let tree_support_compute = TreeSupportCtx::new(&device, &queue, &cells_buf);
+        let thermal_post_compute = ThermalPostCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -3240,6 +3573,7 @@ impl GpuState {
             flame_emit_compute,
             lifecycle_compute,
             tree_support_compute,
+            thermal_post_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -3449,6 +3783,7 @@ impl GpuState {
                 color_fires: true,
                 flame_test_emission: true,
                 tree_support: true,
+                thermal_post: true,
             };
             self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
@@ -3495,6 +3830,10 @@ impl GpuState {
             self.pressure_compute.encode(&mut encoder);
             // 4. Thermal: extract → 1 diffuse iter → writeback.
             self.thermal_compute.encode(&mut encoder);
+            // 4b. thermal_post — combustion ignition, burn-out, and
+            //     phase changes (Water→Steam, Ice→Water, Wood→ash).
+            self.thermal_post_compute.update_frame(&self.queue, self.frame_counter);
+            self.thermal_post_compute.encode(&mut encoder);
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.
