@@ -309,6 +309,40 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     a
 };
 
+/// Snapshot the per-element pressure-source data as a packed vec4 —
+/// `[kind_id_f32, cell_weight, _, _]` for the GPU pressure_sources
+/// compute. `kind_id` follows the order of `Kind` enum (Empty=0,
+/// Solid=1, Gravel=2, Powder=3, Liquid=4, Gas=5, Fire=6). Cell
+/// weight matches the CPU `cell_weight()` helper.
+pub fn pressure_source_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    // SAFETY: we go through the bit pattern. Element is `repr(u8)`
+    // and its variants are an explicit subset of 0..ELEMENT_COUNT.
+    // Indices that don't correspond to a defined variant exist (the
+    // table has gaps for unused atomic numbers); those return a
+    // null physics profile, which the shader treats as zero-weight
+    // empty-kind — effectively inert under the column walk.
+    let phys = &PHYSICS[i];
+    let kind_id: f32 = match phys.kind {
+        Kind::Empty => 0.0,
+        Kind::Solid => 1.0,
+        Kind::Gravel => 2.0,
+        Kind::Powder => 3.0,
+        Kind::Liquid => 4.0,
+        Kind::Gas => 5.0,
+        Kind::Fire => 6.0,
+    };
+    let weight = match phys.kind {
+        Kind::Empty => AMBIENT_AIR.molar_mass * 0.02,
+        Kind::Gas | Kind::Fire => phys.molar_mass * 0.05,
+        _ => (phys.density.max(0) as f32) * 0.5,
+    };
+    [kind_id, weight, 0.0, 0.0]
+}
+
 /// Snapshot the thermal profile for element id `id` as a packed
 /// `[conductivity, ambient_temp_f32, ambient_rate, heat_capacity]`
 /// — used by the GPU compute shader's per-element profile lookup.
@@ -3811,10 +3845,26 @@ impl World {
     /// wgpu binary uses this when both passes run on GPU compute.
     /// thermal_post() (moisture/combustion) still runs on CPU.
     pub fn step_skip_pressure_thermal(&mut self, wind: Vec2) {
-        self.step_inner(wind, false, false);
+        self.step_inner_full(wind, false, false, true);
+    }
+
+    /// Skip pressure_sources, pressure, AND thermal_diffuse — all
+    /// three are running on GPU compute.
+    pub fn step_skip_gpu_passes(&mut self, wind: Vec2) {
+        self.step_inner_full(wind, false, false, false);
     }
 
     fn step_inner(&mut self, wind: Vec2, run_pressure: bool, run_thermal_diffuse: bool) {
+        self.step_inner_full(wind, run_pressure, run_thermal_diffuse, true);
+    }
+
+    fn step_inner_full(
+        &mut self,
+        wind: Vec2,
+        run_pressure: bool,
+        run_thermal_diffuse: bool,
+        run_pressure_sources: bool,
+    ) {
         self.frame = self.frame.wrapping_add(1);
         let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
         let mut tt = std::time::Instant::now();
@@ -3873,7 +3923,9 @@ impl World {
             }
         }
         mark!("update_cells");
-        self.pressure_sources();     mark!("pressure_src");
+        if run_pressure_sources {
+            self.pressure_sources(); mark!("pressure_src");
+        }
         if run_pressure {
             self.pressure();         mark!("pressure");
         }
@@ -4598,17 +4650,36 @@ impl World {
     // means transient spikes (paint injection, phase-change formation) decay
     // gradually over ~20 frames, giving them time to drive motion and spread
     // through diffusion before the baseline reclaims the field.
-    fn pressure_sources(&mut self) {
+    pub fn pressure_sources(&mut self) {
         if self.pressure_scratch.len() != W * H {
             self.pressure_scratch = vec![0; W * H];
         }
+        // Pre-compute the per-element weight LUT once per call. Avoids
+        // the chained `cell.el.physics().kind` match every iteration of
+        // the column walk (1.08M calls otherwise) — the LUT replaces
+        // it with a single Vec<f32> index.
+        let mut weight_lut: [f32; ELEMENT_COUNT] = [0.0; ELEMENT_COUNT];
+        let mut is_wallable_lut: [bool; ELEMENT_COUNT] = [false; ELEMENT_COUNT];
+        let mut is_pressurizable_lut: [bool; ELEMENT_COUNT] = [false; ELEMENT_COUNT];
+        for i in 0..ELEMENT_COUNT {
+            let phys = &PHYSICS[i];
+            weight_lut[i] = match phys.kind {
+                Kind::Empty => AMBIENT_AIR.molar_mass * 0.02,
+                Kind::Gas | Kind::Fire => phys.molar_mass * 0.05,
+                _ => (phys.density.max(0) as f32) * 0.5,
+            };
+            is_wallable_lut[i] = !matches!(
+                phys.kind,
+                Kind::Empty | Kind::Gas | Kind::Fire | Kind::Liquid,
+            );
+            is_pressurizable_lut[i] = matches!(phys.kind, Kind::Gas | Kind::Fire);
+        }
 
-        // Compute per-cell TARGET pressure into the scratch buffer.
-        // Pass 1: thermal component.
+        // Pass 1: thermal component (per-cell, branchy on kind).
         for i in 0..self.cells.len() {
             let cell = self.cells[i];
-            let phys = cell.el.physics();
-            let thermal = if matches!(phys.kind, Kind::Gas | Kind::Fire) {
+            let id = cell.el as usize;
+            let thermal = if id < ELEMENT_COUNT && is_pressurizable_lut[id] {
                 ((cell.temp as i32 - 20) * 5).clamp(-300, 4000)
             } else {
                 0
@@ -4632,30 +4703,15 @@ impl World {
                 while y != end {
                     let i = Self::idx(x, y);
                     let cell = self.cells[i];
-                    // ANY frozen cell is structural, regardless of element
-                    // kind. Iron walls are Kind::Gravel, stone is Kind::Solid,
-                    // sand walls are Kind::Powder — when frozen they're all
-                    // rigid and bear load through contact, not fluid column
-                    // pressure. The kind-based check missed iron entirely.
+                    let id = cell.el as usize;
                     let is_wall = cell.is_frozen()
-                        && !matches!(
-                            cell.el.physics().kind,
-                            Kind::Empty | Kind::Gas | Kind::Fire | Kind::Liquid,
-                        );
+                        && id < ELEMENT_COUNT
+                        && is_wallable_lut[id];
                     if is_wall {
-                        // Structural walls break the hydrostatic column.
-                        // Iron's density (79) would otherwise saturate col_p
-                        // to 4000 within a few cells, leaving every cell
-                        // below the wall targeting max pressure — which made
-                        // wall cells themselves read 4000 and ambient cells
-                        // below them sit in the thousands. Walls also
-                        // shouldn't hold hydrostatic pressure of their own,
-                        // so we skip updating their target here (it stays at
-                        // thermal = 0 from pass 1, and the blend will decay
-                        // any stuck pressure they inherited).
                         col_p = 0.0;
                     } else {
-                        col_p += Self::cell_weight(cell.el) * g;
+                        let w = if id < ELEMENT_COUNT { weight_lut[id] } else { 0.0 };
+                        col_p += w * g;
                         let p_clamped = col_p.clamp(-4000.0, 4000.0) as i32;
                         let combined = (self.pressure_scratch[i] as i32 + p_clamped)
                             .clamp(-4000, 4000);
