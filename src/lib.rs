@@ -309,6 +309,19 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     a
 };
 
+/// Snapshot the thermal profile for element id `id` as a packed
+/// `[conductivity, ambient_temp_f32, ambient_rate, heat_capacity]`
+/// — used by the GPU compute shader's per-element profile lookup.
+/// Out-of-range ids return safe defaults (no heat exchange).
+pub fn thermal_profile_vec4(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT {
+        return [0.0, 20.0, 0.0, 1.0];
+    }
+    let p = &THERMAL[i];
+    [p.conductivity, p.ambient_temp as f32, p.ambient_rate, p.heat_capacity]
+}
+
 static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
     const NONE_PH: Option<Phase> = None;
     const fn base() -> ThermalProfile {
@@ -3778,7 +3791,7 @@ impl World {
     }
 
     pub fn step(&mut self, wind: Vec2) {
-        self.step_inner(wind, true);
+        self.step_inner(wind, true, true);
     }
 
     /// Step everything except the pressure diffusion pass. The wgpu
@@ -3786,10 +3799,17 @@ impl World {
     /// `pressure_sources` (CPU-cheap, sets up hydrostatic targets)
     /// still runs — the GPU starts from those values.
     pub fn step_skip_pressure(&mut self, wind: Vec2) {
-        self.step_inner(wind, false);
+        self.step_inner(wind, false, true);
     }
 
-    fn step_inner(&mut self, wind: Vec2, run_pressure: bool) {
+    /// Step everything except pressure() AND thermal_diffuse(). The
+    /// wgpu binary uses this when both passes run on GPU compute.
+    /// thermal_post() (moisture/combustion) still runs on CPU.
+    pub fn step_skip_pressure_thermal(&mut self, wind: Vec2) {
+        self.step_inner(wind, false, false);
+    }
+
+    fn step_inner(&mut self, wind: Vec2, run_pressure: bool, run_thermal_diffuse: bool) {
         self.frame = self.frame.wrapping_add(1);
         let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
         let mut tt = std::time::Instant::now();
@@ -3817,7 +3837,13 @@ impl World {
         self.hg_amalgamation();      mark!("hg_amalg");
         self.flame_test_emission();  mark!("flame_emit");
         self.color_fires();          mark!("color_fires");
-        self.thermal();              mark!("thermal");
+        if run_thermal_diffuse {
+            self.thermal();          mark!("thermal");
+        } else {
+            // GPU compute path dispatches thermal_diffuse externally;
+            // CPU still handles moisture + combustion.
+            self.thermal_post();     mark!("thermal_post");
+        }
         self.chemical_reactions();   mark!("chem_reactions");
         self.acid_displacement();    mark!("acid_disp");
         self.alloy_acid_leach();     mark!("alloy_leach");
@@ -3918,12 +3944,16 @@ impl World {
     // changes and in-place combustion. Generic — every element is driven by
     // the same rules through its property methods.
     fn thermal(&mut self) {
-        // 1) Diffusion + ambient (double-buffered).
-        // The early-exit "skip when no cell deviates from ambient"
-        // optimization was tested but broke gas pressure dynamics —
-        // pressure_sources uses cell.temp deviation as input, and
-        // without diffusion settling cells toward ambient, that input
-        // becomes stale. Diffusion runs every frame.
+        self.thermal_diffuse();
+        self.thermal_post();
+    }
+
+    /// Section 1 of thermal: 4-neighbor heat diffusion + ambient blend
+    /// + stochastic rounding. Pure per-cell read/compute → write to a
+    /// disjoint scratch slot, which makes it safe to dispatch on GPU
+    /// compute. The wgpu binary skips this and calls a compute shader
+    /// instead via `step_skip_pressure_thermal`.
+    pub fn thermal_diffuse(&mut self) {
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -3963,7 +3993,13 @@ impl World {
         for i in 0..(W * H) {
             self.cells[i].temp = self.temp_scratch[i];
         }
+    }
 
+    /// Sections 2 + 3 of thermal: moisture dynamics, evaporation,
+    /// combustion-driven phase changes. These have writes-to-non-self
+    /// neighbors and stay on CPU regardless of which step variant the
+    /// caller uses.
+    pub fn thermal_post(&mut self) {
         // 2) Moisture dynamics — wetting from water contact, heat-driven and
         // passive evaporation *only on cells touching air* (surface-first).
         for y in 0..H as i32 {

@@ -23,7 +23,114 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::{color_rgb, Element, World, H, W};
+use crate::{color_rgb, thermal_profile_vec4, Element, World, H, W};
+
+const THERMAL_COMPUTE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    ambient_offset: i32,
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> temp_in: array<i32>;
+@group(0) @binding(2) var<storage, read_write> temp_out: array<i32>;
+@group(0) @binding(3) var<storage, read> el: array<u32>;
+// Per-element thermal profile, indexed by el[i].
+//   x = conductivity, y = ambient_temp, z = ambient_rate, w = heat_capacity
+@group(0) @binding(4) var<uniform> profiles: array<vec4<f32>, 96>;
+
+const FIRE_ID: u32 = 5u;
+const EMPTY_ID: u32 = 0u;
+
+fn hash_random(i: u32, frame: u32) -> f32 {
+    var h: u32 = i * 2654435761u;
+    h ^= frame * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    h *= 3266489917u;
+    h ^= h >> 16u;
+    return f32(h) / 4294967295.0;
+}
+
+@compute @workgroup_size(16, 16)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let w_i = i32(u.width);
+    let h_i = i32(u.height);
+    if (x >= w_i || y >= h_i) { return; }
+
+    let i = u32(y * w_i + x);
+    let me_el = el[i];
+    let me_props = profiles[me_el];
+    let my_k = me_props.x;
+    let me_t = f32(temp_in[i]);
+
+    var delta: f32 = 0.0;
+    var diff_neighbors: f32 = 0.0;
+    var oob_neighbors: f32 = 0.0;
+    // 4 neighbors (cardinals).
+    if (x > 0) {
+        let ni = u32(y * w_i + (x - 1));
+        let n_el = el[ni];
+        let n_k = profiles[n_el].x;
+        let n_t = f32(temp_in[ni]);
+        let k = min(my_k, n_k);
+        delta += k * (n_t - me_t);
+        if (n_el != me_el) { diff_neighbors += 1.0; }
+    } else { oob_neighbors += 1.0; }
+    if (x < w_i - 1) {
+        let ni = u32(y * w_i + (x + 1));
+        let n_el = el[ni];
+        let n_k = profiles[n_el].x;
+        let n_t = f32(temp_in[ni]);
+        let k = min(my_k, n_k);
+        delta += k * (n_t - me_t);
+        if (n_el != me_el) { diff_neighbors += 1.0; }
+    } else { oob_neighbors += 1.0; }
+    if (y > 0) {
+        let ni = u32((y - 1) * w_i + x);
+        let n_el = el[ni];
+        let n_k = profiles[n_el].x;
+        let n_t = f32(temp_in[ni]);
+        let k = min(my_k, n_k);
+        delta += k * (n_t - me_t);
+        if (n_el != me_el) { diff_neighbors += 1.0; }
+    } else { oob_neighbors += 1.0; }
+    if (y < h_i - 1) {
+        let ni = u32((y + 1) * w_i + x);
+        let n_el = el[ni];
+        let n_k = profiles[n_el].x;
+        let n_t = f32(temp_in[ni]);
+        let k = min(my_k, n_k);
+        delta += k * (n_t - me_t);
+        if (n_el != me_el) { diff_neighbors += 1.0; }
+    } else { oob_neighbors += 1.0; }
+
+    var exposure: f32;
+    if (me_el == FIRE_ID || me_el == EMPTY_ID) {
+        exposure = 1.0;
+    } else {
+        exposure = (diff_neighbors + oob_neighbors) / 4.0;
+    }
+    let amb_factor = 0.10 + 0.90 * exposure;
+    let ambient_t = me_props.y + f32(u.ambient_offset);
+    delta += me_props.z * amb_factor * (ambient_t - me_t);
+    let heat_cap = max(me_props.w, 0.0001);
+    let exact = me_t + delta / heat_cap;
+    let floor_v = floor(exact);
+    let frac = exact - floor_v;
+    let roll = hash_random(i, u.frame);
+    var stepped: f32;
+    if (roll < frac) { stepped = floor_v + 1.0; }
+    else { stepped = floor_v; }
+    let new_t = clamp(stepped, -273.0, 4000.0);
+    temp_out[i] = i32(new_t);
+}
+"#;
 
 const PRESSURE_COMPUTE_SHADER: &str = r#"
 struct Uniforms {
@@ -261,7 +368,6 @@ impl PressureComputeCtx {
 
     fn dispatch(&mut self, world: &mut World, device: &wgpu::Device, queue: &wgpu::Queue) {
         let cell_count = W * H;
-        // Pack cell.pressure (i16) into i32 staging, perm (u8) into u32 staging.
         for i in 0..cell_count {
             self.pressure_staging[i] = world.cells[i].pressure as i32;
             self.perm_staging[i] = world.cells[i].el.pressure_p().permeability as u32;
@@ -311,6 +417,218 @@ impl PressureComputeCtx {
             }
         }
         self.readback_buf.unmap();
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ThermalUniforms {
+    width: u32,
+    height: u32,
+    ambient_offset: i32,
+    frame: u32,
+}
+
+/// GPU compute pipeline for thermal diffusion (heat exchange + ambient
+/// blend). Runs the inner per-cell math of `World::thermal_diffuse()`
+/// in a fragment shader, leaving moisture/combustion/phase changes
+/// (`thermal_post`) on the CPU. Saves the largest CPU-linear cost
+/// after pressure was moved to GPU.
+struct ThermalComputeCtx {
+    pipeline: wgpu::ComputePipeline,
+    uniform_buf: wgpu::Buffer,
+    profiles_buf: wgpu::Buffer,
+    temp_a: wgpu::Buffer,
+    temp_b: wgpu::Buffer,
+    el_buf: wgpu::Buffer,
+    readback_buf: wgpu::Buffer,
+    bind_a_to_b: wgpu::BindGroup,
+    bind_b_to_a: wgpu::BindGroup,
+    temp_staging: Vec<i32>,
+    el_staging: Vec<u32>,
+}
+
+impl ThermalComputeCtx {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let cell_count = W * H;
+        let buf_bytes = (cell_count * 4) as wgpu::BufferAddress;
+
+        // Build the per-element thermal profile uniform (96 vec4s).
+        let mut profile_data: Vec<[f32; 4]> = vec![[0.0, 20.0, 0.0, 1.0]; 96];
+        for i in 0..96 {
+            profile_data[i] = thermal_profile_vec4(i as u8);
+        }
+        let profiles_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-thermal-profiles"),
+            contents: bytemuck::cast_slice(&profile_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniforms = ThermalUniforms {
+            width: W as u32,
+            height: H as u32,
+            ambient_offset: 0,
+            frame: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-thermal-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let _ = queue; // queue write happens per-frame in dispatch.
+
+        let make_storage = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: buf_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let temp_a = make_storage("alembic-temp-a");
+        let temp_b = make_storage("alembic-temp-b");
+        let el_buf = make_storage("alembic-el");
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-thermal-readback"),
+            size: buf_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-thermal-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bind_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-thermal-bind-a-to-b"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: temp_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: temp_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: el_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: profiles_buf.as_entire_binding() },
+            ],
+        });
+        let bind_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-thermal-bind-b-to-a"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: temp_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: temp_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: el_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: profiles_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-thermal-compute-shader"),
+            source: wgpu::ShaderSource::Wgsl(THERMAL_COMPUTE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-thermal-compute-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-thermal-compute-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        ThermalComputeCtx {
+            pipeline,
+            uniform_buf,
+            profiles_buf,
+            temp_a,
+            temp_b,
+            el_buf,
+            readback_buf,
+            bind_a_to_b,
+            bind_b_to_a,
+            temp_staging: vec![0i32; cell_count],
+            el_staging: vec![0u32; cell_count],
+        }
+    }
+
+    fn dispatch(&mut self, world: &mut World, device: &wgpu::Device, queue: &wgpu::Queue, frame: u32, ambient_offset: i16) {
+        let cell_count = W * H;
+        for i in 0..cell_count {
+            self.temp_staging[i] = world.cells[i].temp as i32;
+            self.el_staging[i] = world.cells[i].el as u32;
+        }
+        queue.write_buffer(&self.temp_a, 0, bytemuck::cast_slice(&self.temp_staging));
+        queue.write_buffer(&self.el_buf, 0, bytemuck::cast_slice(&self.el_staging));
+        let uniforms = ThermalUniforms {
+            width: W as u32,
+            height: H as u32,
+            ambient_offset: ambient_offset as i32,
+            frame,
+        };
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("alembic-thermal-encoder"),
+        });
+        let wg_x = (W as u32 + 15) / 16;
+        let wg_y = (H as u32 + 15) / 16;
+        // One iteration of thermal diffusion (matches CPU reference).
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-thermal-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bind_a_to_b, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &self.temp_b, 0, &self.readback_buf, 0,
+            (cell_count * 4) as wgpu::BufferAddress,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = self.readback_buf.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
+        let _ = device.poll(wgpu::Maintain::Wait);
+        let _ = receiver.recv();
+        {
+            let data = slice.get_mapped_range();
+            let result: &[i32] = bytemuck::cast_slice(&data);
+            for (i, &v) in result.iter().enumerate() {
+                world.cells[i].temp = v.clamp(-273, 4000) as i16;
+            }
+        }
+        self.readback_buf.unmap();
+        // Suppress "field never used" lint for fields we keep alive
+        // for resource ownership but don't reference per-call.
+        let _ = (&self.bind_b_to_a, &self.profiles_buf, &self.temp_a);
     }
 }
 
@@ -373,6 +691,10 @@ struct GpuState {
     /// `World::pressure()` pass; lets us scale the grid without paying
     /// the linear CPU cost.
     pressure_compute: PressureComputeCtx,
+    /// GPU compute pipeline for thermal diffusion (heat exchange +
+    /// ambient blend). Replaces `World::thermal_diffuse()`.
+    thermal_compute: ThermalComputeCtx,
+    frame_counter: u32,
     /// Window must outlive the surface. Held as Arc so the surface's
     /// 'static lifetime contract is satisfied without unsafe.
     window: Arc<Window>,
@@ -661,6 +983,7 @@ impl GpuState {
         let image_buffer = vec![0u8; W * H * 4];
 
         let pressure_compute = PressureComputeCtx::new(&device, &queue);
+        let thermal_compute = ThermalComputeCtx::new(&device, &queue);
 
         let mut state = GpuState {
             surface,
@@ -674,6 +997,8 @@ impl GpuState {
             sim_pipeline,
             display_uniform,
             pressure_compute,
+            thermal_compute,
+            frame_counter: 0,
             window,
             selected: Element::Sand,
             brush_radius: 4,
@@ -847,11 +1172,22 @@ impl GpuState {
         // so the new cells participate in this tick.
         self.apply_brush();
 
-        // Tick the sim. Everything except pressure runs on CPU; the
-        // pressure diffusion pass dispatches to the GPU compute shader.
+        // Tick the sim. The two heaviest per-cell passes (pressure
+        // diffusion, thermal diffusion) dispatch to GPU compute
+        // shaders; everything else stays on CPU. Thermal_post
+        // (moisture, combustion) still runs on CPU as part of step.
         if !self.paused {
-            self.world.step_skip_pressure(macroquad::math::Vec2::new(0.0, 0.0));
+            self.world.step_skip_pressure_thermal(macroquad::math::Vec2::new(0.0, 0.0));
             self.pressure_compute.dispatch(&mut self.world, &self.device, &self.queue);
+            let amb = self.world.ambient_offset;
+            self.thermal_compute.dispatch(
+                &mut self.world,
+                &self.device,
+                &self.queue,
+                self.frame_counter,
+                amb,
+            );
+            self.frame_counter = self.frame_counter.wrapping_add(1);
         }
 
         // Compute the sim rectangle in framebuffer pixels, preserving
