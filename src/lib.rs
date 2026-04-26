@@ -3987,6 +3987,7 @@ pub struct GpuChem {
     pub clear_flags: bool,
     pub color_fires: bool,
     pub flame_test_emission: bool,
+    pub tree_support: bool,
 }
 
 impl World {
@@ -4094,7 +4095,9 @@ impl World {
         self.joule_heating();        mark!("joule");
         self.electrolysis();         mark!("electrolysis");
         self.decay();                mark!("decay");
-        self.tree_support_check();   mark!("tree_support");
+        if !gpu_chem.tree_support {
+            self.tree_support_check(); mark!("tree_support");
+        }
         self.thermite();             mark!("thermite");
         self.magnesium_burn();       mark!("mg_burn");
         self.glass_etching();        mark!("glass_etch");

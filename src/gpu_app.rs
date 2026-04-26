@@ -1068,12 +1068,15 @@ fn can_enter(src_cell: vec4<u32>, tx: i32, ty: i32, dy: i32) -> bool {
 // automatic, so a column shifts down by one per frame without
 // fragmenting (which is what Margolus block updates produced).
 //
+const EL_WOOD: u32 = 4u;
+const EL_SEED: u32 = 10u;
+const EL_LEAVES: u32 = 12u;
+
 // Pass 0 — vertical fall. Faithful port of update_powder, update_gravel,
-// and update_liquid's straight-down step. Per-column thread, walks
-// bottom-up so cascading happens within one pass. Each cell's "can I
-// fall straight down?" check uses can_enter(c, x, y+1, 1) which mirrors
-// CPU exactly: target Empty always passes; rigid target blocks; gas-gas
-// mixes; otherwise density-direction test.
+// update_liquid's straight-down step PLUS the bespoke wood-life-fall
+// branch from update_cell, the unrooted-seed fall from update_seed,
+// and the unsupported-leaves fall from update_leaves. Per-column
+// thread, walks bottom-up so cascading happens within one pass.
 fn vertical_fall(x: u32) {
     var y = i32(u.height) - 2;
     loop {
@@ -1082,14 +1085,78 @@ fn vertical_fall(x: u32) {
         let c = cells[i_here];
         if (cell_updated(c) || cell_frozen(c)) { y = y - 1; continue; }
         let k = cell_kind(c);
-        // Powder/Gravel/Liquid try straight-down. Gas/Fire/Empty/Solid
-        // are handled in other passes.
+        let el = cell_el(c);
+        let life = (c.x >> 16u) & 0xFFFFu;
+
+        var tried = false;
+
+        // Powder / Gravel / Liquid → standard straight-down via can_enter.
         if (k == KIND_POWDER || k == KIND_GRAVEL || k == KIND_LIQUID) {
             if (can_enter(c, i32(x), y + 1, 1)) {
                 let i_below = cell_idx(x, u32(y + 1));
                 let c_below = cells[i_below];
                 cells[i_here]  = c_below;
                 cells[i_below] = mark_updated(c);
+                tried = true;
+            }
+        }
+
+        // Wood with life > 0 → falling unsupported wood. Per CPU's
+        // update_cell wood branch: only falls into Empty (not gas/fire).
+        if (!tried && el == EL_WOOD && life > 0u) {
+            let i_below = cell_idx(x, u32(y + 1));
+            let c_below = cells[i_below];
+            if (cell_kind(c_below) == KIND_EMPTY
+                && !cell_updated(c_below) && !cell_frozen(c_below)) {
+                cells[i_here]  = c_below;
+                cells[i_below] = mark_updated(c);
+                tried = true;
+            } else {
+                // Landed: clear falling flag (life = 0). Per CPU.
+                cells[i_here] = vec4<u32>(c.x & 0xFFFFu, c.y, c.z, c.w);
+            }
+        }
+
+        // Seed with life == 0 → unrooted seed. Falls into Empty only
+        // (CPU update_seed). Diagonals tried in dslide.
+        if (!tried && el == EL_SEED && life == 0u) {
+            let i_below = cell_idx(x, u32(y + 1));
+            let c_below = cells[i_below];
+            if (cell_kind(c_below) == KIND_EMPTY
+                && !cell_updated(c_below) && !cell_frozen(c_below)) {
+                cells[i_here]  = c_below;
+                cells[i_below] = mark_updated(c);
+                tried = true;
+            }
+        }
+
+        // Leaves → unsupported fall. CPU update_leaves checks 5×5
+        // for any Wood/Seed; if found, supported (do nothing).
+        // Otherwise, 25% chance per frame to fall via can_enter.
+        if (!tried && el == EL_LEAVES) {
+            // Probability gate (matches CPU's 1-in-4 + should_fall=1 at g=1).
+            let r = hash_u32_motion(i_here, u.frame);
+            if ((r & 3u) == 0u) {
+                // Check 5×5 neighborhood for Wood/Seed.
+                var supported = false;
+                for (var dy = -2i32; dy <= 2i32 && !supported; dy = dy + 1) {
+                    for (var dx = -2i32; dx <= 2i32 && !supported; dx = dx + 1) {
+                        if (dx == 0 && dy == 0) { continue; }
+                        let nx = i32(x) + dx;
+                        let ny = y + dy;
+                        if (nx < 0 || nx >= i32(u.width) || ny < 0 || ny >= i32(u.height)) { continue; }
+                        let n_el = cell_el(cells[cell_idx(u32(nx), u32(ny))]);
+                        if (n_el == EL_WOOD || n_el == EL_SEED) { supported = true; }
+                    }
+                }
+                if (!supported) {
+                    if (can_enter(c, i32(x), y + 1, 1)) {
+                        let i_below = cell_idx(x, u32(y + 1));
+                        let c_below = cells[i_below];
+                        cells[i_here]  = c_below;
+                        cells[i_below] = mark_updated(c);
+                    }
+                }
             }
         }
         y = y - 1;
@@ -1534,6 +1601,249 @@ impl MotionComputeCtx {
 //   * color_fires         — per-cell write to one byte (cell.w lo)
 //   * flame_test_emission — Margolus 2x2, 4 phases, neighbor write
 //                           lives entirely within the same block
+
+const TREE_SUPPORT_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0 = anchor pass, 1 = propagate iter
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+@group(0) @binding(2) var<uniform> motion_props: array<vec4<f32>, 96>;
+
+const EL_WOOD: u32 = 4u;
+const KIND_SOLID: u32 = 1u;
+const KIND_GRAVEL: u32 = 2u;
+const KIND_POWDER: u32 = 3u;
+const FLAG_FROZEN: u32 = 0x02u;
+
+fn ts_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn ts_kind(c: vec4<u32>) -> u32 { return u32(motion_props[ts_el(c)].x); }
+fn ts_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn ts_frozen(c: vec4<u32>) -> bool { return (ts_flag(c) & FLAG_FROZEN) != 0u; }
+fn ts_life(c: vec4<u32>) -> u32 { return (c.x >> 16u) & 0xFFFFu; }
+fn ts_set_life(c: vec4<u32>, life: u32) -> vec4<u32> {
+    return vec4<u32>((c.x & 0xFFFFu) | (life << 16u), c.y, c.z, c.w);
+}
+
+// Faithful port of `World::tree_support_check`. Two pass modes:
+//
+// pass 0 (anchor): For every Wood cell, decide whether it's
+//   directly grounded:
+//     * frozen wood → always anchor
+//     * y == H-1     → on floor → anchor
+//     * cell directly below is non-Wood Solid/Gravel/Powder → anchor
+//   Anchors get life=0, all other wood cells get life=1.
+//
+// pass 1 (propagate, run K times): For every Wood cell with life=1,
+//   if any 4-neighbor is Wood with life=0 (supported), inherit
+//   life=0. After K iterations, all wood connected to an anchor
+//   has been marked supported.
+//
+// life=1 cells fall via the wood-fall branch in vertical_fall.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    let c = cells[i];
+    if (ts_el(c) != EL_WOOD) { return; }
+
+    if (u.pass_id == 0u) {
+        // Anchor pass.
+        var anchor = false;
+        if (ts_frozen(c)) {
+            anchor = true;
+        } else if (y == u.height - 1u) {
+            anchor = true;
+        } else {
+            let i_below = (y + 1u) * u.width + x;
+            let cb = cells[i_below];
+            let kb = ts_kind(cb);
+            let eb = ts_el(cb);
+            if (eb != EL_WOOD && (kb == KIND_SOLID || kb == KIND_GRAVEL || kb == KIND_POWDER)) {
+                anchor = true;
+            }
+        }
+        if (anchor) {
+            cells[i] = ts_set_life(c, 0u);
+        } else {
+            cells[i] = ts_set_life(c, 1u);
+        }
+        return;
+    }
+
+    // pass 1: propagate. Only act on cells currently marked unsupported.
+    if (ts_life(c) == 0u) { return; }
+    // Check 4 neighbors for supported wood.
+    var supported = false;
+    if (x > 0u) {
+        let n = cells[y * u.width + (x - 1u)];
+        if (ts_el(n) == EL_WOOD && ts_life(n) == 0u) { supported = true; }
+    }
+    if (!supported && x + 1u < u.width) {
+        let n = cells[y * u.width + (x + 1u)];
+        if (ts_el(n) == EL_WOOD && ts_life(n) == 0u) { supported = true; }
+    }
+    if (!supported && y > 0u) {
+        let n = cells[(y - 1u) * u.width + x];
+        if (ts_el(n) == EL_WOOD && ts_life(n) == 0u) { supported = true; }
+    }
+    if (!supported && y + 1u < u.height) {
+        let n = cells[(y + 1u) * u.width + x];
+        if (ts_el(n) == EL_WOOD && ts_life(n) == 0u) { supported = true; }
+    }
+    if (supported) {
+        cells[i] = ts_set_life(c, 0u);
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct TreeSupportUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    _pad: u32,
+}
+
+/// GPU port of `World::tree_support_check`. Runs every 30 frames
+/// (matches CPU cadence). Two pass modes share a pipeline; we
+/// dispatch one anchor pass + many propagate iterations to push
+/// "supported" flags outward through connected wood.
+struct TreeSupportCtx {
+    pipeline: wgpu::ComputePipeline,
+    u_anchor: wgpu::Buffer,
+    u_propagate: wgpu::Buffer,
+    #[allow(dead_code)]
+    motion_props_buf: wgpu::Buffer,
+    bg_anchor: wgpu::BindGroup,
+    bg_propagate: wgpu::BindGroup,
+    iters: u32,
+}
+
+impl TreeSupportCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = TreeSupportUniforms {
+                width: W as u32,
+                height: H as u32,
+                pass_id,
+                _pad: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let u_anchor = mk_uniform("alembic-treesup-uniforms-anchor", 0);
+        let u_propagate = mk_uniform("alembic-treesup-uniforms-propagate", 1);
+
+        let mut props_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            props_data[i] = crate::motion_props(i as u8);
+        }
+        let motion_props_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-treesup-motion-props"),
+            contents: bytemuck::cast_slice(&props_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-treesup-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bg_anchor = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-treesup-bind-anchor"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_anchor.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
+            ],
+        });
+        let bg_propagate = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-treesup-bind-propagate"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_propagate.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-treesup-shader"),
+            source: wgpu::ShaderSource::Wgsl(TREE_SUPPORT_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-treesup-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-treesup-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        TreeSupportCtx {
+            pipeline,
+            u_anchor,
+            u_propagate,
+            motion_props_buf,
+            bg_anchor,
+            bg_propagate,
+            iters: 50,
+        }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        // Anchor pass.
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-treesup-anchor"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bg_anchor, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        // Propagation iterations.
+        for _ in 0..self.iters {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-treesup-propagate"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bg_propagate, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        let _ = (&self.u_anchor, &self.u_propagate);
+    }
+}
 
 const LIFECYCLE_SHADER: &str = r#"
 struct Uniforms {
@@ -2573,6 +2883,11 @@ struct GpuState {
     /// and decay-to-product (Fire → Empty after life=0, Steam →
     /// Water at boiling temp, etc.).
     lifecycle_compute: LifecycleCtx,
+    /// GPU port of `World::tree_support_check`. Multi-iter flood-fill
+    /// from anchored wood through connected wood. Marks unsupported
+    /// wood with life=1; the wood-life-fall branch in vertical_fall
+    /// then makes those cells fall.
+    tree_support_compute: TreeSupportCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -2902,6 +3217,7 @@ impl GpuState {
         let color_fires_compute = ColorFiresCtx::new(&device, &queue, &cells_buf);
         let flame_emit_compute = FlameTestEmissionCtx::new(&device, &queue, &cells_buf);
         let lifecycle_compute = LifecycleCtx::new(&device, &queue, &cells_buf);
+        let tree_support_compute = TreeSupportCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -2923,6 +3239,7 @@ impl GpuState {
             color_fires_compute,
             flame_emit_compute,
             lifecycle_compute,
+            tree_support_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -3131,6 +3448,7 @@ impl GpuState {
                 clear_flags: true,
                 color_fires: true,
                 flame_test_emission: true,
+                tree_support: true,
             };
             self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
@@ -3160,6 +3478,13 @@ impl GpuState {
             // 1b. lifecycle — tick down life on ephemeral elements
             //     (Fire, Steam, …) so they age and decay this frame.
             self.lifecycle_compute.encode(&mut encoder);
+            // 1c. tree_support — runs every 30 frames (matches CPU
+            //     cadence). Multi-iter flood-fill from anchored
+            //     wood; marks unrooted wood with life=1 so motion
+            //     can drop it.
+            if self.frame_counter % 30 == 0 {
+                self.tree_support_compute.encode(&mut encoder);
+            }
             // 2. PS: column scan + asymmetric blend. Writes new pressure
             //    straight into cells_buf, so the diffusion below sees
             //    post-PS values when it extracts.
