@@ -16,8 +16,9 @@
 
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::{color_rgb, Element, World, H, W};
@@ -54,6 +55,20 @@ struct GpuState {
     /// Window must outlive the surface. Held as Arc so the surface's
     /// 'static lifetime contract is satisfied without unsafe.
     window: Arc<Window>,
+
+    // ---- Input state ----
+    /// Currently-selected element for the paint brush.
+    selected: Element,
+    /// Paint brush radius in cells.
+    brush_radius: i32,
+    /// Last known cursor position in window pixels (top-left origin).
+    cursor_pos: Option<(f64, f64)>,
+    /// True while left mouse is held — paint while held.
+    paint_down: bool,
+    /// True while right mouse is held — erase while held.
+    erase_down: bool,
+    /// Pause toggle (Space).
+    paused: bool,
 }
 
 impl GpuState {
@@ -292,6 +307,56 @@ impl GpuState {
             sim_bind_group,
             sim_pipeline,
             window,
+            selected: Element::Sand,
+            brush_radius: 4,
+            cursor_pos: None,
+            paint_down: false,
+            erase_down: false,
+            paused: false,
+        }
+    }
+
+    /// Translate window-pixel cursor coords into integer grid coords.
+    /// The sim is currently stretched across the entire window with
+    /// no letterbox / no panel — proportional mapping is fine.
+    fn cursor_to_grid(&self, px: f64, py: f64) -> (i32, i32) {
+        let win_w = self.surface_config.width as f64;
+        let win_h = self.surface_config.height as f64;
+        let gx = (px / win_w * W as f64) as i32;
+        let gy = (py / win_h * H as f64) as i32;
+        (gx.clamp(0, W as i32 - 1), gy.clamp(0, H as i32 - 1))
+    }
+
+    /// Apply a brush stroke at the current cursor location, if any.
+    /// Called every frame while a mouse button is held so dragging
+    /// paints continuously.
+    fn apply_brush(&mut self) {
+        let Some((px, py)) = self.cursor_pos else { return; };
+        let (gx, gy) = self.cursor_to_grid(px, py);
+        if self.paint_down {
+            self.world.paint(gx, gy, self.brush_radius, self.selected, 0, false);
+        }
+        if self.erase_down {
+            self.world.paint(gx, gy, self.brush_radius, Element::Empty, 0, false);
+        }
+    }
+
+    /// Map a winit keycode to its element shortcut, if any. Mirrors
+    /// the macroquad version's number-key bindings so muscle memory
+    /// transfers.
+    fn element_for_key(key: KeyCode) -> Option<Element> {
+        match key {
+            KeyCode::Digit1 => Some(Element::Sand),
+            KeyCode::Digit2 => Some(Element::Water),
+            KeyCode::Digit3 => Some(Element::Stone),
+            KeyCode::Digit4 => Some(Element::Wood),
+            KeyCode::Digit5 => Some(Element::CO2),
+            KeyCode::Digit6 => Some(Element::Oil),
+            KeyCode::Digit7 => Some(Element::Lava),
+            KeyCode::Digit8 => Some(Element::Fire),
+            KeyCode::Digit9 => Some(Element::Seed),
+            KeyCode::Digit0 => Some(Element::Empty),
+            _ => None,
         }
     }
 
@@ -303,9 +368,14 @@ impl GpuState {
     }
 
     fn render(&mut self) {
-        // Tick the CPU sim. Wind is zero for now — input wiring lands
-        // in a later phase.
-        self.world.step(macroquad::math::Vec2::new(0.0, 0.0));
+        // Apply paint/erase from any held mouse button before stepping
+        // so the new cells participate in this tick.
+        self.apply_brush();
+
+        // Tick the CPU sim unless paused.
+        if !self.paused {
+            self.world.step(macroquad::math::Vec2::new(0.0, 0.0));
+        }
 
         // Fill the CPU pixel buffer from cell colors. Same path as the
         // legacy macroquad render loop, just writing to our local Vec
@@ -432,6 +502,53 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 state.render();
                 state.window.request_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor_pos = Some((position.x, position.y));
+            }
+            WindowEvent::CursorLeft { .. } => {
+                state.cursor_pos = None;
+            }
+            WindowEvent::MouseInput { state: mouse_state, button, .. } => {
+                let pressed = mouse_state == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => state.paint_down = pressed,
+                    MouseButton::Right => state.erase_down = pressed,
+                    _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Scroll changes brush radius (simple first cut — later
+                // we'll mirror the macroquad version's modifier-key
+                // dispatch for ambient settings, prefab sizing, etc.).
+                let dir: i32 = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => if y > 0.0 { 1 } else if y < 0.0 { -1 } else { 0 },
+                    MouseScrollDelta::PixelDelta(p) => if p.y > 0.0 { 1 } else if p.y < 0.0 { -1 } else { 0 },
+                };
+                state.brush_radius = (state.brush_radius + dir).clamp(1, 30);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed { return; }
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if let Some(el) = GpuState::element_for_key(code) {
+                        state.selected = el;
+                        return;
+                    }
+                    match code {
+                        KeyCode::Space => state.paused = !state.paused,
+                        KeyCode::KeyC => {
+                            // C clears non-frozen matter (mirror the
+                            // macroquad version's clear shortcut).
+                            for c in state.world.cells.iter_mut() {
+                                if !c.is_frozen() {
+                                    *c = crate::Cell::EMPTY;
+                                }
+                            }
+                        }
+                        KeyCode::Escape => event_loop.exit(),
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
