@@ -1931,6 +1931,162 @@ impl ThermalPostCtx {
     }
 }
 
+const FIRE_EMIT_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    parity: u32,            // 0 = even y emits, 1 = odd y emits
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+const EL_EMPTY: u32 = 0u;
+const EL_FIRE:  u32 = 5u;
+
+fn fe_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn fe_burn(c: vec4<u32>) -> u32 { return (c.z >> 8u) & 0xFFu; }
+
+fn fe_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Fire emission from burning cells. CPU's thermal_post emits a Fire
+// cell into the empty cell above with 1/10 probability while a cell
+// is burning. Multi-cell write (we write to (x, y-1)), so split into
+// even-y vs odd-y sub-passes: a cell at row Y writes to Y-1, which
+// is the opposite parity, and the opposite-parity row isn't being
+// processed in this sub-pass — race-free.
+//
+// Fire cell template matches Cell::new(Element::Fire): life ≈ 60,
+// temp = 20 (initial, will be heated by thermal_diffuse next frame),
+// other fields zero.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    if (y == 0u) { return; }
+    if ((y & 1u) != u.parity) { return; }
+    let i = y * u.width + x;
+    let c = cells[i];
+    if (fe_burn(c) == 0u) { return; }
+    let i_above = (y - 1u) * u.width + x;
+    let above = cells[i_above];
+    if (fe_el(above) != EL_EMPTY) { return; }
+    let r = fe_hash(i, u.frame);
+    if ((r % 10u) != 0u) { return; }
+    // Build a Fire cell. life = 60 (mid-range of CPU's 40..80 random),
+    // temp = 20.
+    let pack0 = 5u | (60u << 16u);
+    let pack1 = 20u << 16u;
+    let pack2 = 0u;
+    let pack3 = 0u;
+    cells[i_above] = vec4<u32>(pack0, pack1, pack2, pack3);
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct FireEmitUniforms {
+    width: u32,
+    height: u32,
+    parity: u32,
+    frame: u32,
+}
+
+/// GPU port of the "emit Fire above burning cell" branch of CPU
+/// thermal_post. Two parity sub-passes (even-y rows, odd-y rows)
+/// keep multi-cell writes race-free: row Y writes to row Y-1, which
+/// is opposite parity and not being processed in the same sub-pass.
+struct FireEmitCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 2],
+    pass_bind_groups: [wgpu::BindGroup; 2],
+}
+
+impl FireEmitCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mk_uniform = |label: &str, parity: u32| {
+            let u = FireEmitUniforms { width: W as u32, height: H as u32, parity, frame: 0 };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let pass_uniform_bufs: [wgpu::Buffer; 2] = [
+            mk_uniform("alembic-fireemit-uniforms-even", 0),
+            mk_uniform("alembic-fireemit-uniforms-odd", 1),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-fireemit-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-fireemit-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 2] = [mk_bind(0), mk_bind(1)];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-fireemit-shader"),
+            source: wgpu::ShaderSource::Wgsl(FIRE_EMIT_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-fireemit-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-fireemit-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        FireEmitCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let arr = [frame];
+        let bytes: &[u8] = bytemuck::cast_slice(&arr);
+        for i in 0..2 {
+            queue.write_buffer(&self.pass_uniform_bufs[i], 12, bytes);
+        }
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        for i in 0..2 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-fireemit-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const SOLUTE_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -3543,6 +3699,9 @@ struct GpuState {
     /// GPU port of `World::dissolve` + `World::diffuse_solute`.
     /// Margolus 2x2 4-phase × 2 modes = 8 dispatches per frame.
     solute_compute: SoluteCtx,
+    /// Fire emission from burning cells — visible flames above wood
+    /// fires, gunpowder ignition columns, etc. Two parity sub-passes.
+    fire_emit_compute: FireEmitCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -3875,6 +4034,7 @@ impl GpuState {
         let tree_support_compute = TreeSupportCtx::new(&device, &queue, &cells_buf);
         let thermal_post_compute = ThermalPostCtx::new(&device, &queue, &cells_buf);
         let solute_compute = SoluteCtx::new(&device, &queue, &cells_buf);
+        let fire_emit_compute = FireEmitCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -3899,6 +4059,7 @@ impl GpuState {
             tree_support_compute,
             thermal_post_compute,
             solute_compute,
+            fire_emit_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -4165,6 +4326,10 @@ impl GpuState {
             //     for water-salt dissolution and inter-water solute
             //     equalization.
             self.solute_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 4d. fire emit-above — burning cells spawn visible Fire
+            //     in the empty cell above (1/10 per frame). Two
+            //     parity sub-passes for race-safe multi-cell write.
+            self.fire_emit_compute.encode(&mut encoder, &self.queue, self.frame_counter);
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.
