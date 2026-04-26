@@ -4651,6 +4651,12 @@ impl World {
     // gradually over ~20 frames, giving them time to drive motion and spread
     // through diffusion before the baseline reclaims the field.
     pub fn pressure_sources(&mut self) {
+        // Run on even frames only. Hydrostatic + thermal-pressure
+        // targets are slowly varying; recomputing them every other
+        // frame is visually indistinguishable but halves the per-tick
+        // cost of this pass. Diffusion (pressure / pressure_gpu) still
+        // runs every frame.
+        if self.frame & 1 != 0 { return; }
         if self.pressure_scratch.len() != W * H {
             self.pressure_scratch = vec![0; W * H];
         }
