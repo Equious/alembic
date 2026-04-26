@@ -309,6 +309,79 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     a
 };
 
+/// 16-byte packed `Cell` for GPU storage buffers. Ordered as four
+/// `u32`s so it works in WGSL `array<vec4<u32>>`. Pack layout:
+///   pack0: el(8) | derived_id(8) | seed(8) | flag(8)
+///   pack1: u16 reinterpret-cast of (temp_i16, pressure_i16) — bit-cast.
+///         Stored as: low 16 = (temp as u16), high 16 = (pressure as u16).
+///   pack2: life(16) | moisture(8) | burn(8)
+///   pack3: solute_el(8) | solute_amt(8) | solute_derived_id(8) | _reserved(8)
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CellGpu {
+    pub pack0: u32,
+    pub pack1: u32,
+    pub pack2: u32,
+    pub pack3: u32,
+}
+
+#[inline]
+pub fn pack_cell(c: Cell) -> CellGpu {
+    let pack0 = (c.el as u32)
+        | ((c.derived_id as u32) << 8)
+        | ((c.seed as u32) << 16)
+        | ((c.flag as u32) << 24);
+    let pack1 = (c.temp as u16 as u32) | ((c.pressure as u16 as u32) << 16);
+    let pack2 = (c.life as u32) | ((c.moisture as u32) << 16) | ((c.burn as u32) << 24);
+    let pack3 = (c.solute_el as u32)
+        | ((c.solute_amt as u32) << 8)
+        | ((c.solute_derived_id as u32) << 16);
+    CellGpu { pack0, pack1, pack2, pack3 }
+}
+
+/// Convert a `u8` back to `Element`. Element is `repr(u8)` with
+/// variants in the dense range `0..ELEMENT_COUNT`. We transmute the
+/// byte directly. SAFETY: caller must ensure `id < ELEMENT_COUNT` —
+/// values outside the variant set are UB. Callers in this module
+/// (the GPU readback and pack/unpack helpers) only ever receive
+/// `id`s that came from a `Cell`'s prior `el as u8`, so they round-
+/// trip safely.
+#[inline]
+pub fn element_from_u8(id: u8) -> Element {
+    debug_assert!((id as usize) < ELEMENT_COUNT);
+    unsafe { std::mem::transmute(id) }
+}
+
+#[inline]
+pub fn unpack_cell(g: CellGpu) -> Cell {
+    let el_id = (g.pack0 & 0xFF) as u8;
+    let derived_id = ((g.pack0 >> 8) & 0xFF) as u8;
+    let seed = ((g.pack0 >> 16) & 0xFF) as u8;
+    let flag = ((g.pack0 >> 24) & 0xFF) as u8;
+    let temp = (g.pack1 & 0xFFFF) as u16 as i16;
+    let pressure = ((g.pack1 >> 16) & 0xFFFF) as u16 as i16;
+    let life = (g.pack2 & 0xFFFF) as u16;
+    let moisture = ((g.pack2 >> 16) & 0xFF) as u8;
+    let burn = ((g.pack2 >> 24) & 0xFF) as u8;
+    let solute_el = (g.pack3 & 0xFF) as u8;
+    let solute_amt = ((g.pack3 >> 8) & 0xFF) as u8;
+    let solute_derived_id = ((g.pack3 >> 16) & 0xFF) as u8;
+    Cell {
+        el: element_from_u8(el_id),
+        derived_id,
+        life,
+        seed,
+        flag,
+        temp,
+        moisture,
+        burn,
+        pressure,
+        solute_el: element_from_u8(solute_el),
+        solute_amt,
+        solute_derived_id,
+    }
+}
+
 /// Per-element motion props as packed vec4 for the GPU motion compute:
 ///   x = kind id (Empty=0, Solid=1, Gravel=2, Powder=3, Liquid=4, Gas=5, Fire=6)
 ///   y = density (signed, but we cap at 0 for the GPU shader's swap test)
@@ -3875,11 +3948,17 @@ impl World {
     /// Skip pressure_sources, pressure, AND thermal_diffuse — all
     /// three are running on GPU compute.
     pub fn step_skip_gpu_passes(&mut self, wind: Vec2) {
-        self.step_inner_full(wind, false, false, false);
+        self.step_inner_full2(wind, false, false, false, true);
+    }
+
+    /// Skip pressure_sources, pressure, thermal_diffuse, AND motion
+    /// (`update_cell` sweep) — used when motion runs on GPU compute.
+    pub fn step_skip_gpu_passes_and_motion(&mut self, wind: Vec2) {
+        self.step_inner_full2(wind, false, false, false, false);
     }
 
     fn step_inner(&mut self, wind: Vec2, run_pressure: bool, run_thermal_diffuse: bool) {
-        self.step_inner_full(wind, run_pressure, run_thermal_diffuse, true);
+        self.step_inner_full2(wind, run_pressure, run_thermal_diffuse, true, true);
     }
 
     fn step_inner_full(
@@ -3888,6 +3967,17 @@ impl World {
         run_pressure: bool,
         run_thermal_diffuse: bool,
         run_pressure_sources: bool,
+    ) {
+        self.step_inner_full2(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, true);
+    }
+
+    fn step_inner_full2(
+        &mut self,
+        wind: Vec2,
+        run_pressure: bool,
+        run_thermal_diffuse: bool,
+        run_pressure_sources: bool,
+        run_motion: bool,
     ) {
         self.frame = self.frame.wrapping_add(1);
         let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
@@ -3939,14 +4029,16 @@ impl World {
         self.dissolve();             mark!("dissolve");
         self.diffuse_solute();       mark!("diffuse_solute");
         self.reactions();            mark!("reactions");
-        for y in (0..H as i32).rev() {
-            let lr = self.frame % 2 == 0;
-            for i in 0..W as i32 {
-                let x = if lr { i } else { W as i32 - 1 - i };
-                self.update_cell(x, y, wind);
+        if run_motion {
+            for y in (0..H as i32).rev() {
+                let lr = self.frame % 2 == 0;
+                for i in 0..W as i32 {
+                    let x = if lr { i } else { W as i32 - 1 - i };
+                    self.update_cell(x, y, wind);
+                }
             }
+            mark!("update_cells");
         }
-        mark!("update_cells");
         if run_pressure_sources {
             self.pressure_sources(); mark!("pressure_src");
         }
