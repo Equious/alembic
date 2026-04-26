@@ -391,16 +391,17 @@ impl GpuState {
         state
     }
 
-    /// Compute the pixels-per-cell that would fit the sim entirely
-    /// within the current window (preserving aspect, with letterbox
-    /// or pillarbox bars on the leftover dimension). This is the
-    /// baseline "1× zoom" reference.
+    /// Pixels-per-cell that fills the window without letterbox bars
+    /// (cover-fit). When the window aspect differs from the sim aspect,
+    /// part of the sim is cropped off-screen — the user can pan to see
+    /// it. This is the default "1× zoom" reference; zoom-out below
+    /// this value reveals void around the sim grid.
     fn fit_scale(&self) -> f32 {
         let win_w = self.surface_config.width as f32;
         let win_h = self.surface_config.height as f32;
         let by_w = win_w / W as f32;
         let by_h = win_h / H as f32;
-        by_w.min(by_h)
+        by_w.max(by_h)
     }
 
     /// Reset camera to the default fit-to-window view (sim centered,

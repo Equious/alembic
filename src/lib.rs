@@ -8,14 +8,15 @@ use macroquad::window::miniquad::{
     BlendFactor, BlendState, BlendValue, Equation, PipelineParams,
 };
 
-// Sim grid dimensions. Sized so the play area fills the 1280×1024 window
-// with zero dead space after reserving the right control panel (240 px):
-//   avail = (1280 − 240) × 1024 = 1040 × 1024
-//   cell scale = 1040 / 320 = 3.25 → H = 1024 / 3.25 ≈ 315
-// Window is non-resizable so these proportions hold exactly. The old
-// top status bar is gone — all state now lives in the side panel.
-pub const W: usize = 320;
-pub const H: usize = 315;
+// Sim grid dimensions. v0.3 adopts a 5:4 aspect (400×320) — the wgpu
+// renderer fills standard 1280×1024 / 1280×800-ish windows with zero
+// letterbox at the default camera zoom. Sim size 128 000 cells, ~28%
+// more than the original 320×315 = 100 800. Existing physics tuning
+// continues to hold; the sim's behavior is local to each cell, so a
+// larger grid just means more playable space at proportionally higher
+// per-tick cost.
+pub const W: usize = 400;
+pub const H: usize = 320;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
