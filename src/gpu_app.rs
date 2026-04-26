@@ -1006,7 +1006,7 @@ const MOTION_COMPUTE_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
     height: u32,
-    phase: u32,           // 0..3 — 2x2 block alignment
+    pass_id: u32,         // 0 = vertical fall, 1 = liquid spread
     frame: u32,
 }
 
@@ -1031,126 +1031,92 @@ fn cell_flag(c: vec4<u32>) -> u32 { return (c.x >> 24u) & 0xFFu; }
 fn cell_kind(c: vec4<u32>) -> u32 { return u32(motion_props[cell_el(c)].x); }
 fn cell_density(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].y; }
 fn cell_frozen(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_FROZEN) != 0u; }
-fn cell_movable(c: vec4<u32>) -> bool {
-    if (cell_frozen(c)) { return false; }
-    let k = cell_kind(c);
-    return k != KIND_SOLID;
+
+// Pass 0 — vertical fall: one thread per column, bottom-up walk.
+// When sand at row Y swaps with empty at Y+1, the next iteration
+// (row Y-1) sees the now-empty Y and can fall into it. Cascading is
+// automatic, so a column shifts down by one per frame without
+// fragmenting (which is what Margolus block updates produced).
+//
+// Adjacent columns are independent — straight vertical fall doesn't
+// cross columns — so per-column threads have no race conditions.
+fn vertical_fall(x: u32) {
+    var y = i32(u.height) - 2;
+    loop {
+        if (y < 0) { break; }
+        let i_here = cell_idx(x, u32(y));
+        let i_below = cell_idx(x, u32(y + 1));
+        let c_here = cells[i_here];
+        let c_below = cells[i_below];
+
+        if (!cell_frozen(c_here) && !cell_frozen(c_below)) {
+            let kh = cell_kind(c_here);
+            let kb = cell_kind(c_below);
+            let dh = cell_density(c_here);
+            let db = cell_density(c_below);
+
+            let h_falls = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
+            let b_open  = (kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
+
+            if (h_falls && b_open && dh > db) {
+                cells[i_here]  = c_below;
+                cells[i_below] = c_here;
+            }
+        }
+        y = y - 1;
+    }
 }
 
-// Margolus 2x2 block update. The block's top-left cell is at (bx, by);
-// 4 cells are read, swap rules applied within the block, written back.
-//
-// Rules implemented:
-//  1) gravity: heavier-density cell on top, lighter-density (or empty)
-//     cell on bottom → swap (vertical pair only).
-//  2) liquid spread: liquid sitting on top of solid floor with empty
-//     horizontal neighbor in same block → swap horizontally.
-//  3) gas rise: gas on bottom, lighter-than-its-density on top →
-//     gas swaps up (gas density is low enough that "heavier sinks"
-//     handles most of this naturally).
-//
-// Only 4 cells per workgroup invocation (one Margolus block). Within
-// a phase, blocks don't overlap so writes are race-free.
-@compute @workgroup_size(8, 8, 1)
+// Pass 1 — liquid horizontal spread: one thread per row. Walks
+// left-to-right on even frames, right-to-left on odd, swapping
+// liquid with adjacent empty/gas. Each row is independent (no cross-
+// row reads) so per-row threads don't race.
+fn liquid_spread(y: u32) {
+    let lr = (u.frame & 1u) == 0u;
+    let w_i = i32(u.width);
+    var x: i32;
+    var step: i32;
+    var x_end: i32;
+    if (lr) { x = 0; step = 1; x_end = w_i - 1; }
+    else    { x = w_i - 1; step = -1; x_end = 0; }
+    loop {
+        if (lr) { if (x >= x_end) { break; } }
+        else    { if (x <= x_end) { break; } }
+        let nx = x + step;
+        let i_a = cell_idx(u32(x),  y);
+        let i_b = cell_idx(u32(nx), y);
+        let c_a = cells[i_a];
+        let c_b = cells[i_b];
+        if (!cell_frozen(c_a) && !cell_frozen(c_b)) {
+            let ka = cell_kind(c_a);
+            let kb = cell_kind(c_b);
+            // Only spread if cell BELOW is solid/liquid (i.e. liquid
+            // is sitting on something — otherwise vertical fall handles it).
+            // Cheap proxy: just check directly-below cell at this y+1.
+            let i_below = cell_idx(u32(x), y + 1u);
+            let c_below = cells[i_below];
+            let kbel = cell_kind(c_below);
+            let supported = (kbel != KIND_EMPTY && kbel != KIND_GAS && kbel != KIND_FIRE);
+            if (supported && ka == KIND_LIQUID && (kb == KIND_EMPTY || kb == KIND_GAS)) {
+                cells[i_a] = c_b;
+                cells[i_b] = c_a;
+            }
+        }
+        x = x + step;
+    }
+}
+
+@compute @workgroup_size(64, 1, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let off_x = u.phase & 1u;
-    let off_y = (u.phase >> 1u) & 1u;
-    let bx = gid.x * 2u + off_x;
-    let by = gid.y * 2u + off_y;
-    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
-
-    let i00 = cell_idx(bx,      by);
-    let i10 = cell_idx(bx + 1u, by);
-    let i01 = cell_idx(bx,      by + 1u);
-    let i11 = cell_idx(bx + 1u, by + 1u);
-
-    var c00 = cells[i00];
-    var c10 = cells[i10];
-    var c01 = cells[i01];
-    var c11 = cells[i11];
-
-    // --- Gravity: heavier-on-top vs lighter-on-bottom (left column) ---
-    if (cell_movable(c00) && cell_movable(c01)) {
-        let d_top = cell_density(c00);
-        let d_bot = cell_density(c01);
-        let k_top = cell_kind(c00);
-        let k_bot = cell_kind(c01);
-        // Top is denser AND top is a "falling" kind (powder/gravel/liquid)
-        // OR bottom is gas (which always wants to rise).
-        let top_falls = (k_top == KIND_POWDER || k_top == KIND_GRAVEL || k_top == KIND_LIQUID);
-        let bot_rises = (k_bot == KIND_GAS || k_bot == KIND_FIRE || k_bot == KIND_EMPTY);
-        if (d_top > d_bot && (top_falls || bot_rises)) {
-            let tmp = c00; c00 = c01; c01 = tmp;
-        }
+    if (u.pass_id == 0u) {
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        vertical_fall(x);
+    } else {
+        let y = gid.x;
+        if (y >= u.height - 1u) { return; }
+        liquid_spread(y);
     }
-    // --- Gravity: right column ---
-    if (cell_movable(c10) && cell_movable(c11)) {
-        let d_top = cell_density(c10);
-        let d_bot = cell_density(c11);
-        let k_top = cell_kind(c10);
-        let k_bot = cell_kind(c11);
-        let top_falls = (k_top == KIND_POWDER || k_top == KIND_GRAVEL || k_top == KIND_LIQUID);
-        let bot_rises = (k_bot == KIND_GAS || k_bot == KIND_FIRE || k_bot == KIND_EMPTY);
-        if (d_top > d_bot && (top_falls || bot_rises)) {
-            let tmp = c10; c10 = c11; c11 = tmp;
-        }
-    }
-    // --- Liquid spread: top row, left ↔ right ---
-    {
-        let kl = cell_kind(c00); let kr = cell_kind(c10);
-        if (cell_movable(c00) && cell_movable(c10)) {
-            // liquid spreads into empty/gas horizontally
-            if (kl == KIND_LIQUID && (kr == KIND_EMPTY || kr == KIND_GAS)) {
-                // 50/50 spread bias by frame parity to avoid one-sided drift
-                if ((u.frame & 1u) == 0u) {
-                    let tmp = c00; c00 = c10; c10 = tmp;
-                }
-            } else if (kr == KIND_LIQUID && (kl == KIND_EMPTY || kl == KIND_GAS)) {
-                if ((u.frame & 1u) == 1u) {
-                    let tmp = c00; c00 = c10; c10 = tmp;
-                }
-            }
-        }
-    }
-    // --- Liquid spread: bottom row ---
-    {
-        let kl = cell_kind(c01); let kr = cell_kind(c11);
-        if (cell_movable(c01) && cell_movable(c11)) {
-            if (kl == KIND_LIQUID && (kr == KIND_EMPTY || kr == KIND_GAS)) {
-                if ((u.frame & 1u) == 0u) {
-                    let tmp = c01; c01 = c11; c11 = tmp;
-                }
-            } else if (kr == KIND_LIQUID && (kl == KIND_EMPTY || kl == KIND_GAS)) {
-                if ((u.frame & 1u) == 1u) {
-                    let tmp = c01; c01 = c11; c11 = tmp;
-                }
-            }
-        }
-    }
-    // --- Diagonal slide: powder on top with same-density (no fall)
-    //     can slide diagonally if one of the diagonals is empty/gas. ---
-    if (cell_movable(c00) && cell_kind(c00) == KIND_POWDER && cell_kind(c01) != KIND_EMPTY && cell_kind(c01) != KIND_GAS) {
-        // c00 (top-left) blocked from falling; try diagonal to c11 (bottom-right)
-        if (cell_movable(c11)) {
-            let k11 = cell_kind(c11);
-            if (k11 == KIND_EMPTY || k11 == KIND_GAS) {
-                let tmp = c00; c00 = c11; c11 = tmp;
-            }
-        }
-    }
-    if (cell_movable(c10) && cell_kind(c10) == KIND_POWDER && cell_kind(c11) != KIND_EMPTY && cell_kind(c11) != KIND_GAS) {
-        if (cell_movable(c01)) {
-            let k01 = cell_kind(c01);
-            if (k01 == KIND_EMPTY || k01 == KIND_GAS) {
-                let tmp = c10; c10 = c01; c01 = tmp;
-            }
-        }
-    }
-
-    cells[i00] = c00;
-    cells[i10] = c10;
-    cells[i01] = c01;
-    cells[i11] = c11;
 }
 "#;
 
@@ -1159,30 +1125,29 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct MotionUniforms {
     width: u32,
     height: u32,
-    phase: u32,
+    pass_id: u32,         // 0 = vertical fall, 1 = liquid spread
     frame: u32,
 }
 
-/// GPU motion compute pipeline. Operates on a packed `CellGpu` storage
-/// buffer using Margolus 2×2 block updates: each frame runs 4 phases
-/// covering all (offset_x, offset_y) ∈ {0,1}² block alignments so every
-/// cell-pair gets a chance to swap. Phases share the same buffer and
-/// don't conflict because blocks within a phase are disjoint.
+/// GPU motion compute pipeline. Two passes per frame:
+///   pass 0: vertical fall (1 thread per column, bottom-up walk).
+///           Cells fall through empty space, cascading within the
+///           same thread. Adjacent columns are independent.
+///   pass 1: liquid spread (1 thread per row, frame-parity-biased
+///           direction). Liquids resting on solid floor spread
+///           horizontally into adjacent empty/gas.
+/// Each pass uses its own pre-baked uniform buffer + bind group
+/// because queue.write_buffer collapses to last-write-wins within
+/// a single submit (so a shared uniform with in-loop writes makes
+/// every dispatch see the same value).
 struct MotionComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    /// Four uniform buffers — one per Margolus phase, with `phase`
-    /// pre-baked at create time. queue.write_buffer collapses to
-    /// "last-write-wins" within a single submit, so we cannot use a
-    /// shared uniform buffer with 4 in-loop writes; per-phase
-    /// dedicated buffers sidestep that entirely.
-    phase_uniform_bufs: [wgpu::Buffer; 4],
+    pass_uniform_bufs: [wgpu::Buffer; 2],
     #[allow(dead_code)]
     motion_props_buf: wgpu::Buffer,
     cells_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
-    /// One bind group per phase, each pointing at the matching phase
-    /// uniform buffer (and the shared cells/motion_props buffers).
-    phase_bind_groups: [wgpu::BindGroup; 4],
+    pass_bind_groups: [wgpu::BindGroup; 2],
     cells_staging: Vec<crate::CellGpu>,
     write_idx: usize,
     has_data: [bool; 2],
@@ -1204,21 +1169,19 @@ impl MotionComputeCtx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // 4 phase uniform buffers, each pre-baked with a different
-        // phase index. Frame is updated every frame on all 4.
-        let mk_phase_uniform = |phase: u32, label: &str| {
-            let u = MotionUniforms { width: W as u32, height: H as u32, phase, frame: 0 };
+        // 2 pass uniform buffers, each pre-baked with a different
+        // pass_id. Frame is updated every frame on both.
+        let mk_pass_uniform = |pass_id: u32, label: &str| {
+            let u = MotionUniforms { width: W as u32, height: H as u32, pass_id, frame: 0 };
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents: bytemuck::cast_slice(&[u]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        let phase_uniform_bufs: [wgpu::Buffer; 4] = [
-            mk_phase_uniform(0, "alembic-motion-uniforms-p0"),
-            mk_phase_uniform(1, "alembic-motion-uniforms-p1"),
-            mk_phase_uniform(2, "alembic-motion-uniforms-p2"),
-            mk_phase_uniform(3, "alembic-motion-uniforms-p3"),
+        let pass_uniform_bufs: [wgpu::Buffer; 2] = [
+            mk_pass_uniform(0, "alembic-motion-uniforms-vfall"),
+            mk_pass_uniform(1, "alembic-motion-uniforms-lspread"),
         ];
         let _ = queue;
 
@@ -1264,12 +1227,12 @@ impl MotionComputeCtx {
             label: Some("alembic-motion-bind"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: phase_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
             ],
         });
-        let phase_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let pass_bind_groups: [wgpu::BindGroup; 2] = [mk_bind(0), mk_bind(1)];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-motion-shader"),
             source: wgpu::ShaderSource::Wgsl(MOTION_COMPUTE_SHADER.into()),
@@ -1289,11 +1252,11 @@ impl MotionComputeCtx {
         });
         MotionComputeCtx {
             pipeline,
-            phase_uniform_bufs,
+            pass_uniform_bufs,
             motion_props_buf,
             cells_buf,
             readback_bufs,
-            phase_bind_groups,
+            pass_bind_groups,
             cells_staging: vec![crate::CellGpu::default(); cell_count],
             write_idx: 0,
             has_data: [false; 2],
@@ -1308,35 +1271,35 @@ impl MotionComputeCtx {
         queue.write_buffer(&self.cells_buf, 0, bytemuck::cast_slice(&self.cells_staging));
     }
 
-    /// Encode all 4 Margolus phases for a single frame of motion. Each
-    /// phase has its own pre-baked uniform buffer + bind group — the
-    /// frame counter is the only per-frame value that needs updating,
-    /// and we write it to all 4 buffers up-front (one queue.write each
-    /// before submit, no in-loop overwrites).
+    /// Encode the 2 motion passes for one frame.
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
         let cell_count = W * H;
-        let blocks_x = (W as u32 + 1) / 2;
-        let blocks_y = (H as u32 + 1) / 2;
-        let wg_x = (blocks_x + 7) / 8;
-        let wg_y = (blocks_y + 7) / 8;
-        // Update `frame` field at offset 12 (after width, height, phase
-        // — each u32, 4 bytes) on each phase uniform. Phase field is
-        // pre-baked at create time and stays put.
         let frame_arr = [frame];
         let frame_bytes = bytemuck::cast_slice(&frame_arr);
-        for i in 0..4 {
-            queue.write_buffer(&self.phase_uniform_bufs[i], 12, frame_bytes);
+        for i in 0..2 {
+            queue.write_buffer(&self.pass_uniform_bufs[i], 12, frame_bytes);
         }
-        // Run phases in order. wgpu inserts a barrier between separate
-        // compute passes so writes from phase N are visible to phase N+1.
-        for i in 0..4 {
+        // Pass 0: vertical fall, 1 thread per column.
+        {
+            let wg = (W as u32 + 63) / 64;
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("alembic-motion-cpass"),
+                label: Some("alembic-motion-vfall"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.phase_bind_groups[i], &[]);
-            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+            cpass.set_bind_group(0, &self.pass_bind_groups[0], &[]);
+            cpass.dispatch_workgroups(wg, 1, 1);
+        }
+        // Pass 1: liquid spread, 1 thread per row.
+        {
+            let wg = (H as u32 + 63) / 64;
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-motion-lspread"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[1], &[]);
+            cpass.dispatch_workgroups(wg, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
             &self.cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
@@ -1474,6 +1437,10 @@ struct GpuState {
     middle_drag_from: Option<(f64, f64)>,
 
     // ---- Camera state ----
+    /// Set by the C key. Render reads it after motion readback and
+    /// before the CPU step so the clear actually sticks (otherwise
+    /// motion's full-cells readback overwrites the cleared cells).
+    pending_clear: bool,
     /// World-space cell coordinate at the center of the view.
     /// Default: (W/2, H/2) → sim is centered. Pan moves this around.
     cam_center_x: f32,
@@ -1771,6 +1738,7 @@ impl GpuState {
             paused: false,
             ctrl_held: false,
             middle_drag_from: None,
+            pending_clear: false,
             cam_center_x: W as f32 * 0.5,
             cam_center_y: H as f32 * 0.5,
             cam_scale: 1.0,
@@ -1951,6 +1919,19 @@ impl GpuState {
             self.thermal_compute.read_back_prev_into(&mut self.world);
         }
         let t_compute_readback = t_compute_start.elapsed();
+
+        // Pending C-key clear runs AFTER the readback so it isn't
+        // wiped by motion's full-cells overwrite. apply_brush and
+        // step then operate on the cleared state and the next stage
+        // upload pushes the clear into the GPU buffer.
+        if self.pending_clear {
+            for c in self.world.cells.iter_mut() {
+                if !c.is_frozen() {
+                    *c = crate::Cell::EMPTY;
+                }
+            }
+            self.pending_clear = false;
+        }
 
         // Apply paint/erase from any held mouse button. Operates on
         // the just-read-back world.cells so the paint sticks.
@@ -2275,11 +2256,10 @@ impl ApplicationHandler for App {
                             state.pan_pixels(0.0, -win_h * pan_step_px);
                         }
                         KeyCode::KeyC => {
-                            for c in state.world.cells.iter_mut() {
-                                if !c.is_frozen() {
-                                    *c = crate::Cell::EMPTY;
-                                }
-                            }
+                            // Defer the actual clear until render() so it
+                            // happens AFTER motion readback (which would
+                            // otherwise resurrect the cleared cells).
+                            state.pending_clear = true;
                         }
                         KeyCode::Escape => event_loop.exit(),
                         _ => {}
