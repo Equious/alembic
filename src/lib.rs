@@ -9,11 +9,8 @@ use macroquad::window::miniquad::{
 };
 
 // Sim grid dimensions. v0.3 settles on 600×480 (5:4) — 2.25× the
-// original 320×315 = 100 800 cells. Bigger than the legacy grid so
-// zoom-out actually reveals more playspace, but not so big that CPU
-// sim cost (which scales linearly) tanks the framerate. The default
-// camera is bottom-aligned so the user sees the floor immediately
-// without having to pan/zoom.
+// original 320×315 = 100 800 cells. Held to this size while CPU sim
+// is the backstop. v0.4 GPU compute will let us grow this dramatically.
 pub const W: usize = 600;
 pub const H: usize = 480;
 
