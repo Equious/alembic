@@ -1170,12 +1170,19 @@ struct MotionUniforms {
 /// don't conflict because blocks within a phase are disjoint.
 struct MotionComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    uniform_buf: wgpu::Buffer,
+    /// Four uniform buffers — one per Margolus phase, with `phase`
+    /// pre-baked at create time. queue.write_buffer collapses to
+    /// "last-write-wins" within a single submit, so we cannot use a
+    /// shared uniform buffer with 4 in-loop writes; per-phase
+    /// dedicated buffers sidestep that entirely.
+    phase_uniform_bufs: [wgpu::Buffer; 4],
     #[allow(dead_code)]
     motion_props_buf: wgpu::Buffer,
     cells_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
-    bind_group: wgpu::BindGroup,
+    /// One bind group per phase, each pointing at the matching phase
+    /// uniform buffer (and the shared cells/motion_props buffers).
+    phase_bind_groups: [wgpu::BindGroup; 4],
     cells_staging: Vec<crate::CellGpu>,
     write_idx: usize,
     has_data: [bool; 2],
@@ -1197,12 +1204,22 @@ impl MotionComputeCtx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let init_uniforms = MotionUniforms { width: W as u32, height: H as u32, phase: 0, frame: 0 };
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("alembic-motion-uniforms"),
-            contents: bytemuck::cast_slice(&[init_uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        // 4 phase uniform buffers, each pre-baked with a different
+        // phase index. Frame is updated every frame on all 4.
+        let mk_phase_uniform = |phase: u32, label: &str| {
+            let u = MotionUniforms { width: W as u32, height: H as u32, phase, frame: 0 };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let phase_uniform_bufs: [wgpu::Buffer; 4] = [
+            mk_phase_uniform(0, "alembic-motion-uniforms-p0"),
+            mk_phase_uniform(1, "alembic-motion-uniforms-p1"),
+            mk_phase_uniform(2, "alembic-motion-uniforms-p2"),
+            mk_phase_uniform(3, "alembic-motion-uniforms-p3"),
+        ];
         let _ = queue;
 
         let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1243,15 +1260,16 @@ impl MotionComputeCtx {
                 },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("alembic-motion-bind"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: phase_uniform_bufs[i].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
             ],
         });
+        let phase_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-motion-shader"),
             source: wgpu::ShaderSource::Wgsl(MOTION_COMPUTE_SHADER.into()),
@@ -1271,11 +1289,11 @@ impl MotionComputeCtx {
         });
         MotionComputeCtx {
             pipeline,
-            uniform_buf,
+            phase_uniform_bufs,
             motion_props_buf,
             cells_buf,
             readback_bufs,
-            bind_group,
+            phase_bind_groups,
             cells_staging: vec![crate::CellGpu::default(); cell_count],
             write_idx: 0,
             has_data: [false; 2],
@@ -1291,36 +1309,35 @@ impl MotionComputeCtx {
     }
 
     /// Encode all 4 Margolus phases for a single frame of motion. Each
-    /// phase rebinds the same buffer with a different uniform `phase`
-    /// value. Phases share the same in-place buffer; within each phase
-    /// the disjoint-block invariant prevents races.
+    /// phase has its own pre-baked uniform buffer + bind group — the
+    /// frame counter is the only per-frame value that needs updating,
+    /// and we write it to all 4 buffers up-front (one queue.write each
+    /// before submit, no in-loop overwrites).
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
         let cell_count = W * H;
         let blocks_x = (W as u32 + 1) / 2;
         let blocks_y = (H as u32 + 1) / 2;
         let wg_x = (blocks_x + 7) / 8;
         let wg_y = (blocks_y + 7) / 8;
-        // Run phases in a fixed order: (0,0), (1,0), (0,1), (1,1).
-        // Each phase needs the previous phase's writes visible — wgpu
-        // automatically inserts a barrier between separate compute
-        // passes, so we begin/end a pass per phase.
-        for phase in 0u32..4u32 {
-            let uniforms = MotionUniforms {
-                width: W as u32,
-                height: H as u32,
-                phase,
-                frame,
-            };
-            queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+        // Update `frame` field at offset 12 (after width, height, phase
+        // — each u32, 4 bytes) on each phase uniform. Phase field is
+        // pre-baked at create time and stays put.
+        let frame_arr = [frame];
+        let frame_bytes = bytemuck::cast_slice(&frame_arr);
+        for i in 0..4 {
+            queue.write_buffer(&self.phase_uniform_bufs[i], 12, frame_bytes);
+        }
+        // Run phases in order. wgpu inserts a barrier between separate
+        // compute passes so writes from phase N are visible to phase N+1.
+        for i in 0..4 {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("alembic-motion-cpass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.set_bind_group(0, &self.phase_bind_groups[i], &[]);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        // Copy the (in-place mutated) cells buffer to readback for next-frame consumption.
         encoder.copy_buffer_to_buffer(
             &self.cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
             (cell_count * std::mem::size_of::<crate::CellGpu>()) as wgpu::BufferAddress,
