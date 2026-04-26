@@ -6,6 +6,20 @@ edition = "2024"
 [dependencies]
 macroquad = "0.4"
 rayon = "1.10"
+# wgpu migration (v0.3) — modern GPU stack with real compute shaders
+# and storage buffers. winit for window/event loop.
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1.16", features = ["derive"] }
+
+[[bin]]
+name = "alembic"
+path = "src/main.rs"
+
+[[bin]]
+name = "alembic-wgpu"
+path = "src/wgpu_main.rs"
 
 [dev-dependencies]
 serial_test = "3.2.0"

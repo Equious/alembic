@@ -1,3 +1,8 @@
+// v0.3 wgpu rendering backend — runs the binary `alembic-wgpu`.
+// The legacy macroquad path below remains compiled and runnable as
+// `alembic` until the migration is complete.
+pub mod gpu_app;
+
 use macroquad::prelude::*;
 use macroquad::window::miniquad::{
     BlendFactor, BlendState, BlendValue, Equation, PipelineParams,
