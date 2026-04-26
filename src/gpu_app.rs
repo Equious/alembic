@@ -366,7 +366,7 @@ impl PressureComputeCtx {
         }
     }
 
-    fn dispatch(&mut self, world: &mut World, device: &wgpu::Device, queue: &wgpu::Queue) {
+    fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue) {
         let cell_count = W * H;
         for i in 0..cell_count {
             self.pressure_staging[i] = world.cells[i].pressure as i32;
@@ -374,10 +374,10 @@ impl PressureComputeCtx {
         }
         queue.write_buffer(&self.pressure_a, 0, bytemuck::cast_slice(&self.pressure_staging));
         queue.write_buffer(&self.perm_buf, 0, bytemuck::cast_slice(&self.perm_staging));
+    }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("alembic-pressure-encoder"),
-        });
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let cell_count = W * H;
         let wg_x = (W as u32 + 15) / 16;
         let wg_y = (H as u32 + 15) / 16;
         for iter in 0..self.iters {
@@ -390,25 +390,19 @@ impl PressureComputeCtx {
             cpass.set_bind_group(0, bind, &[]);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        // Final write target: even-iter writes B; odd writes A.
-        // ITERS=3 → iter 0,1,2 → writes B,A,B → final in B.
         let final_buf = if self.iters % 2 == 1 { &self.pressure_b } else { &self.pressure_a };
         encoder.copy_buffer_to_buffer(
             final_buf, 0, &self.readback_buf, 0,
             (cell_count * 4) as wgpu::BufferAddress,
         );
-        queue.submit(std::iter::once(encoder.finish()));
+    }
 
-        // Map for readback. wgpu::PollType::Wait blocks the CPU until
-        // the GPU finishes — sync, but without GL's per-call flush
-        // overhead. Compute + readback should be a few ms total.
+    fn start_map(&self) {
+        self.readback_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    }
+
+    fn read_back_into(&self, world: &mut World) {
         let slice = self.readback_buf.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        let _ = device.poll(wgpu::Maintain::Wait);
-        let _ = receiver.recv();
         {
             let data = slice.get_mapped_range();
             let result: &[i32] = bytemuck::cast_slice(&data);
@@ -576,7 +570,7 @@ impl ThermalComputeCtx {
         }
     }
 
-    fn dispatch(&mut self, world: &mut World, device: &wgpu::Device, queue: &wgpu::Queue, frame: u32, ambient_offset: i16) {
+    fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue, frame: u32, ambient_offset: i16) {
         let cell_count = W * H;
         for i in 0..cell_count {
             self.temp_staging[i] = world.cells[i].temp as i32;
@@ -591,13 +585,12 @@ impl ThermalComputeCtx {
             frame,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+    }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("alembic-thermal-encoder"),
-        });
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let cell_count = W * H;
         let wg_x = (W as u32 + 15) / 16;
         let wg_y = (H as u32 + 15) / 16;
-        // One iteration of thermal diffusion (matches CPU reference).
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("alembic-thermal-cpass"),
@@ -611,13 +604,16 @@ impl ThermalComputeCtx {
             &self.temp_b, 0, &self.readback_buf, 0,
             (cell_count * 4) as wgpu::BufferAddress,
         );
-        queue.submit(std::iter::once(encoder.finish()));
+        // Keep ownership-only fields lint-quiet.
+        let _ = (&self.bind_b_to_a, &self.profiles_buf, &self.temp_a);
+    }
 
+    fn start_map(&self) {
+        self.readback_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    }
+
+    fn read_back_into(&self, world: &mut World) {
         let slice = self.readback_buf.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = sender.send(result); });
-        let _ = device.poll(wgpu::Maintain::Wait);
-        let _ = receiver.recv();
         {
             let data = slice.get_mapped_range();
             let result: &[i32] = bytemuck::cast_slice(&data);
@@ -626,9 +622,6 @@ impl ThermalComputeCtx {
             }
         }
         self.readback_buf.unmap();
-        // Suppress "field never used" lint for fields we keep alive
-        // for resource ownership but don't reference per-call.
-        let _ = (&self.bind_b_to_a, &self.profiles_buf, &self.temp_a);
     }
 }
 
@@ -1191,15 +1184,27 @@ impl GpuState {
         let t_sim = t_sim_start.elapsed();
         let t_compute_start = std::time::Instant::now();
         if !self.paused {
-            self.pressure_compute.dispatch(&mut self.world, &self.device, &self.queue);
+            // Combined compute pass: stage both inputs, encode both
+            // dispatches in one command buffer, single submit, single
+            // map_async pair, single device.poll(Wait). Cuts the GPU
+            // sync overhead in half vs running them serially.
+            self.pressure_compute.stage_and_upload(&self.world, &self.queue);
             let amb = self.world.ambient_offset;
-            self.thermal_compute.dispatch(
-                &mut self.world,
-                &self.device,
-                &self.queue,
-                self.frame_counter,
-                amb,
-            );
+            self.thermal_compute.stage_and_upload(&self.world, &self.queue, self.frame_counter, amb);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("alembic-combined-compute-encoder"),
+            });
+            self.pressure_compute.encode(&mut encoder);
+            self.thermal_compute.encode(&mut encoder);
+            self.queue.submit(std::iter::once(encoder.finish()));
+            // Queue both maps before polling — poll(Wait) drains all
+            // pending GPU work, so both buffers become readable in
+            // a single sync.
+            self.pressure_compute.start_map();
+            self.thermal_compute.start_map();
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+            self.pressure_compute.read_back_into(&mut self.world);
+            self.thermal_compute.read_back_into(&mut self.world);
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
         let t_compute = t_compute_start.elapsed();
