@@ -1036,29 +1036,46 @@ fn cell_frozen(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_FROZEN) != 0u
 // Adjacent columns are independent — straight vertical fall doesn't
 // cross columns — so per-column threads have no race conditions.
 fn vertical_fall(x: u32) {
-    var y = i32(u.height) - 2;
-    loop {
-        if (y < 0) { break; }
-        let i_here = cell_idx(x, u32(y));
-        let i_below = cell_idx(x, u32(y + 1));
-        let c_here = cells[i_here];
-        let c_below = cells[i_below];
+    // Run the column scan multiple times per frame. Each pass shifts
+    // a falling column by one row, so 4 iterations = up to 4 rows of
+    // fall per frame — closer to terminal velocity, less of "things
+    // hang in the air for ages." Cheap: 4 × 900 cell visits per
+    // thread on the GPU.
+    for (var iter = 0u; iter < 4u; iter = iter + 1u) {
+        var y = i32(u.height) - 2;
+        loop {
+            if (y < 0) { break; }
+            let i_here = cell_idx(x, u32(y));
+            let i_below = cell_idx(x, u32(y + 1));
+            let c_here = cells[i_here];
+            let c_below = cells[i_below];
 
-        if (!cell_frozen(c_here) && !cell_frozen(c_below)) {
-            let kh = cell_kind(c_here);
-            let kb = cell_kind(c_below);
-            let dh = cell_density(c_here);
-            let db = cell_density(c_below);
+            if (!cell_frozen(c_here) && !cell_frozen(c_below)) {
+                let kh = cell_kind(c_here);
+                let kb = cell_kind(c_below);
+                let dh = cell_density(c_here);
+                let db = cell_density(c_below);
 
-            let h_falls = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
-            let b_open  = (kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
-
-            if (h_falls && b_open && dh > db) {
-                cells[i_here]  = c_below;
-                cells[i_below] = c_here;
+                let h_falls = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
+                let b_open  = (kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
+                // Heavier-on-top falls into lighter-on-bottom.
+                if (h_falls && b_open && dh > db) {
+                    cells[i_here]  = c_below;
+                    cells[i_below] = c_here;
+                }
+                // Buoyancy: lighter-on-bottom rises into heavier-on-top.
+                // Empty/gas on top with denser gas/fire below swaps so
+                // gases bubble up. Without this rule, steam, smoke, and
+                // other gases just sit in mid-air.
+                else if ((kh == KIND_EMPTY || kh == KIND_GAS)
+                      && (kb == KIND_GAS || kb == KIND_FIRE)
+                      && kh != kb) {
+                    cells[i_here]  = c_below;
+                    cells[i_below] = c_here;
+                }
             }
+            y = y - 1;
         }
-        y = y - 1;
     }
 }
 
@@ -1080,40 +1097,44 @@ fn diagonal_slide(x: u32, parity: u32) {
     let nx = i32(x) + dir;
     if (nx < 0 || nx >= i32(u.width)) { return; }
 
-    var y = i32(u.height) - 2;
-    loop {
-        if (y < 0) { break; }
-        let i_here = cell_idx(x, u32(y));
-        let i_below = cell_idx(x, u32(y + 1));
-        let i_diag  = cell_idx(u32(nx), u32(y + 1));
-        let c_here  = cells[i_here];
-        let c_below = cells[i_below];
-        let c_diag  = cells[i_diag];
+    // 4 iterations to match vfall — diagonal slides also propagate
+    // multiple rows per frame for fast pile settling.
+    for (var iter = 0u; iter < 4u; iter = iter + 1u) {
+        var y = i32(u.height) - 2;
+        loop {
+            if (y < 0) { break; }
+            let i_here = cell_idx(x, u32(y));
+            let i_below = cell_idx(x, u32(y + 1));
+            let i_diag  = cell_idx(u32(nx), u32(y + 1));
+            let c_here  = cells[i_here];
+            let c_below = cells[i_below];
+            let c_diag  = cells[i_diag];
 
-        if (!cell_frozen(c_here) && !cell_frozen(c_diag)) {
-            let kh = cell_kind(c_here);
-            let kb = cell_kind(c_below);
-            let kd = cell_kind(c_diag);
-            let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
-            let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
-            let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
-            // Only the TOP cell of a pile column may slide. If there's
-            // another sand-like cell above us, sliding here would leave
-            // a gap that vfall couldn't fill until next frame — visible
-            // as horizontal voids running through the pile. With this
-            // check, internal cells stay put while the surface slides.
-            var above_blocks = false;
-            if (y > 0) {
-                let i_above = cell_idx(x, u32(y - 1));
-                let ka = cell_kind(cells[i_above]);
-                above_blocks = (ka == KIND_POWDER || ka == KIND_GRAVEL || ka == KIND_LIQUID);
+            if (!cell_frozen(c_here) && !cell_frozen(c_diag)) {
+                let kh = cell_kind(c_here);
+                let kb = cell_kind(c_below);
+                let kd = cell_kind(c_diag);
+                let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
+                let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
+                let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
+                // Only the TOP cell of a pile column may slide. If there's
+                // another sand-like cell above us, sliding here would leave
+                // a gap that vfall couldn't fill until next frame — visible
+                // as horizontal voids running through the pile. With this
+                // check, internal cells stay put while the surface slides.
+                var above_blocks = false;
+                if (y > 0) {
+                    let i_above = cell_idx(x, u32(y - 1));
+                    let ka = cell_kind(cells[i_above]);
+                    above_blocks = (ka == KIND_POWDER || ka == KIND_GRAVEL || ka == KIND_LIQUID);
+                }
+                if (h_slides && b_blocks && d_open && !above_blocks) {
+                    cells[i_here] = c_diag;
+                    cells[i_diag] = c_here;
+                }
             }
-            if (h_slides && b_blocks && d_open && !above_blocks) {
-                cells[i_here] = c_diag;
-                cells[i_diag] = c_here;
-            }
+            y = y - 1;
         }
-        y = y - 1;
     }
 }
 
