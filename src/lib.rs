@@ -361,6 +361,16 @@ pub fn cells_copy_from_bytes(cells: &mut [Cell], data: &[u8]) {
     }
 }
 
+/// Per-element permeability for the GPU pressure-diffusion shader.
+/// Returned as a vec4 (only x is used) so it slots into the standard
+/// `array<vec4<u32>, 24>` uniform layout (96 elements packed 4 per vec).
+/// Replaces the per-cell `perm` upload — element id → perm via LUT.
+pub fn pressure_perm_props(id: u8) -> [u32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0; 4]; }
+    [PRESSURE[i].permeability as u32, 0, 0, 0]
+}
+
 /// Per-element motion props as packed vec4 for the GPU motion compute:
 ///   x = kind id (Empty=0, Solid=1, Gravel=2, Powder=3, Liquid=4, Gas=5, Fire=6)
 ///   y = density (signed, but we cap at 0 for the GPU shader's swap test)

@@ -36,13 +36,17 @@ struct Uniforms {
     height: u32,
     ambient_offset: i32,
     frame: u32,
+    pass_id: u32,            // 0=extract, 1=diffuse, 2=writeback
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> temp_in: array<i32>;
 @group(0) @binding(2) var<storage, read_write> temp_out: array<i32>;
-@group(0) @binding(3) var<storage, read> el: array<u32>;
-// Per-element thermal profile, indexed by el[i].
+@group(0) @binding(3) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element thermal profile, indexed by el extracted from cells[i].
 //   x = conductivity, y = ambient_temp, z = ambient_rate, w = heat_capacity
 @group(0) @binding(4) var<uniform> profiles: array<vec4<f32>, 96>;
 
@@ -60,6 +64,13 @@ fn hash_random(i: u32, frame: u32) -> f32 {
     return f32(h) / 4294967295.0;
 }
 
+fn cell_el_thermal(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+// Extract i16 from bits 16-31 of `word` and sign-extend to i32.
+fn extract_i16_thermal(word: u32) -> i32 {
+    let raw = (word >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+
 @compute @workgroup_size(16, 16)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = i32(gid.x);
@@ -67,9 +78,28 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w_i = i32(u.width);
     let h_i = i32(u.height);
     if (x >= w_i || y >= h_i) { return; }
-
     let i = u32(y * w_i + x);
-    let me_el = el[i];
+
+    if (u.pass_id == 0u) {
+        // Extract: copy current temp (i16 at bits 16-31 of cells[i].y)
+        // into temp_out (acts as scratch_a for the first diffuse iter).
+        temp_out[i] = extract_i16_thermal(cells[i].y);
+        return;
+    }
+    if (u.pass_id == 2u) {
+        // Writeback: temp_in holds the final diffused temp. Clamp to
+        // i16, write back to bits 16-31 of cells[i].y while preserving
+        // seed (bits 0-7) and flag (bits 8-15).
+        let final_t = clamp(temp_in[i], -273, 4000);
+        let raw = u32(final_t) & 0xFFFFu;
+        let lo = cells[i].y & 0x0000FFFFu;
+        cells[i].y = lo | (raw << 16u);
+        return;
+    }
+
+    // pass_id == 1: diffusion iteration.
+    let me_cell = cells[i];
+    let me_el = cell_el_thermal(me_cell);
     let me_props = profiles[me_el];
     let my_k = me_props.x;
     let me_t = f32(temp_in[i]);
@@ -77,10 +107,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var delta: f32 = 0.0;
     var diff_neighbors: f32 = 0.0;
     var oob_neighbors: f32 = 0.0;
-    // 4 neighbors (cardinals).
     if (x > 0) {
         let ni = u32(y * w_i + (x - 1));
-        let n_el = el[ni];
+        let n_el = cell_el_thermal(cells[ni]);
         let n_k = profiles[n_el].x;
         let n_t = f32(temp_in[ni]);
         let k = min(my_k, n_k);
@@ -89,7 +118,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else { oob_neighbors += 1.0; }
     if (x < w_i - 1) {
         let ni = u32(y * w_i + (x + 1));
-        let n_el = el[ni];
+        let n_el = cell_el_thermal(cells[ni]);
         let n_k = profiles[n_el].x;
         let n_t = f32(temp_in[ni]);
         let k = min(my_k, n_k);
@@ -98,7 +127,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else { oob_neighbors += 1.0; }
     if (y > 0) {
         let ni = u32((y - 1) * w_i + x);
-        let n_el = el[ni];
+        let n_el = cell_el_thermal(cells[ni]);
         let n_k = profiles[n_el].x;
         let n_t = f32(temp_in[ni]);
         let k = min(my_k, n_k);
@@ -107,7 +136,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else { oob_neighbors += 1.0; }
     if (y < h_i - 1) {
         let ni = u32((y + 1) * w_i + x);
-        let n_el = el[ni];
+        let n_el = cell_el_thermal(cells[ni]);
         let n_k = profiles[n_el].x;
         let n_t = f32(temp_in[ni]);
         let k = min(my_k, n_k);
@@ -141,16 +170,29 @@ const PRESSURE_COMPUTE_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
     height: u32,
-    _pad0: u32,
-    _pad1: u32,
+    pass_id: u32,            // 0=extract, 1=diffuse, 2=writeback
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> pressure_in: array<i32>;
 @group(0) @binding(2) var<storage, read_write> pressure_out: array<i32>;
-@group(0) @binding(3) var<storage, read> perm: array<u32>;
+@group(0) @binding(3) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element permeability LUT: 96 elements packed 4 per vec4.
+@group(0) @binding(4) var<uniform> perm_lut: array<vec4<u32>, 24>;
 
 const DIFF_SCALE: i32 = 2048;
+
+fn cell_el_pcompute(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cell_perm_pcompute(c: vec4<u32>) -> u32 {
+    let id = cell_el_pcompute(c);
+    return perm_lut[id / 4u][id % 4u];
+}
+// Extract i16 from bits 16-31 of `word` and sign-extend to i32.
+fn extract_i16_pcompute(word: u32) -> i32 {
+    let raw = (word >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
 
 @compute @workgroup_size(16, 16)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -160,7 +202,27 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h_i = i32(u.height);
     if (x >= w_i || y >= h_i) { return; }
     let i = u32(y * w_i + x);
-    let me_perm = i32(perm[i]);
+
+    if (u.pass_id == 0u) {
+        // Extract: copy current pressure (i16 at bits 16-31 of cells[i].z)
+        // into pressure_out (acts as scratch_a for the first diffuse iter).
+        pressure_out[i] = extract_i16_pcompute(cells[i].z);
+        return;
+    }
+    if (u.pass_id == 2u) {
+        // Writeback: pressure_in holds the final diffused pressure.
+        // Clamp to i16, write back to bits 16-31 of cells[i].z while
+        // preserving moisture (bits 0-7) and burn (bits 8-15).
+        let final_p = clamp(pressure_in[i], -4000, 4000);
+        let raw = u32(final_p) & 0xFFFFu;
+        let lo = cells[i].z & 0x0000FFFFu;
+        cells[i].z = lo | (raw << 16u);
+        return;
+    }
+
+    // pass_id == 1: diffusion iteration (existing logic, perm via LUT).
+    let me_cell = cells[i];
+    let me_perm = i32(cell_perm_pcompute(me_cell));
     let me_p = pressure_in[i];
     if (me_perm == 0) {
         pressure_out[i] = me_p;
@@ -171,7 +233,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x > 0) {
         let ni = u32(y * w_i + (x - 1));
         let n_p = pressure_in[ni];
-        let n_perm = i32(perm[ni]);
+        let n_perm = i32(cell_perm_pcompute(cells[ni]));
         let mp = min(me_perm, n_perm);
         if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
     } else {
@@ -181,17 +243,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x < w_i - 1) {
         let ni = u32(y * w_i + (x + 1));
         let n_p = pressure_in[ni];
-        let n_perm = i32(perm[ni]);
+        let n_perm = i32(cell_perm_pcompute(cells[ni]));
         let mp = min(me_perm, n_perm);
         if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
     } else {
         new_p += (-me_p) * min(me_perm, 255) / DIFF_SCALE;
     }
-    // UP — vertical OOB sealed (skip neighbor entirely).
+    // UP — vertical OOB sealed.
     if (y > 0) {
         let ni = u32((y - 1) * w_i + x);
         let n_p = pressure_in[ni];
-        let n_perm = i32(perm[ni]);
+        let n_perm = i32(cell_perm_pcompute(cells[ni]));
         let mp = min(me_perm, n_perm);
         if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
     }
@@ -199,7 +261,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (y < h_i - 1) {
         let ni = u32((y + 1) * w_i + x);
         let n_p = pressure_in[ni];
-        let n_perm = i32(perm[ni]);
+        let n_perm = i32(cell_perm_pcompute(cells[ni]));
         let mp = min(me_perm, n_perm);
         if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
     }
@@ -216,55 +278,81 @@ struct ComputeUniforms {
     _pad1: u32,
 }
 
-/// GPU compute pipeline + storage buffers for pressure diffusion. Replaces
-/// the CPU `World::pressure()` pass — same numerics (4-neighbor flux at
-/// DIFF_SCALE=2048, ITERS=3 by default), runs on the GPU as a compute
-/// shader on storage buffers. Sync readback into `cell.pressure` at the
-/// end so downstream CPU passes see the diffused field.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct PressurePassUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0=extract, 1=diffuse, 2=writeback
+    _pad: u32,
+}
+
+/// GPU compute pipeline for pressure diffusion. All cell state lives in
+/// `cells_buf` (shared across motion/pressure/thermal/PS) — no per-cell
+/// CPU stage loops, no separate readback buffer. Three pass-modes share
+/// one pipeline:
+///   pass 0 (extract):   reads pressure i16 out of `cells_buf` into pressure_a.
+///   pass 1 (diffuse):   3 iterations of 4-neighbor flux, ping-pong a↔b,
+///                       perm read from cells_buf via perm_lut LUT.
+///   pass 2 (writeback): clamps + writes the final scratch back into
+///                       cells_buf bits 16-31 of `.z`.
 struct PressureComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    uniform_buf: wgpu::Buffer,
     pressure_a: wgpu::Buffer,
     pressure_b: wgpu::Buffer,
-    perm_buf: wgpu::Buffer,
-    /// Double-buffered readback. Frame N writes to readback_bufs[write_idx]
-    /// and queues a map_async; frame N+1 reads from the same buffer (now
-    /// mapped after a single shared device.poll). Removes the per-frame
-    /// GPU sync stall — by the time we want the data, it's already
-    /// finished computing during the inter-frame interval.
-    readback_bufs: [wgpu::Buffer; 2],
-    bind_a_to_b: wgpu::BindGroup,
-    bind_b_to_a: wgpu::BindGroup,
-    pressure_staging: Vec<i32>,
-    perm_staging: Vec<u32>,
+    /// Pre-baked uniform buffers, one per pass id. queue.write_buffer
+    /// collapses to last-write-wins inside a single submit, so each
+    /// pass-mode needs its own immutable uniform.
+    u_extract: wgpu::Buffer,
+    u_diffuse: wgpu::Buffer,
+    u_writeback: wgpu::Buffer,
+    perm_lut_buf: wgpu::Buffer,
+    bg_extract: wgpu::BindGroup,
+    bg_a_to_b: wgpu::BindGroup,
+    bg_b_to_a: wgpu::BindGroup,
+    bg_writeback: wgpu::BindGroup,
     iters: u32,
-    write_idx: usize,
-    has_data: [bool; 2],
 }
 
 impl PressureComputeCtx {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
         let cell_count = W * H;
-        let buf_bytes = (cell_count * 4) as wgpu::BufferAddress; // i32 / u32 = 4 bytes
+        let scratch_bytes = (cell_count * 4) as wgpu::BufferAddress;
 
-        let uniforms = ComputeUniforms {
-            width: W as u32,
-            height: H as u32,
-            _pad0: 0,
-            _pad1: 0,
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = PressurePassUniforms {
+                width: W as u32,
+                height: H as u32,
+                pass_id,
+                _pad: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
         };
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("alembic-pressure-compute-uniforms"),
-            contents: bytemuck::cast_slice(&[uniforms]),
+        let u_extract   = mk_uniform("alembic-pressure-uniforms-extract",   0);
+        let u_diffuse   = mk_uniform("alembic-pressure-uniforms-diffuse",   1);
+        let u_writeback = mk_uniform("alembic-pressure-uniforms-writeback", 2);
+        let _ = queue;
+
+        // Per-element permeability LUT — 96 u32s packed 4 per vec4.
+        let mut perm_lut: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0..96u32 {
+            let p = crate::pressure_perm_props(el_id as u8);
+            perm_lut[(el_id / 4) as usize][(el_id % 4) as usize] = p[0];
+        }
+        let perm_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-pressure-perm-lut"),
+            contents: bytemuck::cast_slice(&perm_lut),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        // Force initial uniform upload.
-        queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
 
         let make_storage = |label: &str| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: buf_bytes,
+                size: scratch_bytes,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
@@ -273,83 +361,79 @@ impl PressureComputeCtx {
         };
         let pressure_a = make_storage("alembic-pressure-a");
         let pressure_b = make_storage("alembic-pressure-b");
-        let perm_buf = make_storage("alembic-perm");
-        let make_readback = |label: &str| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: buf_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            })
-        };
-        let readback_bufs = [
-            make_readback("alembic-pressure-readback-0"),
-            make_readback("alembic-pressure-readback-1"),
-        ];
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-pressure-compute-bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
             ],
         });
-        let bind_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("alembic-pressure-bind-a-to-b"),
+        // Bind group for extract: scratch_a is bound to pressure_in
+        // (unused by the shader in this pass) AND pressure_out (the
+        // target). The shader only writes pressure_out in pass 0.
+        let bg_extract = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pressure-bg-extract"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: pressure_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: pressure_b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: perm_buf.as_entire_binding() },
-            ],
-        });
-        let bind_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("alembic-pressure-bind-b-to-a"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: u_extract.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: pressure_b.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: pressure_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: perm_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: perm_lut_buf.as_entire_binding() },
+            ],
+        });
+        let bg_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pressure-bg-a-to-b"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_diffuse.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pressure_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pressure_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: perm_lut_buf.as_entire_binding() },
+            ],
+        });
+        let bg_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pressure-bg-b-to-a"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_diffuse.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pressure_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pressure_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: perm_lut_buf.as_entire_binding() },
+            ],
+        });
+        // Writeback reads the final scratch (pressure_b after 3 iters
+        // starting from a→b: a→b, b→a, a→b → result in b).
+        let bg_writeback = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pressure-bg-writeback"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_writeback.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pressure_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pressure_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: perm_lut_buf.as_entire_binding() },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -371,94 +455,55 @@ impl PressureComputeCtx {
         });
         PressureComputeCtx {
             pipeline,
-            uniform_buf,
             pressure_a,
             pressure_b,
-            perm_buf,
-            readback_bufs,
-            bind_a_to_b,
-            bind_b_to_a,
-            pressure_staging: vec![0i32; cell_count],
-            perm_staging: vec![0u32; cell_count],
+            u_extract,
+            u_diffuse,
+            u_writeback,
+            perm_lut_buf,
+            bg_extract,
+            bg_a_to_b,
+            bg_b_to_a,
+            bg_writeback,
             iters: 3,
-            write_idx: 0,
-            has_data: [false; 2],
         }
     }
-
-    fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue) {
-        let cell_count = W * H;
-        for i in 0..cell_count {
-            self.pressure_staging[i] = world.cells[i].pressure as i32;
-            self.perm_staging[i] = world.cells[i].el.pressure_p().permeability as u32;
-        }
-        queue.write_buffer(&self.pressure_a, 0, bytemuck::cast_slice(&self.pressure_staging));
-        queue.write_buffer(&self.perm_buf, 0, bytemuck::cast_slice(&self.perm_staging));
-    }
-
-    /// Upload only the permeability LUT — used when pressure_a is going
-    /// to be filled by a GPU-side copy from the pressure_sources output
-    /// instead of by a CPU upload.
-    fn stage_perm_only(&mut self, world: &World, queue: &wgpu::Queue) {
-        let cell_count = W * H;
-        for i in 0..cell_count {
-            self.perm_staging[i] = world.cells[i].el.pressure_p().permeability as u32;
-        }
-        queue.write_buffer(&self.perm_buf, 0, bytemuck::cast_slice(&self.perm_staging));
-    }
-
-    /// Borrow the pressure_a storage buffer so other ctxs (e.g.
-    /// PressureSourcesCtx) can copy their output directly into the
-    /// diffusion input slot — avoiding a CPU round-trip when chaining.
-    fn pressure_a_buf(&self) -> &wgpu::Buffer { &self.pressure_a }
 
     fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        let cell_count = W * H;
         let wg_x = (W as u32 + 15) / 16;
         let wg_y = (H as u32 + 15) / 16;
-        for iter in 0..self.iters {
-            let bind = if iter % 2 == 0 { &self.bind_a_to_b } else { &self.bind_b_to_a };
+        // Pass 0: extract pressure from cells_buf → pressure_a.
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("alembic-pressure-cpass"),
+                label: Some("alembic-pressure-extract"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bg_extract, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        // Pass 1: diffuse — 3 iterations, ping-pong.
+        for iter in 0..self.iters {
+            let bind = if iter % 2 == 0 { &self.bg_a_to_b } else { &self.bg_b_to_a };
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-pressure-diffuse"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, bind, &[]);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        let final_buf = if self.iters % 2 == 1 { &self.pressure_b } else { &self.pressure_a };
-        encoder.copy_buffer_to_buffer(
-            final_buf, 0, &self.readback_bufs[self.write_idx], 0,
-            (cell_count * 4) as wgpu::BufferAddress,
-        );
-    }
-
-    fn start_map(&mut self) {
-        self.readback_bufs[self.write_idx]
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| {});
-        self.has_data[self.write_idx] = true;
-    }
-
-    /// Read the OTHER buffer (filled last frame). Skips on the first
-    /// frame when no prior data exists.
-    fn read_back_prev_into(&mut self, world: &mut World) {
-        let read_idx = 1 - self.write_idx;
-        if !self.has_data[read_idx] { return; }
-        let slice = self.readback_bufs[read_idx].slice(..);
+        // Pass 2: writeback final scratch → cells_buf pressure bits.
         {
-            let data = slice.get_mapped_range();
-            let result: &[i32] = bytemuck::cast_slice(&data);
-            for (i, &v) in result.iter().enumerate() {
-                world.cells[i].pressure = v as i16;
-            }
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-pressure-writeback"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bg_writeback, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        self.readback_bufs[read_idx].unmap();
-        self.has_data[read_idx] = false;
-    }
-
-    fn advance_frame(&mut self) {
-        self.write_idx = 1 - self.write_idx;
+        let _ = (&self.u_extract, &self.u_diffuse, &self.u_writeback, &self.perm_lut_buf);
     }
 }
 
@@ -469,35 +514,41 @@ struct ThermalUniforms {
     height: u32,
     ambient_offset: i32,
     frame: u32,
+    pass_id: u32,            // 0=extract, 1=diffuse, 2=writeback
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// GPU compute pipeline for thermal diffusion (heat exchange + ambient
-/// blend). Runs the inner per-cell math of `World::thermal_diffuse()`
-/// in a fragment shader, leaving moisture/combustion/phase changes
-/// (`thermal_post`) on the CPU. Saves the largest CPU-linear cost
-/// after pressure was moved to GPU.
+/// blend). Reads temp + el directly out of the shared `cells_buf`
+/// using extract → diffuse (3 iters) → writeback. No per-cell CPU
+/// stage loops, no separate readback path.
 struct ThermalComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    uniform_buf: wgpu::Buffer,
+    /// Per-frame uniform — only `frame`, `ambient_offset`, and
+    /// `pass_id` change. Each pass has its own pre-baked uniform
+    /// buffer because queue.write_buffer collapses to last-write-wins
+    /// inside a submit.
+    u_extract: wgpu::Buffer,
+    u_diffuse: wgpu::Buffer,
+    u_writeback: wgpu::Buffer,
+    #[allow(dead_code)]
     profiles_buf: wgpu::Buffer,
     temp_a: wgpu::Buffer,
     temp_b: wgpu::Buffer,
-    el_buf: wgpu::Buffer,
-    readback_bufs: [wgpu::Buffer; 2],
-    bind_a_to_b: wgpu::BindGroup,
-    bind_b_to_a: wgpu::BindGroup,
-    temp_staging: Vec<i32>,
-    el_staging: Vec<u32>,
-    write_idx: usize,
-    has_data: [bool; 2],
+    bg_extract: wgpu::BindGroup,
+    bg_a_to_b: wgpu::BindGroup,
+    bg_b_to_a: wgpu::BindGroup,
+    bg_writeback: wgpu::BindGroup,
+    iters: u32,
 }
 
 impl ThermalComputeCtx {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
         let cell_count = W * H;
-        let buf_bytes = (cell_count * 4) as wgpu::BufferAddress;
+        let scratch_bytes = (cell_count * 4) as wgpu::BufferAddress;
 
-        // Build the per-element thermal profile uniform (96 vec4s).
         let mut profile_data: Vec<[f32; 4]> = vec![[0.0, 20.0, 0.0, 1.0]; 96];
         for i in 0..96 {
             profile_data[i] = thermal_profile_vec4(i as u8);
@@ -508,23 +559,30 @@ impl ThermalComputeCtx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniforms = ThermalUniforms {
-            width: W as u32,
-            height: H as u32,
-            ambient_offset: 0,
-            frame: 0,
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = ThermalUniforms {
+                width: W as u32,
+                height: H as u32,
+                ambient_offset: 0,
+                frame: 0,
+                pass_id,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
         };
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("alembic-thermal-uniforms"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let _ = queue; // queue write happens per-frame in dispatch.
+        let u_extract   = mk_uniform("alembic-thermal-uniforms-extract",   0);
+        let u_diffuse   = mk_uniform("alembic-thermal-uniforms-diffuse",   1);
+        let u_writeback = mk_uniform("alembic-thermal-uniforms-writeback", 2);
+        let _ = queue;
 
         let make_storage = |label: &str| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: buf_bytes,
+                size: scratch_bytes,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
@@ -533,19 +591,6 @@ impl ThermalComputeCtx {
         };
         let temp_a = make_storage("alembic-temp-a");
         let temp_b = make_storage("alembic-temp-b");
-        let el_buf = make_storage("alembic-el");
-        let make_readback = |label: &str| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: buf_bytes,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            })
-        };
-        let readback_bufs = [
-            make_readback("alembic-thermal-readback-0"),
-            make_readback("alembic-thermal-readback-1"),
-        ];
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-thermal-bgl"),
@@ -564,7 +609,7 @@ impl ThermalComputeCtx {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
@@ -572,25 +617,47 @@ impl ThermalComputeCtx {
                 },
             ],
         });
-        let bind_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("alembic-thermal-bind-a-to-b"),
+        let bg_extract = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-thermal-bg-extract"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: temp_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: temp_b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: el_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: u_extract.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: temp_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: temp_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: profiles_buf.as_entire_binding() },
             ],
         });
-        let bind_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("alembic-thermal-bind-b-to-a"),
+        let bg_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-thermal-bg-a-to-b"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: u_diffuse.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: temp_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: temp_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: profiles_buf.as_entire_binding() },
+            ],
+        });
+        let bg_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-thermal-bg-b-to-a"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_diffuse.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: temp_b.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: temp_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: el_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: profiles_buf.as_entire_binding() },
+            ],
+        });
+        let bg_writeback = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-thermal-bg-writeback"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u_writeback.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: temp_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: temp_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: profiles_buf.as_entire_binding() },
             ],
         });
@@ -613,82 +680,68 @@ impl ThermalComputeCtx {
         });
         ThermalComputeCtx {
             pipeline,
-            uniform_buf,
+            u_extract,
+            u_diffuse,
+            u_writeback,
             profiles_buf,
             temp_a,
             temp_b,
-            el_buf,
-            readback_bufs,
-            bind_a_to_b,
-            bind_b_to_a,
-            temp_staging: vec![0i32; cell_count],
-            el_staging: vec![0u32; cell_count],
-            write_idx: 0,
-            has_data: [false; 2],
+            bg_extract,
+            bg_a_to_b,
+            bg_b_to_a,
+            bg_writeback,
+            iters: 1,
         }
     }
 
-    fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue, frame: u32, ambient_offset: i16) {
-        let cell_count = W * H;
-        for i in 0..cell_count {
-            self.temp_staging[i] = world.cells[i].temp as i32;
-            self.el_staging[i] = world.cells[i].el as u32;
+    /// Update the per-frame fields (frame counter + ambient offset) in
+    /// each pass uniform. Cell field reads come straight from
+    /// cells_buf — no per-cell staging.
+    fn update_frame(&self, queue: &wgpu::Queue, frame: u32, ambient_offset: i16) {
+        // Layout: width(4), height(4), ambient_offset(4), frame(4),
+        // pass_id(4), pad(4)*3. Update bytes 8-15 (ambient_offset, frame).
+        let bytes: [u8; 8] = bytemuck::cast([(ambient_offset as i32), frame as i32]);
+        for buf in [&self.u_extract, &self.u_diffuse, &self.u_writeback] {
+            queue.write_buffer(buf, 8, &bytes);
         }
-        queue.write_buffer(&self.temp_a, 0, bytemuck::cast_slice(&self.temp_staging));
-        queue.write_buffer(&self.el_buf, 0, bytemuck::cast_slice(&self.el_staging));
-        let uniforms = ThermalUniforms {
-            width: W as u32,
-            height: H as u32,
-            ambient_offset: ambient_offset as i32,
-            frame,
-        };
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
     fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        let cell_count = W * H;
         let wg_x = (W as u32 + 15) / 16;
         let wg_y = (H as u32 + 15) / 16;
+        // Pass 0: extract.
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("alembic-thermal-cpass"),
+                label: Some("alembic-thermal-extract"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.bind_a_to_b, &[]);
+            cpass.set_bind_group(0, &self.bg_extract, &[]);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &self.temp_b, 0, &self.readback_bufs[self.write_idx], 0,
-            (cell_count * 4) as wgpu::BufferAddress,
-        );
-        let _ = (&self.bind_b_to_a, &self.profiles_buf, &self.temp_a);
-    }
-
-    fn start_map(&mut self) {
-        self.readback_bufs[self.write_idx]
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| {});
-        self.has_data[self.write_idx] = true;
-    }
-
-    fn read_back_prev_into(&mut self, world: &mut World) {
-        let read_idx = 1 - self.write_idx;
-        if !self.has_data[read_idx] { return; }
-        let slice = self.readback_bufs[read_idx].slice(..);
-        {
-            let data = slice.get_mapped_range();
-            let result: &[i32] = bytemuck::cast_slice(&data);
-            for (i, &v) in result.iter().enumerate() {
-                world.cells[i].temp = v.clamp(-273, 4000) as i16;
-            }
+        // Pass 1: diffuse iters (1 by default — keeps the original
+        // single-iter behavior of thermal_diffuse).
+        for iter in 0..self.iters {
+            let bind = if iter % 2 == 0 { &self.bg_a_to_b } else { &self.bg_b_to_a };
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-thermal-diffuse"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, bind, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        self.readback_bufs[read_idx].unmap();
-        self.has_data[read_idx] = false;
-    }
-
-    fn advance_frame(&mut self) {
-        self.write_idx = 1 - self.write_idx;
+        // Pass 2: writeback. With iters=1 (a→b), final is in temp_b,
+        // which is what bg_writeback's pressure_in points to.
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-thermal-writeback"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bg_writeback, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
     }
 }
 
@@ -705,13 +758,9 @@ struct Uniforms {
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> el_in: array<u32>;
-@group(0) @binding(2) var<storage, read> flag_in: array<u32>;
-@group(0) @binding(3) var<storage, read> temp_in: array<i32>;
-@group(0) @binding(4) var<storage, read> pressure_in: array<i32>;
-@group(0) @binding(5) var<storage, read_write> pressure_out: array<i32>;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
 // vec4 per element: x = kind_id, y = weight, z = _, w = _
-@group(0) @binding(6) var<uniform> profiles: array<vec4<f32>, 96>;
+@group(0) @binding(2) var<uniform> profiles: array<vec4<f32>, 96>;
 
 const FLAG_FROZEN: u32 = 0x02u;
 const KIND_EMPTY: u32  = 0u;
@@ -719,10 +768,23 @@ const KIND_LIQUID: u32 = 4u;
 const KIND_GAS: u32    = 5u;
 const KIND_FIRE: u32   = 6u;
 
+fn cell_el_ps(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cell_flag_ps(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn extract_temp_ps(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn extract_pressure_ps(c: vec4<u32>) -> i32 {
+    let raw = (c.z >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+
 // One thread per column. Walks vertically computing the column-
-// integrated hydrostatic pressure plus per-cell thermal tgt,
-// then blends current pressure → tgt with the asymmetric rule
+// integrated hydrostatic pressure plus per-cell thermal target,
+// then blends current pressure → target with the asymmetric rule
 // (gas/fire only blend up; everything else blends both ways).
+// Reads + writes pressure directly in cells_buf — no per-field
+// staging. Per-column dispatch keeps writes race-free.
 @compute @workgroup_size(64, 1, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x;
@@ -749,7 +811,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     loop {
         if (y == y_end) { break; }
         let i = w * u32(y) + x;
-        let id = el_in[i];
+        let c = cells[i];
+        let id = cell_el_ps(c);
         let prof = profiles[id];
         let kind_id = u32(prof.x);
         let weight = prof.y;
@@ -759,16 +822,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             && kind_id != KIND_LIQUID
             && kind_id != KIND_GAS
             && kind_id != KIND_FIRE);
-        let is_frozen = (flag_in[i] & FLAG_FROZEN) != 0u;
+        let is_frozen = (cell_flag_ps(c) & FLAG_FROZEN) != 0u;
 
-        // Pass 1: thermal tgt.
         var tgt: i32 = 0;
         if (is_pressurizable) {
-            let t = (temp_in[i] - 20) * 5;
+            let t = (extract_temp_ps(c) - 20) * 5;
             tgt = clamp(t, -300, 4000);
         }
 
-        // Pass 2: hydrostatic column integration.
         if (u.gravity_present != 0u && u.gy != 0) {
             if (is_frozen && is_wallable) {
                 col_p = 0.0;
@@ -779,8 +840,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // Pass 3: asymmetric blend toward tgt.
-        let current = pressure_in[i];
+        let current = extract_pressure_ps(c);
         let delta = tgt - current;
         var new_p = current;
         if (delta > 0) {
@@ -792,7 +852,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (stp > -1) { stp = -1; }
             new_p = clamp(current + stp, -4000, 4000);
         }
-        pressure_out[i] = new_p;
+        // Write pressure back to cells[i].z bits 16-31, preserving
+        // moisture (bits 0-7) and burn (bits 8-15).
+        let raw = u32(new_p) & 0xFFFFu;
+        let lo = cells[i].z & 0x0000FFFFu;
+        cells[i].z = lo | (raw << 16u);
 
         y = y + step;
     }
@@ -812,32 +876,20 @@ struct PressureSourcesUniforms {
     _pad2: u32,
 }
 
-/// GPU compute pipeline for the hydrostatic + thermal pressure tgt
-/// pass (`World::pressure_sources`). Largest single CPU-bound pass at
-/// 1200×900 (~9-11ms); has no race conditions (column scan + per-cell
-/// blend), so it ports cleanly with one thread per column.
+/// GPU compute pipeline for the hydrostatic + thermal pressure-target
+/// pass. Reads cell fields directly from the shared `cells_buf` and
+/// writes new pressure straight back into it. Per-column dispatch
+/// keeps writes race-free (each thread owns its column entirely).
 struct PressureSourcesCtx {
     pipeline: wgpu::ComputePipeline,
     uniform_buf: wgpu::Buffer,
     #[allow(dead_code)]
     profiles_buf: wgpu::Buffer,
-    el_buf: wgpu::Buffer,
-    flag_buf: wgpu::Buffer,
-    temp_buf: wgpu::Buffer,
-    pressure_in_buf: wgpu::Buffer,
-    pressure_out_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    el_staging: Vec<u32>,
-    flag_staging: Vec<u32>,
-    temp_staging: Vec<i32>,
-    pressure_staging: Vec<i32>,
 }
 
 impl PressureSourcesCtx {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let cell_count = W * H;
-        let buf_bytes = (cell_count * 4) as wgpu::BufferAddress;
-
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
         // Per-element profile uniform (96 vec4s = 1536 bytes).
         let mut profile_data: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, 0.0]; 96];
         for i in 0..96 {
@@ -864,21 +916,6 @@ impl PressureSourcesCtx {
         });
         let _ = queue;
 
-        let make_storage = |label: &str| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: buf_bytes,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let el_buf = make_storage("alembic-ps-el");
-        let flag_buf = make_storage("alembic-ps-flag");
-        let temp_buf = make_storage("alembic-ps-temp");
-        let pressure_in_buf = make_storage("alembic-ps-pressure-in");
-        let pressure_out_buf = make_storage("alembic-ps-pressure-out");
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-ps-bgl"),
             entries: &[
@@ -888,26 +925,10 @@ impl PressureSourcesCtx {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 6, visibility: wgpu::ShaderStages::COMPUTE,
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
             ],
@@ -917,12 +938,8 @@ impl PressureSourcesCtx {
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: el_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: flag_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: temp_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: pressure_in_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: pressure_out_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: profiles_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: profiles_buf.as_entire_binding() },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -946,33 +963,12 @@ impl PressureSourcesCtx {
             pipeline,
             uniform_buf,
             profiles_buf,
-            el_buf,
-            flag_buf,
-            temp_buf,
-            pressure_in_buf,
-            pressure_out_buf,
             bind_group,
-            el_staging: vec![0u32; cell_count],
-            flag_staging: vec![0u32; cell_count],
-            temp_staging: vec![0i32; cell_count],
-            pressure_staging: vec![0i32; cell_count],
         }
     }
 
-    fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue) {
-        let cell_count = W * H;
-        for i in 0..cell_count {
-            let c = world.cells[i];
-            self.el_staging[i] = c.el as u32;
-            self.flag_staging[i] = c.flag as u32;
-            self.temp_staging[i] = c.temp as i32;
-            self.pressure_staging[i] = c.pressure as i32;
-        }
-        queue.write_buffer(&self.el_buf, 0, bytemuck::cast_slice(&self.el_staging));
-        queue.write_buffer(&self.flag_buf, 0, bytemuck::cast_slice(&self.flag_staging));
-        queue.write_buffer(&self.temp_buf, 0, bytemuck::cast_slice(&self.temp_staging));
-        queue.write_buffer(&self.pressure_in_buf, 0, bytemuck::cast_slice(&self.pressure_staging));
-
+    /// Update gravity uniform (only thing that varies across frames).
+    fn update_frame(&self, queue: &wgpu::Queue, world: &World) {
         let uniforms = PressureSourcesUniforms {
             width: W as u32,
             height: H as u32,
@@ -984,11 +980,7 @@ impl PressureSourcesCtx {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
-    /// Dispatch only — no readback copy. The output buffer is consumed
-    /// directly by the next compute stage (pressure diffusion) via a
-    /// GPU-side copy, so we don't need to round-trip through CPU.
     fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        // One thread per column; workgroup size 64.
         let wg_x = (W as u32 + 63) / 64;
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("alembic-ps-cpass"),
@@ -998,10 +990,6 @@ impl PressureSourcesCtx {
         cpass.set_bind_group(0, &self.bind_group, &[]);
         cpass.dispatch_workgroups(wg_x, 1, 1);
     }
-
-    /// Borrow the output buffer so the diffusion ctx can copy from it
-    /// in the chained dispatch.
-    fn pressure_out_buf(&self) -> &wgpu::Buffer { &self.pressure_out_buf }
 }
 
 const MOTION_COMPUTE_SHADER: &str = r#"
@@ -1118,11 +1106,16 @@ fn diagonal_slide(x: u32, parity: u32) {
     }
 }
 
-// Pass 1 — liquid horizontal spread: one thread per row. Walks
-// left-to-right on even frames, right-to-left on odd, swapping
-// liquid with adjacent empty/gas. Each row is independent (no cross-
-// row reads) so per-row threads don't race.
-fn liquid_spread(y: u32) {
+// Pass 1/2 — liquid horizontal spread. Each thread handles one row,
+// swapping liquid with adjacent empty/gas if the cell below is solid
+// (so liquids spread on top of a floor instead of refusing to fall).
+//
+// Race fix vs the previous single-pass version: thread y reads
+// row y+1 for the support check while thread y+1 might be writing
+// it. Split into even-row and odd-row sub-passes (parity 0 / 1)
+// so adjacent rows never run simultaneously.
+fn liquid_spread(y: u32, parity: u32) {
+    if ((y & 1u) != parity) { return; }
     let lr = (u.frame & 1u) == 0u;
     let w_i = i32(u.width);
     var x: i32;
@@ -1166,12 +1159,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (u.pass_id == 1u) {
         let y = gid.x;
         if (y >= u.height - 1u) { return; }
-        liquid_spread(y);
+        liquid_spread(y, 0u);
     } else if (u.pass_id == 2u) {
+        let y = gid.x;
+        if (y >= u.height - 1u) { return; }
+        liquid_spread(y, 1u);
+    } else if (u.pass_id == 3u) {
         let x = gid.x;
         if (x >= u.width) { return; }
         diagonal_slide(x, 0u);
-    } else if (u.pass_id == 3u) {
+    } else if (u.pass_id == 4u) {
         let x = gid.x;
         if (x >= u.width) { return; }
         diagonal_slide(x, 1u);
@@ -1201,18 +1198,17 @@ struct MotionUniforms {
 /// every dispatch see the same value).
 struct MotionComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    pass_uniform_bufs: [wgpu::Buffer; 4],
+    pass_uniform_bufs: [wgpu::Buffer; 5],
     #[allow(dead_code)]
     motion_props_buf: wgpu::Buffer,
-    cells_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
-    pass_bind_groups: [wgpu::BindGroup; 4],
+    pass_bind_groups: [wgpu::BindGroup; 5],
     write_idx: usize,
     has_data: [bool; 2],
 }
 
 impl MotionComputeCtx {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
         let cell_count = W * H;
         let cell_bytes = (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
 
@@ -1237,22 +1233,15 @@ impl MotionComputeCtx {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        let pass_uniform_bufs: [wgpu::Buffer; 4] = [
+        let pass_uniform_bufs: [wgpu::Buffer; 5] = [
             mk_pass_uniform(0, "alembic-motion-uniforms-vfall"),
-            mk_pass_uniform(1, "alembic-motion-uniforms-lspread"),
-            mk_pass_uniform(2, "alembic-motion-uniforms-dslide-even"),
-            mk_pass_uniform(3, "alembic-motion-uniforms-dslide-odd"),
+            mk_pass_uniform(1, "alembic-motion-uniforms-lspread-even"),
+            mk_pass_uniform(2, "alembic-motion-uniforms-lspread-odd"),
+            mk_pass_uniform(3, "alembic-motion-uniforms-dslide-even"),
+            mk_pass_uniform(4, "alembic-motion-uniforms-dslide-odd"),
         ];
         let _ = queue;
 
-        let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("alembic-motion-cells"),
-            size: cell_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let make_readback = |label: &str| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -1292,7 +1281,7 @@ impl MotionComputeCtx {
                 wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
             ],
         });
-        let pass_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let pass_bind_groups: [wgpu::BindGroup; 5] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3), mk_bind(4)];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-motion-shader"),
             source: wgpu::ShaderSource::Wgsl(MOTION_COMPUTE_SHADER.into()),
@@ -1315,7 +1304,6 @@ impl MotionComputeCtx {
             pipeline,
             pass_uniform_bufs,
             motion_props_buf,
-            cells_buf,
             readback_bufs,
             pass_bind_groups,
             write_idx: 0,
@@ -1323,28 +1311,24 @@ impl MotionComputeCtx {
         }
     }
 
-    fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue) {
-        // Zero-copy: world.cells is repr(C), 16 bytes/cell, GPU layout
-        // matches directly. queue.write_buffer hands the bytes off to
-        // wgpu's upload path without us touching individual cells.
-        queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&world.cells));
-    }
-
-    /// Encode all 4 motion passes for one frame.
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+    /// Encode all 5 motion passes for one frame, then snapshot the
+    /// shared `cells_buf` into the readback buffer for next-frame
+    /// CPU sync.
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32, cells_buf: &wgpu::Buffer) {
         let cell_count = W * H;
         let frame_arr = [frame];
         let frame_bytes = bytemuck::cast_slice(&frame_arr);
-        for i in 0..4 {
+        for i in 0..5 {
             queue.write_buffer(&self.pass_uniform_bufs[i], 12, frame_bytes);
         }
         let wg_col = (W as u32 + 63) / 64;
         let wg_row = (H as u32 + 63) / 64;
         let labels_dispatches = [
-            ("alembic-motion-vfall",       wg_col, 0usize),
-            ("alembic-motion-lspread",     wg_row, 1usize),
-            ("alembic-motion-dslide-even", wg_col, 2usize),
-            ("alembic-motion-dslide-odd",  wg_col, 3usize),
+            ("alembic-motion-vfall",         wg_col, 0usize),
+            ("alembic-motion-lspread-even",  wg_row, 1usize),
+            ("alembic-motion-lspread-odd",   wg_row, 2usize),
+            ("alembic-motion-dslide-even",   wg_col, 3usize),
+            ("alembic-motion-dslide-odd",    wg_col, 4usize),
         ];
         for (label, wg, idx) in labels_dispatches {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1356,7 +1340,7 @@ impl MotionComputeCtx {
             cpass.dispatch_workgroups(wg, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
-            &self.cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
+            cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
             (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress,
         );
     }
@@ -1441,6 +1425,10 @@ struct GpuState {
     /// Uniform buffer carrying cursor pos + brush radius to the
     /// fragment shader so it can render a brush outline overlay.
     display_uniform: wgpu::Buffer,
+    /// GPU-resident cell state. Source of truth for the simulation
+    /// runtime. CPU's `world.cells` is a mirror synced once per frame
+    /// at the start of render() and pushed back before dispatch.
+    cells_buf: wgpu::Buffer,
     /// GPU compute pipeline for pressure diffusion. Replaces the CPU
     /// `World::pressure()` pass; lets us scale the grid without paying
     /// the linear CPU cost.
@@ -1755,10 +1743,29 @@ impl GpuState {
 
         let image_buffer = vec![0u8; W * H * 4];
 
-        let pressure_compute = PressureComputeCtx::new(&device, &queue);
-        let thermal_compute = ThermalComputeCtx::new(&device, &queue);
-        let pressure_sources_compute = PressureSourcesCtx::new(&device, &queue);
-        let motion_compute = MotionComputeCtx::new(&device, &queue);
+        // GPU-resident cell state. Single 16 MB allocation, populated
+        // once from initial world.cells, then mutated only by GPU
+        // compute and small CPU paint/clear writes. Every compute
+        // pipeline that needs cell fields binds this buffer.
+        let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-cells-buf"),
+            size: (W * H * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Initial upload: world.cells → cells_buf via the zero-copy
+        // bytes view. After this, world.cells stays in sync via the
+        // single per-frame readback at the start of render(), and CPU
+        // chemistry mutations are pushed back via a single per-frame
+        // upload before the GPU dispatch.
+        queue.write_buffer(&cells_buf, 0, crate::cells_as_bytes(&world.cells));
+
+        let pressure_compute = PressureComputeCtx::new(&device, &queue, &cells_buf);
+        let thermal_compute = ThermalComputeCtx::new(&device, &queue, &cells_buf);
+        let pressure_sources_compute = PressureSourcesCtx::new(&device, &queue, &cells_buf);
+        let motion_compute = MotionComputeCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -1771,6 +1778,7 @@ impl GpuState {
             sim_bind_group,
             sim_pipeline,
             display_uniform,
+            cells_buf,
             pressure_compute,
             thermal_compute,
             pressure_sources_compute,
@@ -1951,15 +1959,14 @@ impl GpuState {
     }
 
     fn render(&mut self) {
-        // Read prior frame's GPU motion result FIRST so paint and
-        // CPU step land on top of post-motion cells (and aren't
-        // wiped by a stale readback).
+        // Single CPU↔GPU sync point per frame: motion's readback gives
+        // us the post-everything state in world.cells. apply_brush and
+        // CPU chemistry mutate world.cells. Then ONE upload pushes the
+        // mutated cells back to cells_buf for the next GPU dispatch.
         let t_compute_start = std::time::Instant::now();
         if !self.paused {
             let _ = self.device.poll(wgpu::Maintain::Wait);
             self.motion_compute.read_back_prev_into(&mut self.world);
-            self.pressure_compute.read_back_prev_into(&mut self.world);
-            self.thermal_compute.read_back_prev_into(&mut self.world);
         }
         let t_compute_readback = t_compute_start.elapsed();
 
@@ -1984,38 +1991,34 @@ impl GpuState {
         if !self.paused {
             let run_ps = self.frame_counter & 1 == 0;
 
-            if run_ps {
-                self.pressure_sources_compute.stage_and_upload(&self.world, &self.queue);
-                self.pressure_compute.stage_perm_only(&self.world, &self.queue);
-            } else {
-                self.pressure_compute.stage_and_upload(&self.world, &self.queue);
-            }
+            // Single zero-copy upload: world.cells (with this frame's
+            // chemistry/paint changes) → cells_buf. Every GPU compute
+            // pass below reads/writes cells_buf directly — no per-cell
+            // CPU stage loops anywhere.
+            self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
             let amb = self.world.ambient_offset;
-            self.thermal_compute.stage_and_upload(&self.world, &self.queue, self.frame_counter, amb);
-            // Zero-copy cells upload — straight memcpy, no per-cell loop.
-            self.motion_compute.stage_and_upload(&self.world, &self.queue);
+            self.thermal_compute.update_frame(&self.queue, self.frame_counter, amb);
+            if run_ps {
+                self.pressure_sources_compute.update_frame(&self.queue, &self.world);
+            }
 
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("alembic-combined-compute-encoder"),
             });
+            // PS: column scan + asymmetric blend. Writes new pressure
+            // straight into cells_buf, so the pressure diffusion below
+            // sees post-PS values when it extracts.
             if run_ps {
                 self.pressure_sources_compute.encode(&mut encoder);
-                let bytes = (W * H * 4) as wgpu::BufferAddress;
-                encoder.copy_buffer_to_buffer(
-                    self.pressure_sources_compute.pressure_out_buf(), 0,
-                    self.pressure_compute.pressure_a_buf(), 0,
-                    bytes,
-                );
             }
+            // Pressure: extract → 3 diffuse iters → writeback.
             self.pressure_compute.encode(&mut encoder);
+            // Thermal: extract → 1 diffuse iter → writeback.
             self.thermal_compute.encode(&mut encoder);
-            self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // Motion: 4 passes (vfall, lspread, dslide-even, dslide-odd).
+            self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter, &self.cells_buf);
             self.queue.submit(std::iter::once(encoder.finish()));
-            self.pressure_compute.start_map();
-            self.thermal_compute.start_map();
             self.motion_compute.start_map();
-            self.pressure_compute.advance_frame();
-            self.thermal_compute.advance_frame();
             self.motion_compute.advance_frame();
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
