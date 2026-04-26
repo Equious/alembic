@@ -355,11 +355,14 @@ impl GpuState {
         // and a stone block to anchor the eye. Diagnostic only — once we
         // have mouse painting wired up these go away.
         let mut world = World::new();
+        // Pre-paint near the default camera focus (grid center). The
+        // user sees this immediately when the window opens; the rest
+        // of the grid is empty and gets revealed as they zoom out.
         let cx = W as i32 / 2;
-        let floor_y = H as i32 - 30;
-        world.paint(cx, floor_y, 12, Element::Sand, 0, false);
-        world.paint(cx - 60, floor_y - 80, 6, Element::Water, 0, false);
-        world.paint(cx + 50, floor_y - 5, 4, Element::Stone, 0, true);
+        let cy = H as i32 / 2;
+        world.paint(cx, cy + 110, 12, Element::Sand, 0, false);
+        world.paint(cx - 60, cy + 30, 6, Element::Water, 0, false);
+        world.paint(cx + 50, cy + 115, 4, Element::Stone, 0, true);
 
         let image_buffer = vec![0u8; W * H * 4];
 
