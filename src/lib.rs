@@ -373,6 +373,29 @@ pub fn base_color_props(id: u8) -> [u8; 4] {
     [r, g, b, 255]
 }
 
+/// Per-element lifecycle data:
+///   x = ephemeral flag (1 if `Cell::new(el)` sets a non-zero `life`)
+///   y = decay product element id (what this cell becomes when
+///       `life` hits zero — Fire → Empty, Steam → Water, etc.)
+///   z = preserve_state flag (1 to keep temp/pressure across the
+///       transition, e.g., Steam → Water keeps boiling temp; 0 to
+///       reset everything for a clean Empty cell)
+///   w = unused
+///
+/// Driven entirely by element data — the GPU lifecycle compute
+/// reads this LUT and ages every cell uniformly. Adding a new
+/// ephemeral element is just a row here; no new shader code.
+pub fn lifecycle_props(id: u8) -> [u32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0; 4]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    match el {
+        Element::Fire  => [1, Element::Empty as u32, 0, 0],
+        Element::Steam => [1, Element::Water as u32, 1, 0],
+        _ => [0, 0, 0, 0],
+    }
+}
+
 /// Per-element flag: 1 if this element has a flame-test color
 /// (Cu, Na, K, Ca, Mg, B, Salt — see `flame_color`), 0 otherwise.
 /// Returned as a vec4<u32> for the standard packed-LUT layout.

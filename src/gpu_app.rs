@@ -1182,6 +1182,57 @@ fn liquid_spread(y: u32, parity: u32) {
     }
 }
 
+// Pass 5/6 — gas turbulence. Each gas/fire cell, with PRNG-driven
+// probability, swaps with the empty cell to its left or right. The
+// thread is per-COLUMN; we walk the column and for each gas cell
+// pick a direction from a hash of (cell_index, frame). Even-column
+// vs odd-column sub-passes keep writes to the target column race-
+// free (an even thread writes its own column AND the odd column
+// next door; in that sub-pass no odd-column thread is running).
+//
+// Result: gas blobs disperse instead of sitting as solid masses.
+fn hash_u32_motion(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    h *= 3266489917u;
+    h ^= h >> 16u;
+    return h;
+}
+
+fn gas_drift(x: u32, parity: u32) {
+    if ((x & 1u) != parity) { return; }
+    let h = i32(u.height);
+    let w_i = i32(u.width);
+    var y = 0i;
+    loop {
+        if (y >= h) { break; }
+        let i_here = cell_idx(x, u32(y));
+        let c_here = cells[i_here];
+        let kh = cell_kind(c_here);
+        if ((kh == KIND_GAS || kh == KIND_FIRE) && !cell_frozen(c_here)) {
+            let r = hash_u32_motion(i_here, u.frame);
+            // ~50% chance to attempt a drift this frame.
+            if ((r & 0x80u) != 0u) {
+                let dir: i32 = select(-1, 1, (r & 0x40u) != 0u);
+                let nx = i32(x) + dir;
+                if (nx >= 0 && nx < w_i) {
+                    let i_n = cell_idx(u32(nx), u32(y));
+                    let c_n = cells[i_n];
+                    let kn = cell_kind(c_n);
+                    if (kn == KIND_EMPTY && !cell_frozen(c_n)) {
+                        cells[i_here] = c_n;
+                        cells[i_n] = c_here;
+                    }
+                }
+            }
+        }
+        y = y + 1;
+    }
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (u.pass_id == 0u) {
@@ -1204,6 +1255,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x = gid.x;
         if (x >= u.width) { return; }
         diagonal_slide(x, 1u);
+    } else if (u.pass_id == 5u) {
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        gas_drift(x, 0u);
+    } else if (u.pass_id == 6u) {
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        gas_drift(x, 1u);
     }
 }
 "#;
@@ -1230,11 +1289,11 @@ struct MotionUniforms {
 /// every dispatch see the same value).
 struct MotionComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    pass_uniform_bufs: [wgpu::Buffer; 5],
+    pass_uniform_bufs: [wgpu::Buffer; 7],
     #[allow(dead_code)]
     motion_props_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
-    pass_bind_groups: [wgpu::BindGroup; 5],
+    pass_bind_groups: [wgpu::BindGroup; 7],
     write_idx: usize,
     has_data: [bool; 2],
 }
@@ -1265,12 +1324,14 @@ impl MotionComputeCtx {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        let pass_uniform_bufs: [wgpu::Buffer; 5] = [
+        let pass_uniform_bufs: [wgpu::Buffer; 7] = [
             mk_pass_uniform(0, "alembic-motion-uniforms-vfall"),
             mk_pass_uniform(1, "alembic-motion-uniforms-lspread-even"),
             mk_pass_uniform(2, "alembic-motion-uniforms-lspread-odd"),
             mk_pass_uniform(3, "alembic-motion-uniforms-dslide-even"),
             mk_pass_uniform(4, "alembic-motion-uniforms-dslide-odd"),
+            mk_pass_uniform(5, "alembic-motion-uniforms-gdrift-even"),
+            mk_pass_uniform(6, "alembic-motion-uniforms-gdrift-odd"),
         ];
         let _ = queue;
 
@@ -1313,7 +1374,10 @@ impl MotionComputeCtx {
                 wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
             ],
         });
-        let pass_bind_groups: [wgpu::BindGroup; 5] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3), mk_bind(4)];
+        let pass_bind_groups: [wgpu::BindGroup; 7] = [
+            mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3),
+            mk_bind(4), mk_bind(5), mk_bind(6),
+        ];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-motion-shader"),
             source: wgpu::ShaderSource::Wgsl(MOTION_COMPUTE_SHADER.into()),
@@ -1343,14 +1407,14 @@ impl MotionComputeCtx {
         }
     }
 
-    /// Encode all 5 motion passes for one frame, then snapshot the
+    /// Encode all 7 motion passes for one frame, then snapshot the
     /// shared `cells_buf` into the readback buffer for next-frame
     /// CPU sync.
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32, cells_buf: &wgpu::Buffer) {
         let cell_count = W * H;
         let frame_arr = [frame];
         let frame_bytes = bytemuck::cast_slice(&frame_arr);
-        for i in 0..5 {
+        for i in 0..7 {
             queue.write_buffer(&self.pass_uniform_bufs[i], 12, frame_bytes);
         }
         let wg_col = (W as u32 + 63) / 64;
@@ -1361,6 +1425,8 @@ impl MotionComputeCtx {
             ("alembic-motion-lspread-odd",   wg_row, 2usize),
             ("alembic-motion-dslide-even",   wg_col, 3usize),
             ("alembic-motion-dslide-odd",    wg_col, 4usize),
+            ("alembic-motion-gdrift-even",   wg_col, 5usize),
+            ("alembic-motion-gdrift-odd",    wg_col, 6usize),
         ];
         for (label, wg, idx) in labels_dispatches {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1403,15 +1469,187 @@ impl MotionComputeCtx {
 }
 
 // ============================================================
-// Phase 2 chemistry passes on GPU
+// Phase 2 framework passes on GPU
 // ============================================================
 //
-// These three passes share `cells_buf` and a tiny per-pass uniform.
-// All are race-free by construction:
+// Element-data-driven framework primitives:
 //   * clear_flags         — per-cell write to one bit only
+//   * lifecycle           — generic life-decrement + decay-to-product
+//                           for any element flagged ephemeral (Fire,
+//                           Steam, etc.). One LUT row per element.
 //   * color_fires         — per-cell write to one byte (cell.w lo)
 //   * flame_test_emission — Margolus 2x2, 4 phases, neighbor write
 //                           lives entirely within the same block
+
+const LIFECYCLE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element lifecycle data (96 elements packed 4 per vec4<u32>):
+//   each u32 packs: ephemeral(8) | decay_product_el(8) | preserve_state(8) | _(8)
+@group(0) @binding(2) var<uniform> lifecycle: array<vec4<u32>, 24>;
+
+fn lc_lookup(el_id: u32) -> u32 {
+    let safe = min(el_id, 95u);
+    return lifecycle[safe / 4u][safe % 4u];
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    let c = cells[i];
+    let el = c.x & 0xFFu;
+    let lc = lc_lookup(el);
+    let ephemeral = (lc & 0xFFu) != 0u;
+    if (!ephemeral) { return; }
+
+    let life = (c.x >> 16u) & 0xFFFFu;
+    if (life == 0u) {
+        // Decay: replace this cell with its decay product. Bytes 1
+        // (derived_id) and the rest of cell.w (solute_*) reset to
+        // zero; preserve_state controls whether temp + pressure
+        // carry over (Steam → Water keeps the boiling heat so the
+        // condensation is visibly hot, not 0°C).
+        let decay_el = (lc >> 8u) & 0xFFu;
+        let preserve = ((lc >> 16u) & 0xFFu) != 0u;
+        if (preserve) {
+            // Keep temp (cells[i].y bits 16-31) and pressure
+            // (cells[i].z bits 16-31). Reset moisture, burn, life,
+            // derived_id, seed, flag, solute.
+            let pack0 = decay_el; // el only, no derived_id, no life
+            let pack1 = c.y & 0xFFFF0000u;            // keep temp, zero seed/flag
+            let pack2 = c.z & 0xFFFF0000u;            // keep pressure, zero moisture/burn
+            let pack3 = 0u;
+            cells[i] = vec4<u32>(pack0, pack1, pack2, pack3);
+        } else {
+            // Clean transition: decay product as a fresh cell. Used
+            // for Fire → Empty, where leftover heat would re-ignite
+            // anything underneath.
+            cells[i] = vec4<u32>(decay_el, 0u, 0u, 0u);
+        }
+    } else {
+        // Tick down: life - 1, leave everything else alone.
+        let new_life = life - 1u;
+        cells[i].x = (c.x & 0xFFFFu) | (new_life << 16u);
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct LifecycleUniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// GPU lifecycle pass — element-data-driven life decrement and decay.
+/// Generic across all elements: per-cell read, look up the element's
+/// lifecycle row, tick or decay accordingly. Adding a new ephemeral
+/// element is just a row in `lifecycle_props`.
+struct LifecycleCtx {
+    pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    uniform_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    lifecycle_lut_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl LifecycleCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let uniforms = LifecycleUniforms { width: W as u32, height: H as u32, _pad0: 0, _pad1: 0 };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-lifecycle-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Pack lifecycle data: each element gets 1 u32 with ephemeral|decay|preserve.
+        let mut lut: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let p = crate::lifecycle_props(el_id as u8);
+            let packed = (p[0] & 0xFFu32)
+                | ((p[1] & 0xFFu32) << 8)
+                | ((p[2] & 0xFFu32) << 16);
+            lut[(el_id / 4) as usize][(el_id % 4) as usize] = packed;
+        }
+        let lifecycle_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-lifecycle-lut"),
+            contents: bytemuck::cast_slice(&lut),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-lifecycle-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-lifecycle-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: lifecycle_lut_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-lifecycle-shader"),
+            source: wgpu::ShaderSource::Wgsl(LIFECYCLE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-lifecycle-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-lifecycle-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        LifecycleCtx { pipeline, uniform_buf, lifecycle_lut_buf, bind_group }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-lifecycle-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
+
 
 const CLEAR_FLAGS_SHADER: &str = r#"
 struct Uniforms {
@@ -2277,6 +2515,10 @@ struct GpuState {
     color_fires_compute: ColorFiresCtx,
     /// GPU port of `World::flame_test_emission`. Margolus 2x2.
     flame_emit_compute: FlameTestEmissionCtx,
+    /// Generic lifecycle pass — element-data-driven life decrement
+    /// and decay-to-product (Fire → Empty after life=0, Steam →
+    /// Water at boiling temp, etc.).
+    lifecycle_compute: LifecycleCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -2605,6 +2847,7 @@ impl GpuState {
         let clear_flags_compute = ClearFlagsCtx::new(&device, &queue, &cells_buf);
         let color_fires_compute = ColorFiresCtx::new(&device, &queue, &cells_buf);
         let flame_emit_compute = FlameTestEmissionCtx::new(&device, &queue, &cells_buf);
+        let lifecycle_compute = LifecycleCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -2625,6 +2868,7 @@ impl GpuState {
             clear_flags_compute,
             color_fires_compute,
             flame_emit_compute,
+            lifecycle_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -2859,6 +3103,9 @@ impl GpuState {
             // 1. clear_flags — zero out FLAG_UPDATED on every cell so
             //    motion/chemistry start from a clean slate.
             self.clear_flags_compute.encode(&mut encoder);
+            // 1b. lifecycle — tick down life on ephemeral elements
+            //     (Fire, Steam, …) so they age and decay this frame.
+            self.lifecycle_compute.encode(&mut encoder);
             // 2. PS: column scan + asymmetric blend. Writes new pressure
             //    straight into cells_buf, so the diffusion below sees
             //    post-PS values when it extracts.
