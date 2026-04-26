@@ -355,14 +355,15 @@ impl GpuState {
         // and a stone block to anchor the eye. Diagnostic only — once we
         // have mouse painting wired up these go away.
         let mut world = World::new();
-        // Pre-paint near the default camera focus (grid center). The
-        // user sees this immediately when the window opens; the rest
-        // of the grid is empty and gets revealed as they zoom out.
+        // Pre-paint near the floor of the grid since the default
+        // camera is floor-aligned. User sees the showcase scene
+        // immediately; the rest of the grid is empty playspace
+        // that opens up as they zoom out.
         let cx = W as i32 / 2;
-        let cy = H as i32 / 2;
-        world.paint(cx, cy + 110, 12, Element::Sand, 0, false);
-        world.paint(cx - 60, cy + 30, 6, Element::Water, 0, false);
-        world.paint(cx + 50, cy + 115, 4, Element::Stone, 0, true);
+        let floor_y = H as i32 - 30;
+        world.paint(cx, floor_y, 12, Element::Sand, 0, false);
+        world.paint(cx - 60, floor_y - 80, 6, Element::Water, 0, false);
+        world.paint(cx + 50, floor_y - 5, 4, Element::Stone, 0, true);
 
         let image_buffer = vec![0u8; W * H * 4];
 
@@ -407,14 +408,19 @@ impl GpuState {
         by_w.max(by_h)
     }
 
-    /// Reset camera to the default view: centered, zoomed in 2× past
-    /// cover-fit so zooming out actually reveals more grid (instead of
-    /// stranding the user at maximum cover-fit with nothing to expand
-    /// to). Bound to Backspace.
+    /// Reset camera to the default view: bottom-aligned (floor visible
+    /// immediately — falling-sand sims need that as the home pose),
+    /// horizontally centered, zoomed in 2× past cover-fit so zooming
+    /// out reveals the playspace above and to the sides. Bound to
+    /// Backspace.
     fn camera_reset(&mut self) {
-        self.cam_center_x = W as f32 * 0.5;
-        self.cam_center_y = H as f32 * 0.5;
         self.cam_scale = self.fit_scale() * 2.0;
+        let win_h = self.surface_config.height as f32;
+        let visible_half_y = (win_h * 0.5) / self.cam_scale;
+        self.cam_center_x = W as f32 * 0.5;
+        // cam_center_y at H − half_y puts the bottom edge of the view
+        // exactly at the grid floor.
+        self.cam_center_y = (H as f32 - visible_half_y).max(H as f32 * 0.5);
         self.clamp_camera();
     }
 
