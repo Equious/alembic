@@ -1097,7 +1097,18 @@ fn diagonal_slide(x: u32, parity: u32) {
             let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
             let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
             let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
-            if (h_slides && b_blocks && d_open) {
+            // Only the TOP cell of a pile column may slide. If there's
+            // another sand-like cell above us, sliding here would leave
+            // a gap that vfall couldn't fill until next frame — visible
+            // as horizontal voids running through the pile. With this
+            // check, internal cells stay put while the surface slides.
+            var above_blocks = false;
+            if (y > 0) {
+                let i_above = cell_idx(x, u32(y - 1));
+                let ka = cell_kind(cells[i_above]);
+                above_blocks = (ka == KIND_POWDER || ka == KIND_GRAVEL || ka == KIND_LIQUID);
+            }
+            if (h_slides && b_blocks && d_open && !above_blocks) {
                 cells[i_here] = c_diag;
                 cells[i_diag] = c_here;
             }
