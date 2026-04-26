@@ -1002,7 +1002,8 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
-// vec4 per element: x = kind_id, y = density, z = falling, w = is_liquid
+// vec4 per element: x = kind_id, y = density (signed),
+//                   z = viscosity, w = molar_mass
 @group(0) @binding(2) var<uniform> motion_props: array<vec4<f32>, 96>;
 
 const KIND_EMPTY: u32  = 0u;
@@ -1013,19 +1014,53 @@ const KIND_LIQUID: u32 = 4u;
 const KIND_GAS: u32    = 5u;
 const KIND_FIRE: u32   = 6u;
 
-const FLAG_FROZEN: u32 = 0x02u;
+const FLAG_UPDATED: u32 = 0x01u;
+const FLAG_FROZEN:  u32 = 0x02u;
 
 fn cell_idx(x: u32, y: u32) -> u32 { return y * u.width + x; }
-// Cell layout (16 bytes, repr(C)):
-//   x.byte0 = el, x.byte1 = derived_id, x.bytes2-3 = life
-//   y.byte0 = seed, y.byte1 = flag, y.bytes2-3 = temp
-//   z.byte0 = moisture, z.byte1 = burn, z.bytes2-3 = pressure
-//   w.byte0 = solute_el, w.byte1 = solute_amt, w.byte2 = solute_derived_id
 fn cell_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
 fn cell_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
 fn cell_kind(c: vec4<u32>) -> u32 { return u32(motion_props[cell_el(c)].x); }
 fn cell_density(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].y; }
+fn cell_viscosity(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].z; }
+fn cell_molar_mass(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].w; }
 fn cell_frozen(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_FROZEN) != 0u; }
+fn cell_updated(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_UPDATED) != 0u; }
+fn mark_updated(c: vec4<u32>) -> vec4<u32> {
+    return vec4<u32>(c.x, c.y | 0x100u, c.z, c.w);
+}
+
+fn kind_is_rigid(k: u32) -> bool {
+    return k == KIND_SOLID || k == KIND_GRAVEL || k == KIND_POWDER;
+}
+
+// Faithful port of `World::can_enter(src, tx, ty, dy)` from lib.rs.
+// Returns true iff `src_cell` can swap with the cell at (tx, ty)
+// when moving in direction dy (-1=up, 0=horizontal, 1=down).
+fn can_enter(src_cell: vec4<u32>, tx: i32, ty: i32, dy: i32) -> bool {
+    if (tx < 0 || tx >= i32(u.width) || ty < 0 || ty >= i32(u.height)) {
+        return false;
+    }
+    let i_t = u32(ty) * u.width + u32(tx);
+    let tgt = cells[i_t];
+    if (cell_updated(tgt)) { return false; }
+    let sk = cell_kind(src_cell);
+    let tk = cell_kind(tgt);
+    if (tk == KIND_EMPTY) { return true; }
+    if (kind_is_rigid(tk)) { return false; }
+    // Rigid src into viscous liquid (lava crust) — can't sink.
+    if (kind_is_rigid(sk) && cell_viscosity(tgt) > 100.0) { return false; }
+    // Gas-gas mixing: any gas/fire can swap with any other gas/fire.
+    let s_gasy = (sk == KIND_GAS || sk == KIND_FIRE);
+    let t_gasy = (tk == KIND_GAS || tk == KIND_FIRE);
+    if (s_gasy && t_gasy) { return true; }
+    // Density-direction check (matches CPU exactly).
+    let sd = cell_density(src_cell);
+    let td = cell_density(tgt);
+    if (dy > 0) { return sd > td; }
+    if (dy < 0) { return sd < td; }
+    return sd > td;
+}
 
 // Pass 0 — vertical fall: one thread per column, bottom-up walk.
 // When sand at row Y swaps with empty at Y+1, the next iteration
@@ -1043,96 +1078,76 @@ fn mark_updated(c: vec4<u32>) -> vec4<u32> {
     return vec4<u32>(c.x, c.y | 0x100u, c.z, c.w);
 }
 
-// Density-based vertical motion. Heavier-on-top swaps with
-// lighter-on-bottom — driven entirely by signed element data:
-//   * sand(20) on empty(0)  → swap (sand falls)
-//   * water(10) on empty(0) → swap (water falls)
-//   * empty(0) on steam(-3) → swap (steam rises by buoyancy)
-//   * Cl(3) on empty(0)     → swap (heavy gas falls slowly)
-//   * empty(0) on fire(-5)  → swap (fire rises fast)
-//
-// Categorical guard: aggregate-into-aggregate is forbidden.
-// Powders/gravel can't sink through other powders/gravel even if
-// denser — that's how piles stay stable. Mud sits on sand, not
-// through it; rust caps an iron pile, doesn't burrow through it.
-// Liquid-into-liquid is allowed (lava sinks through water).
-//
-// FLAG_UPDATED keeps each cell to one move per frame, matching the
-// CPU sim's row-sweep semantics.
+// Pass 0 — vertical fall. Faithful port of update_powder, update_gravel,
+// and update_liquid's straight-down step. Per-column thread, walks
+// bottom-up so cascading happens within one pass. Each cell's "can I
+// fall straight down?" check uses can_enter(c, x, y+1, 1) which mirrors
+// CPU exactly: target Empty always passes; rigid target blocks; gas-gas
+// mixes; otherwise density-direction test.
 fn vertical_fall(x: u32) {
     var y = i32(u.height) - 2;
     loop {
         if (y < 0) { break; }
         let i_here = cell_idx(x, u32(y));
-        let i_below = cell_idx(x, u32(y + 1));
-        let c_here = cells[i_here];
-        let c_below = cells[i_below];
-
-        let kh = cell_kind(c_here);
-        let kb = cell_kind(c_below);
-        let h_movable = (kh != KIND_SOLID) && !cell_frozen(c_here) && !cell_updated(c_here);
-        let b_movable = (kb != KIND_SOLID) && !cell_frozen(c_below) && !cell_updated(c_below);
-        let h_aggregate = (kh == KIND_POWDER || kh == KIND_GRAVEL);
-        let b_aggregate = (kb == KIND_POWDER || kb == KIND_GRAVEL);
-        let aggregate_to_aggregate = h_aggregate && b_aggregate;
-        if (h_movable && b_movable && !aggregate_to_aggregate) {
-            let dh = cell_density(c_here);
-            let db = cell_density(c_below);
-            if (dh > db) {
-                cells[i_here]  = mark_updated(c_below);
-                cells[i_below] = mark_updated(c_here);
+        let c = cells[i_here];
+        if (cell_updated(c) || cell_frozen(c)) { y = y - 1; continue; }
+        let k = cell_kind(c);
+        // Powder/Gravel/Liquid try straight-down. Gas/Fire/Empty/Solid
+        // are handled in other passes.
+        if (k == KIND_POWDER || k == KIND_GRAVEL || k == KIND_LIQUID) {
+            if (can_enter(c, i32(x), y + 1, 1)) {
+                let i_below = cell_idx(x, u32(y + 1));
+                let c_below = cells[i_below];
+                cells[i_here]  = c_below;
+                cells[i_below] = mark_updated(c);
             }
         }
         y = y - 1;
     }
 }
 
-// Pass 2/3 — diagonal slide for powder/gravel/liquid. Each thread is
-// one column, walks bottom-up. For cells where straight-down was
-// blocked (sand-on-sand from vfall), try diagonally — this is what
-// turns a vertical sand pillar into a triangular pile.
+// Pass 3/4 — diagonal slide for Powder and Liquid. Faithful port of
+// update_powder and update_liquid's diagonal step: only fires when
+// straight-down is blocked. Tries one diagonal first (chosen by
+// frame parity to avoid drift), then the other if the first is blocked.
+// Gravel does NOT slide diagonally (only Powder + Liquid do per CPU).
 //
-// Race-free via column parity: pass 2 only acts on even columns,
-// pass 3 only acts on odd. Each pass writes to its own column AND
-// the diagonal target column, but in pass 2 the diagonal target is
-// ODD (even+1 or even-1), and odd columns aren't running — so no
-// races. Same logic in pass 3.
-//
-// Direction alternates by frame parity to avoid one-sided drift.
+// Per-column threads with even/odd column parity sub-passes — the
+// diagonal target column is x±1, and in each sub-pass only every-other
+// column is active, so writes to the target column don't race.
 fn diagonal_slide(x: u32, parity: u32) {
     if ((x & 1u) != parity) { return; }
-    let dir: i32 = select(-1, 1, (u.frame & 1u) == 0u);
-    let nx = i32(x) + dir;
-    if (nx < 0 || nx >= i32(u.width)) { return; }
+    let frame_lr = (u.frame & 1u) == 0u;
+    var dx_first: i32 = 1;
+    var dx_second: i32 = -1;
+    if (frame_lr) { dx_first = -1; dx_second = 1; }
 
     var y = i32(u.height) - 2;
     loop {
         if (y < 0) { break; }
         let i_here = cell_idx(x, u32(y));
-        let i_below = cell_idx(x, u32(y + 1));
-        let i_diag  = cell_idx(u32(nx), u32(y + 1));
-        let c_here  = cells[i_here];
-        let c_below = cells[i_below];
-        let c_diag  = cells[i_diag];
+        let c = cells[i_here];
+        if (cell_updated(c) || cell_frozen(c)) { y = y - 1; continue; }
+        let k = cell_kind(c);
+        if (k != KIND_POWDER && k != KIND_LIQUID) { y = y - 1; continue; }
+        // If straight-down was open, vfall would have moved us. If it
+        // was blocked, try diagonals now.
+        if (can_enter(c, i32(x), y + 1, 1)) { y = y - 1; continue; }
 
-        if (!cell_frozen(c_here) && !cell_frozen(c_diag)
-            && !cell_updated(c_here) && !cell_updated(c_diag)) {
-            let kh = cell_kind(c_here);
-            let kb = cell_kind(c_below);
-            let kd = cell_kind(c_diag);
-            let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
-            let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
-            let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
-            // Only the TOP cell of a pile column may slide.
-            var above_blocks = false;
-            if (y > 0) {
-                let i_above = cell_idx(x, u32(y - 1));
-                let ka = cell_kind(cells[i_above]);
-                above_blocks = (ka == KIND_POWDER || ka == KIND_GRAVEL || ka == KIND_LIQUID);
-            }
-            if (h_slides && b_blocks && d_open && !above_blocks) {
-                cells[i_here] = mark_updated(c_diag);
-                cells[i_diag] = mark_updated(c_here);
+        // Try first diagonal.
+        let nx1 = i32(x) + dx_first;
+        if (can_enter(c, nx1, y + 1, 1)) {
+            let i_t = cell_idx(u32(nx1), u32(y + 1));
+            let c_t = cells[i_t];
+            cells[i_here] = c_t;
+            cells[i_t]    = mark_updated(c);
+        } else {
+            let nx2 = i32(x) + dx_second;
+            if (can_enter(c, nx2, y + 1, 1)) {
+                let i_t = cell_idx(u32(nx2), u32(y + 1));
+                let c_t = cells[i_t];
+                cells[i_here] = c_t;
+                cells[i_t]    = mark_updated(c);
             }
         }
         y = y - 1;
@@ -1140,44 +1155,52 @@ fn diagonal_slide(x: u32, parity: u32) {
 }
 
 // Pass 1/2 — liquid horizontal spread. Each thread handles one row,
-// swapping liquid with adjacent empty/gas if the cell below is solid
-// (so liquids spread on top of a floor instead of refusing to fall).
+// Pass 1/2 — liquid horizontal spread. Faithful port of update_liquid's
+// horizontal step: only fires when straight-down AND both diagonals
+// below are blocked (otherwise vfall + dslide handle it). Viscosity
+// throttles the spread rate (lava oozes, water runs flat).
 //
-// Race fix vs the previous single-pass version: thread y reads
-// row y+1 for the support check while thread y+1 might be writing
-// it. Split into even-row and odd-row sub-passes (parity 0 / 1)
-// so adjacent rows never run simultaneously.
+// Per-row threads with even/odd row parity sub-passes keep the
+// support-check read of row y+1 race-free.
 fn liquid_spread(y: u32, parity: u32) {
     if ((y & 1u) != parity) { return; }
-    let lr = (u.frame & 1u) == 0u;
+    let frame_lr = (u.frame & 1u) == 0u;
+    var dx_first: i32 = 1;
+    var dx_second: i32 = -1;
+    if (frame_lr) { dx_first = -1; dx_second = 1; }
     let w_i = i32(u.width);
-    var x: i32;
-    var step: i32;
-    var x_end: i32;
-    if (lr) { x = 0; step = 1; x_end = w_i - 1; }
-    else    { x = w_i - 1; step = -1; x_end = 0; }
+
+    var x = 0i;
     loop {
-        if (lr) { if (x >= x_end) { break; } }
-        else    { if (x <= x_end) { break; } }
-        let nx = x + step;
-        let i_a = cell_idx(u32(x),  y);
-        let i_b = cell_idx(u32(nx), y);
-        let c_a = cells[i_a];
-        let c_b = cells[i_b];
-        if (!cell_frozen(c_a) && !cell_frozen(c_b)
-            && !cell_updated(c_a) && !cell_updated(c_b)) {
-            let ka = cell_kind(c_a);
-            let kb = cell_kind(c_b);
-            let i_below = cell_idx(u32(x), y + 1u);
-            let c_below = cells[i_below];
-            let kbel = cell_kind(c_below);
-            let supported = (kbel != KIND_EMPTY && kbel != KIND_GAS && kbel != KIND_FIRE);
-            if (supported && ka == KIND_LIQUID && (kb == KIND_EMPTY || kb == KIND_GAS)) {
-                cells[i_a] = mark_updated(c_b);
-                cells[i_b] = mark_updated(c_a);
-            }
+        if (x >= w_i) { break; }
+        let i_here = cell_idx(u32(x), y);
+        let c = cells[i_here];
+        if (cell_updated(c) || cell_frozen(c)) { x = x + 1; continue; }
+        if (cell_kind(c) != KIND_LIQUID) { x = x + 1; continue; }
+        // Only spread sideways if straight-down + both diagonals are
+        // blocked — that's the CPU's fall priority order.
+        if (can_enter(c, x, i32(y) + 1, 1)) { x = x + 1; continue; }
+        if (can_enter(c, x + dx_first,  i32(y) + 1, 1)) { x = x + 1; continue; }
+        if (can_enter(c, x + dx_second, i32(y) + 1, 1)) { x = x + 1; continue; }
+        // Viscosity throttle: visc 0 always spreads, visc 400 never.
+        let visc = cell_viscosity(c);
+        let r = hash_u32_motion(u32(i_here), u.frame);
+        if (visc > 0.0 && (f32(r & 0xFFFu) / 4096.0) * 400.0 < visc) {
+            x = x + 1; continue;
         }
-        x = x + step;
+        // Try first horizontal direction, then second.
+        if (can_enter(c, x + dx_first, i32(y), 0)) {
+            let i_t = cell_idx(u32(x + dx_first), y);
+            let c_t = cells[i_t];
+            cells[i_here] = c_t;
+            cells[i_t]    = mark_updated(c);
+        } else if (can_enter(c, x + dx_second, i32(y), 0)) {
+            let i_t = cell_idx(u32(x + dx_second), y);
+            let c_t = cells[i_t];
+            cells[i_here] = c_t;
+            cells[i_t]    = mark_updated(c);
+        }
+        x = x + 1;
     }
 }
 
@@ -1204,29 +1227,68 @@ fn hash_u32_motion(a: u32, b: u32) -> u32 {
 
 fn gas_dynamics(x: u32, parity: u32) {
     if ((x & 1u) != parity) { return; }
-    let h = i32(u.height);
     let w_i = i32(u.width);
+    let h_i = i32(u.height);
     var y = 0i;
     loop {
-        if (y >= h) { break; }
+        if (y >= h_i) { break; }
         let i_here = cell_idx(x, u32(y));
-        let c_here = cells[i_here];
-        let kh = cell_kind(c_here);
-        if ((kh == KIND_GAS || kh == KIND_FIRE)
-            && !cell_frozen(c_here) && !cell_updated(c_here)) {
-            let r = hash_u32_motion(i_here, u.frame);
-            // ~50% chance to attempt a lateral drift this frame.
-            if ((r & 0x80u) != 0u) {
-                let dir: i32 = select(-1, 1, (r & 0x40u) != 0u);
-                let nx = i32(x) + dir;
-                if (nx >= 0 && nx < w_i) {
-                    let i_n = cell_idx(u32(nx), u32(y));
-                    let c_n = cells[i_n];
-                    let kn = cell_kind(c_n);
-                    if (kn == KIND_EMPTY
-                        && !cell_frozen(c_n) && !cell_updated(c_n)) {
-                        cells[i_here] = mark_updated(c_n);
-                        cells[i_n]    = mark_updated(c_here);
+        let c = cells[i_here];
+        if (cell_updated(c) || cell_frozen(c)) { y = y + 1; continue; }
+        let k = cell_kind(c);
+        if (k != KIND_GAS && k != KIND_FIRE) { y = y + 1; continue; }
+
+        // Faithful port of update_gas's "empty expansion" — the
+        // primary drive of gas motion in CPU sim. Tries 4 cardinal
+        // directions in randomized order, 50% probability each;
+        // first successful swap with empty wins.
+        let r = hash_u32_motion(i_here, u.frame);
+        let start = r & 3u;
+        var moved = false;
+        // Unrolled 4-direction try with rotated start.
+        for (var k4 = 0u; k4 < 4u && !moved; k4 = k4 + 1u) {
+            let pick = (start + k4) & 3u;
+            var dx: i32 = 0;
+            var dy: i32 = 0;
+            if (pick == 0u) { dx = -1; }
+            else if (pick == 1u) { dx = 1; }
+            else if (pick == 2u) { dy = -1; }
+            else { dy = 1; }
+            let nx = i32(x) + dx;
+            let ny = y + dy;
+            if (nx < 0 || nx >= w_i || ny < 0 || ny >= h_i) { continue; }
+            let i_t = cell_idx(u32(nx), u32(ny));
+            let c_t = cells[i_t];
+            if (cell_kind(c_t) != KIND_EMPTY) { continue; }
+            if (cell_updated(c_t) || cell_frozen(c_t)) { continue; }
+            // 50% per-direction probability (CPU baseline).
+            let prob_bit = (r >> (8u + k4 * 2u)) & 1u;
+            if (prob_bit == 0u) { continue; }
+            cells[i_here] = mark_updated(c_t);
+            cells[i_t]    = mark_updated(c);
+            moved = true;
+        }
+        // Buoyancy fallback: if no lateral/vertical empty swap fired,
+        // try molar-mass-driven rise/sink. Light gases (mass < 29 ~
+        // AMBIENT_AIR) bias upward; heavy gases bias downward.
+        if (!moved) {
+            let m = cell_molar_mass(c);
+            if (m > 0.0) {
+                let air_mass: f32 = 29.0;
+                let bias = (air_mass - m) / air_mass;
+                let dir_y: i32 = select(1, -1, bias > 0.0);
+                let bias_abs = abs(bias);
+                let prob_byte = (r >> 16u) & 0xFFu;
+                if (f32(prob_byte) / 255.0 < bias_abs) {
+                    let nx = i32(x);
+                    let ny = y + dir_y;
+                    if (ny >= 0 && ny < h_i) {
+                        if (can_enter(c, nx, ny, dir_y)) {
+                            let i_t = cell_idx(u32(nx), u32(ny));
+                            let c_t = cells[i_t];
+                            cells[i_here] = c_t;
+                            cells[i_t]    = mark_updated(c);
+                        }
                     }
                 }
             }

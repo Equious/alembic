@@ -429,11 +429,9 @@ pub fn pressure_perm_props(id: u8) -> [u32; 4] {
 
 /// Per-element motion props as packed vec4 for the GPU motion compute:
 ///   x = kind id (Empty=0, Solid=1, Gravel=2, Powder=3, Liquid=4, Gas=5, Fire=6)
-///   y = density (SIGNED — gases have negative density, e.g. Steam=-3,
-///       Fire=-5, Ar=-1; this is what makes the single density-based
-///       swap rule work for both falling AND rising motion)
-///   z = is_falling_solid_or_powder ? 1 : 0  (cells that obey gravity)
-///   w = is_liquid ? 1 : 0                   (cells that flow horizontally)
+///   y = density (SIGNED — gases have negative density)
+///   z = viscosity (gates rigid-into-fluid and horizontal liquid spread)
+///   w = molar_mass (drives gas ambient buoyancy vs AMBIENT_AIR)
 pub fn motion_props(id: u8) -> [f32; 4] {
     let i = id as usize;
     if i >= ELEMENT_COUNT { return [0.0; 4]; }
@@ -450,9 +448,9 @@ pub fn motion_props(id: u8) -> [f32; 4] {
     // Preserve sign — gases have negative density and we rely on
     // empty(0) > gas(-3) for buoyancy in the GPU motion shader.
     let density = phys.density as f32;
-    let falling = matches!(phys.kind, Kind::Powder | Kind::Gravel | Kind::Liquid) as i32 as f32;
-    let is_liquid = matches!(phys.kind, Kind::Liquid) as i32 as f32;
-    [kind_id, density, falling, is_liquid]
+    let viscosity = phys.viscosity as f32;
+    let molar_mass = phys.molar_mass;
+    [kind_id, density, viscosity, molar_mass]
 }
 
 /// Snapshot the per-element pressure-source data as a packed vec4 —
