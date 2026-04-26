@@ -1043,15 +1043,20 @@ fn mark_updated(c: vec4<u32>) -> vec4<u32> {
     return vec4<u32>(c.x, c.y | 0x100u, c.z, c.w);
 }
 
-// Single density-based vertical motion rule. Heavier-on-top swaps
-// with lighter-on-bottom — that's it. With proper signed densities
-// (gas=-1..-5, empty=0, water=10, sand=20, lava=30):
+// Density-based vertical motion. Heavier-on-top swaps with
+// lighter-on-bottom — driven entirely by signed element data:
 //   * sand(20) on empty(0)  → swap (sand falls)
 //   * water(10) on empty(0) → swap (water falls)
 //   * empty(0) on steam(-3) → swap (steam rises by buoyancy)
-//   * steam(-3) on empty(0) → no swap (steam doesn't fall through air)
 //   * Cl(3) on empty(0)     → swap (heavy gas falls slowly)
-//   * fire(-5) on empty(0)  → no swap; empty(0) on fire(-5) → swap (fire rises)
+//   * empty(0) on fire(-5)  → swap (fire rises fast)
+//
+// Categorical guard: aggregate-into-aggregate is forbidden.
+// Powders/gravel can't sink through other powders/gravel even if
+// denser — that's how piles stay stable. Mud sits on sand, not
+// through it; rust caps an iron pile, doesn't burrow through it.
+// Liquid-into-liquid is allowed (lava sinks through water).
+//
 // FLAG_UPDATED keeps each cell to one move per frame, matching the
 // CPU sim's row-sweep semantics.
 fn vertical_fall(x: u32) {
@@ -1067,7 +1072,10 @@ fn vertical_fall(x: u32) {
         let kb = cell_kind(c_below);
         let h_movable = (kh != KIND_SOLID) && !cell_frozen(c_here) && !cell_updated(c_here);
         let b_movable = (kb != KIND_SOLID) && !cell_frozen(c_below) && !cell_updated(c_below);
-        if (h_movable && b_movable) {
+        let h_aggregate = (kh == KIND_POWDER || kh == KIND_GRAVEL);
+        let b_aggregate = (kb == KIND_POWDER || kb == KIND_GRAVEL);
+        let aggregate_to_aggregate = h_aggregate && b_aggregate;
+        if (h_movable && b_movable && !aggregate_to_aggregate) {
             let dh = cell_density(c_here);
             let db = cell_density(c_below);
             if (dh > db) {
