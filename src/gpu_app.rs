@@ -695,6 +695,12 @@ struct GpuState {
     /// ambient blend). Replaces `World::thermal_diffuse()`.
     thermal_compute: ThermalComputeCtx,
     frame_counter: u32,
+    // Lightweight perf counter — prints fps + sim time once per second.
+    prof_last_print: std::time::Instant,
+    prof_frame_count: u32,
+    prof_sim_us: u64,
+    prof_compute_us: u64,
+    prof_render_us: u64,
     /// Window must outlive the surface. Held as Arc so the surface's
     /// 'static lifetime contract is satisfied without unsafe.
     window: Arc<Window>,
@@ -999,6 +1005,11 @@ impl GpuState {
             pressure_compute,
             thermal_compute,
             frame_counter: 0,
+            prof_last_print: std::time::Instant::now(),
+            prof_frame_count: 0,
+            prof_sim_us: 0,
+            prof_compute_us: 0,
+            prof_render_us: 0,
             window,
             selected: Element::Sand,
             brush_radius: 4,
@@ -1172,12 +1183,14 @@ impl GpuState {
         // so the new cells participate in this tick.
         self.apply_brush();
 
-        // Tick the sim. The two heaviest per-cell passes (pressure
-        // diffusion, thermal diffusion) dispatch to GPU compute
-        // shaders; everything else stays on CPU. Thermal_post
-        // (moisture, combustion) still runs on CPU as part of step.
+        // Per-frame timing
+        let t_sim_start = std::time::Instant::now();
         if !self.paused {
             self.world.step_skip_pressure_thermal(macroquad::math::Vec2::new(0.0, 0.0));
+        }
+        let t_sim = t_sim_start.elapsed();
+        let t_compute_start = std::time::Instant::now();
+        if !self.paused {
             self.pressure_compute.dispatch(&mut self.world, &self.device, &self.queue);
             let amb = self.world.ambient_offset;
             self.thermal_compute.dispatch(
@@ -1189,6 +1202,8 @@ impl GpuState {
             );
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
+        let t_compute = t_compute_start.elapsed();
+        let t_render_start = std::time::Instant::now();
 
         // Compute the sim rectangle in framebuffer pixels, preserving
         // the W:H aspect ratio. Whatever space is left over becomes
@@ -1304,6 +1319,27 @@ impl GpuState {
         self.queue.submit(std::iter::once(encoder.finish()));
         self.window.pre_present_notify();
         frame.present();
+        let t_render = t_render_start.elapsed();
+
+        self.prof_sim_us     += t_sim.as_micros() as u64;
+        self.prof_compute_us += t_compute.as_micros() as u64;
+        self.prof_render_us  += t_render.as_micros() as u64;
+        self.prof_frame_count += 1;
+        if self.prof_last_print.elapsed().as_secs_f32() >= 1.0 {
+            let f = self.prof_frame_count.max(1) as f32;
+            eprintln!(
+                "[fps] {:>3} | sim {:>5.1}ms | compute {:>5.1}ms | render {:>5.1}ms",
+                self.prof_frame_count,
+                (self.prof_sim_us as f32 / f) / 1000.0,
+                (self.prof_compute_us as f32 / f) / 1000.0,
+                (self.prof_render_us as f32 / f) / 1000.0,
+            );
+            self.prof_frame_count = 0;
+            self.prof_sim_us = 0;
+            self.prof_compute_us = 0;
+            self.prof_render_us = 0;
+            self.prof_last_print = std::time::Instant::now();
+        }
     }
 }
 
