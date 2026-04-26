@@ -8,11 +8,13 @@ use macroquad::window::miniquad::{
     BlendFactor, BlendState, BlendValue, Equation, PipelineParams,
 };
 
-// Sim grid dimensions. v0.3 settles on 600×480 (5:4) — 2.25× the
-// original 320×315 = 100 800 cells. Held to this size while CPU sim
-// is the backstop. v0.4 GPU compute will let us grow this dramatically.
-pub const W: usize = 600;
-pub const H: usize = 480;
+// Sim grid dimensions. v0.3 phase 3 — pressure now runs on GPU
+// compute, so the largest CPU-linear cost is eliminated and we can
+// grow the grid. 1200×900 = 1.08M cells, ~10× the legacy 320×315.
+// Thermal diffusion is still on CPU; it'll be the next port if it
+// becomes the bottleneck under load.
+pub const W: usize = 1200;
+pub const H: usize = 900;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
