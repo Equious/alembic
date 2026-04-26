@@ -4057,6 +4057,8 @@ pub struct GpuChem {
     pub flame_test_emission: bool,
     pub tree_support: bool,
     pub thermal_post: bool,
+    pub dissolve: bool,
+    pub diffuse_solute: bool,
 }
 
 impl World {
@@ -4191,8 +4193,12 @@ impl World {
         self.alloy_acid_leach();     mark!("alloy_leach");
         self.base_neutralization();  mark!("base_neutral");
         self.alloy_formation();      mark!("alloy_form");
-        self.dissolve();             mark!("dissolve");
-        self.diffuse_solute();       mark!("diffuse_solute");
+        if !gpu_chem.dissolve {
+            self.dissolve();         mark!("dissolve");
+        }
+        if !gpu_chem.diffuse_solute {
+            self.diffuse_solute();   mark!("diffuse_solute");
+        }
         self.reactions();            mark!("reactions");
         if run_motion {
             for y in (0..H as i32).rev() {

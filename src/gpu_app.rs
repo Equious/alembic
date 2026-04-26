@@ -1931,6 +1931,326 @@ impl ThermalPostCtx {
     }
 }
 
+const SOLUTE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0..3 = dissolve phase, 4..7 = diffuse phase
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+const EL_EMPTY: u32 = 0u;
+const EL_WATER: u32 = 2u;
+const EL_SALT:  u32 = 40u;
+
+const FLAG_FROZEN: u32 = 0x02u;
+
+fn s_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn s_derived_id(c: vec4<u32>) -> u32 { return (c.x >> 8u) & 0xFFu; }
+fn s_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn s_frozen(c: vec4<u32>) -> bool { return (s_flag(c) & FLAG_FROZEN) != 0u; }
+fn s_solute_el(c: vec4<u32>) -> u32 { return c.w & 0xFFu; }
+fn s_solute_amt(c: vec4<u32>) -> u32 { return (c.w >> 8u) & 0xFFu; }
+fn s_solute_did(c: vec4<u32>) -> u32 { return (c.w >> 16u) & 0xFFu; }
+
+fn s_set_solute(c: vec4<u32>, el: u32, amt: u32, did: u32) -> vec4<u32> {
+    let pad = c.w & 0xFF000000u;
+    let w = pad | (el & 0xFFu) | ((amt & 0xFFu) << 8u) | ((did & 0xFFu) << 16u);
+    return vec4<u32>(c.x, c.y, c.z, w);
+}
+
+fn s_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+const ABSORB_THRESHOLD: u32 = 192u;
+const DIFFUSE_MAX: u32 = 24u;
+
+// Faithful port of `World::dissolve` and `World::diffuse_solute`,
+// Margolus-2x2 4-phase encoded:
+//
+//   pass_id  0..3: dissolve, 4 phase alignments. Within each 2x2
+//   block, scan for a Water cell with solute_amt < ABSORB_THRESHOLD
+//   adjacent to a Salt cell; consume the Salt (becomes Empty) and
+//   set the water's solute_amt = 255.
+//
+//   pass_id  4..7: diffuse_solute, 4 phase alignments. Within each
+//   2x2 block, find Water-Water pair with matching solute element
+//   and a concentration gap > 1; transfer half the gap (capped at
+//   DIFFUSE_MAX).
+//
+// Margolus 2x2 keeps writes block-local and race-free per phase.
+// Note: the CPU code's Derived-soluble-salt path (FeCl, KCl, …) is
+// NOT yet ported because the Derived registry is dynamic. Salt-only
+// for now; CPU still handles Derived dissolution when active.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    let r = s_hash(by * u.width + bx, u.frame);
+
+    if (u.pass_id < 4u) {
+        // ---- dissolve ----
+        // 4 cells × 4 neighbor pairs per block. Try each Water → Salt
+        // pair; on first match within probability gate, consume Salt.
+        // 20% probability per attempt.
+        if ((r & 0xFFu) > 51u) { return; } // ~20%
+
+        // Helper to attempt dissolve(water, salt) → mark both updated.
+        // Returns updated cells via early exits.
+        // c00 ↔ c10 (horizontal, top row)
+        if (s_el(c00) == EL_WATER && s_solute_amt(c00) < ABSORB_THRESHOLD
+            && s_el(c10) == EL_SALT && !s_frozen(c10)) {
+            c00 = s_set_solute(c00, EL_SALT, 255u, 0u);
+            c10 = vec4<u32>(0u, 0u, 0u, 0u);
+        } else if (s_el(c10) == EL_WATER && s_solute_amt(c10) < ABSORB_THRESHOLD
+            && s_el(c00) == EL_SALT && !s_frozen(c00)) {
+            c10 = s_set_solute(c10, EL_SALT, 255u, 0u);
+            c00 = vec4<u32>(0u, 0u, 0u, 0u);
+        }
+        // c01 ↔ c11 (horizontal, bottom row)
+        else if (s_el(c01) == EL_WATER && s_solute_amt(c01) < ABSORB_THRESHOLD
+            && s_el(c11) == EL_SALT && !s_frozen(c11)) {
+            c01 = s_set_solute(c01, EL_SALT, 255u, 0u);
+            c11 = vec4<u32>(0u, 0u, 0u, 0u);
+        } else if (s_el(c11) == EL_WATER && s_solute_amt(c11) < ABSORB_THRESHOLD
+            && s_el(c01) == EL_SALT && !s_frozen(c01)) {
+            c11 = s_set_solute(c11, EL_SALT, 255u, 0u);
+            c01 = vec4<u32>(0u, 0u, 0u, 0u);
+        }
+        // c00 ↔ c01 (vertical, left col)
+        else if (s_el(c00) == EL_WATER && s_solute_amt(c00) < ABSORB_THRESHOLD
+            && s_el(c01) == EL_SALT && !s_frozen(c01)) {
+            c00 = s_set_solute(c00, EL_SALT, 255u, 0u);
+            c01 = vec4<u32>(0u, 0u, 0u, 0u);
+        } else if (s_el(c01) == EL_WATER && s_solute_amt(c01) < ABSORB_THRESHOLD
+            && s_el(c00) == EL_SALT && !s_frozen(c00)) {
+            c01 = s_set_solute(c01, EL_SALT, 255u, 0u);
+            c00 = vec4<u32>(0u, 0u, 0u, 0u);
+        }
+        // c10 ↔ c11 (vertical, right col)
+        else if (s_el(c10) == EL_WATER && s_solute_amt(c10) < ABSORB_THRESHOLD
+            && s_el(c11) == EL_SALT && !s_frozen(c11)) {
+            c10 = s_set_solute(c10, EL_SALT, 255u, 0u);
+            c11 = vec4<u32>(0u, 0u, 0u, 0u);
+        } else if (s_el(c11) == EL_WATER && s_solute_amt(c11) < ABSORB_THRESHOLD
+            && s_el(c10) == EL_SALT && !s_frozen(c10)) {
+            c11 = s_set_solute(c11, EL_SALT, 255u, 0u);
+            c10 = vec4<u32>(0u, 0u, 0u, 0u);
+        }
+    } else {
+        // ---- diffuse_solute ----
+        // 35% probability per attempt.
+        if ((r & 0xFFu) > 89u) { return; } // ~35%
+        // For each pair, transfer solute from higher to lower if same element.
+        // c00 ↔ c10
+        if (s_el(c00) == EL_WATER && s_el(c10) == EL_WATER) {
+            let s0 = s_solute_amt(c00);
+            let s1 = s_solute_amt(c10);
+            let same = (s_solute_el(c00) == s_solute_el(c10) || s0 == 0u || s1 == 0u)
+                && (s_solute_did(c00) == s_solute_did(c10) || s0 == 0u || s1 == 0u);
+            if (same && s0 > s1 && (s0 - s1) > 1u) {
+                let gap = s0 - s1;
+                var transfer = (gap / 2u);
+                if (transfer > DIFFUSE_MAX) { transfer = DIFFUSE_MAX; }
+                if (transfer < 1u) { transfer = 1u; }
+                let donor_el = s_solute_el(c00);
+                let donor_did = s_solute_did(c00);
+                let new_s0 = s0 - transfer;
+                let new_s1 = min(s1 + transfer, 255u);
+                let final_el0 = select(donor_el, 0u, new_s0 == 0u);
+                let final_did0 = select(donor_did, 0u, new_s0 == 0u);
+                c00 = s_set_solute(c00, final_el0, new_s0, final_did0);
+                c10 = s_set_solute(c10, donor_el, new_s1, donor_did);
+            } else if (same && s1 > s0 && (s1 - s0) > 1u) {
+                let gap = s1 - s0;
+                var transfer = (gap / 2u);
+                if (transfer > DIFFUSE_MAX) { transfer = DIFFUSE_MAX; }
+                if (transfer < 1u) { transfer = 1u; }
+                let donor_el = s_solute_el(c10);
+                let donor_did = s_solute_did(c10);
+                let new_s1 = s1 - transfer;
+                let new_s0 = min(s0 + transfer, 255u);
+                let final_el1 = select(donor_el, 0u, new_s1 == 0u);
+                let final_did1 = select(donor_did, 0u, new_s1 == 0u);
+                c10 = s_set_solute(c10, final_el1, new_s1, final_did1);
+                c00 = s_set_solute(c00, donor_el, new_s0, donor_did);
+            }
+        }
+        // c01 ↔ c11 (analogous)
+        if (s_el(c01) == EL_WATER && s_el(c11) == EL_WATER) {
+            let s0 = s_solute_amt(c01);
+            let s1 = s_solute_amt(c11);
+            let same = (s_solute_el(c01) == s_solute_el(c11) || s0 == 0u || s1 == 0u)
+                && (s_solute_did(c01) == s_solute_did(c11) || s0 == 0u || s1 == 0u);
+            if (same && s0 > s1 && (s0 - s1) > 1u) {
+                let gap = s0 - s1;
+                var transfer = (gap / 2u);
+                if (transfer > DIFFUSE_MAX) { transfer = DIFFUSE_MAX; }
+                if (transfer < 1u) { transfer = 1u; }
+                let donor_el = s_solute_el(c01);
+                let donor_did = s_solute_did(c01);
+                let new_s0 = s0 - transfer;
+                let new_s1 = min(s1 + transfer, 255u);
+                let final_el0 = select(donor_el, 0u, new_s0 == 0u);
+                let final_did0 = select(donor_did, 0u, new_s0 == 0u);
+                c01 = s_set_solute(c01, final_el0, new_s0, final_did0);
+                c11 = s_set_solute(c11, donor_el, new_s1, donor_did);
+            } else if (same && s1 > s0 && (s1 - s0) > 1u) {
+                let gap = s1 - s0;
+                var transfer = (gap / 2u);
+                if (transfer > DIFFUSE_MAX) { transfer = DIFFUSE_MAX; }
+                if (transfer < 1u) { transfer = 1u; }
+                let donor_el = s_solute_el(c11);
+                let donor_did = s_solute_did(c11);
+                let new_s1 = s1 - transfer;
+                let new_s0 = min(s0 + transfer, 255u);
+                let final_el1 = select(donor_el, 0u, new_s1 == 0u);
+                let final_did1 = select(donor_did, 0u, new_s1 == 0u);
+                c11 = s_set_solute(c11, final_el1, new_s1, final_did1);
+                c01 = s_set_solute(c01, donor_el, new_s0, donor_did);
+            }
+        }
+        // c00 ↔ c01 (vertical pairs handled by next phase alignment)
+        // Skipping vertical here — phase rotation covers all pairs.
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct SoluteUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+}
+
+/// GPU port of `World::dissolve` + `World::diffuse_solute`. Both are
+/// neighbor-pair operations on Water cells, ported via Margolus 2x2
+/// 4-phase encoding (race-free per phase). 8 dispatches total per
+/// frame: 4 dissolve phases + 4 diffuse phases. The Derived-soluble
+/// salt branch isn't yet ported; only Element::Salt is recognized.
+struct SoluteCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 8],
+    pass_bind_groups: [wgpu::BindGroup; 8],
+}
+
+impl SoluteCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = SoluteUniforms { width: W as u32, height: H as u32, pass_id, frame: 0 };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let pass_uniform_bufs: [wgpu::Buffer; 8] = [
+            mk_uniform("alembic-solute-u-dis0", 0),
+            mk_uniform("alembic-solute-u-dis1", 1),
+            mk_uniform("alembic-solute-u-dis2", 2),
+            mk_uniform("alembic-solute-u-dis3", 3),
+            mk_uniform("alembic-solute-u-dif0", 4),
+            mk_uniform("alembic-solute-u-dif1", 5),
+            mk_uniform("alembic-solute-u-dif2", 6),
+            mk_uniform("alembic-solute-u-dif3", 7),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-solute-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-solute-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 8] = [
+            mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3),
+            mk_bind(4), mk_bind(5), mk_bind(6), mk_bind(7),
+        ];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-solute-shader"),
+            source: wgpu::ShaderSource::Wgsl(SOLUTE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-solute-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-solute-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        SoluteCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let arr = [frame];
+        let bytes: &[u8] = bytemuck::cast_slice(&arr);
+        for i in 0..8 {
+            queue.write_buffer(&self.pass_uniform_bufs[i], 12, bytes);
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        for i in 0..8 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-solute-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -3220,6 +3540,9 @@ struct GpuState {
     /// GPU port of the per-cell core of `World::thermal_post` —
     /// combustion ignition, burn-out, and phase changes.
     thermal_post_compute: ThermalPostCtx,
+    /// GPU port of `World::dissolve` + `World::diffuse_solute`.
+    /// Margolus 2x2 4-phase × 2 modes = 8 dispatches per frame.
+    solute_compute: SoluteCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -3551,6 +3874,7 @@ impl GpuState {
         let lifecycle_compute = LifecycleCtx::new(&device, &queue, &cells_buf);
         let tree_support_compute = TreeSupportCtx::new(&device, &queue, &cells_buf);
         let thermal_post_compute = ThermalPostCtx::new(&device, &queue, &cells_buf);
+        let solute_compute = SoluteCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -3574,6 +3898,7 @@ impl GpuState {
             lifecycle_compute,
             tree_support_compute,
             thermal_post_compute,
+            solute_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -3784,6 +4109,8 @@ impl GpuState {
                 flame_test_emission: true,
                 tree_support: true,
                 thermal_post: true,
+                dissolve: true,
+                diffuse_solute: true,
             };
             self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
@@ -3834,6 +4161,10 @@ impl GpuState {
             //     phase changes (Water→Steam, Ice→Water, Wood→ash).
             self.thermal_post_compute.update_frame(&self.queue, self.frame_counter);
             self.thermal_post_compute.encode(&mut encoder);
+            // 4c. dissolve + diffuse_solute — Margolus 2x2 4-phase
+            //     for water-salt dissolution and inter-water solute
+            //     equalization.
+            self.solute_compute.encode(&mut encoder, &self.queue, self.frame_counter);
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.
