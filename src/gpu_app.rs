@@ -25,6 +25,295 @@ use winit::window::{Window, WindowId};
 
 use crate::{color_rgb, Element, World, H, W};
 
+const PRESSURE_COMPUTE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> pressure_in: array<i32>;
+@group(0) @binding(2) var<storage, read_write> pressure_out: array<i32>;
+@group(0) @binding(3) var<storage, read> perm: array<u32>;
+
+const DIFF_SCALE: i32 = 2048;
+
+@compute @workgroup_size(16, 16)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let w_i = i32(u.width);
+    let h_i = i32(u.height);
+    if (x >= w_i || y >= h_i) { return; }
+    let i = u32(y * w_i + x);
+    let me_perm = i32(perm[i]);
+    let me_p = pressure_in[i];
+    if (me_perm == 0) {
+        pressure_out[i] = me_p;
+        return;
+    }
+    var new_p = me_p;
+    // LEFT — horizontal OOB acts as open atmosphere (P=0, perm=255).
+    if (x > 0) {
+        let ni = u32(y * w_i + (x - 1));
+        let n_p = pressure_in[ni];
+        let n_perm = i32(perm[ni]);
+        let mp = min(me_perm, n_perm);
+        if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
+    } else {
+        new_p += (-me_p) * min(me_perm, 255) / DIFF_SCALE;
+    }
+    // RIGHT
+    if (x < w_i - 1) {
+        let ni = u32(y * w_i + (x + 1));
+        let n_p = pressure_in[ni];
+        let n_perm = i32(perm[ni]);
+        let mp = min(me_perm, n_perm);
+        if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
+    } else {
+        new_p += (-me_p) * min(me_perm, 255) / DIFF_SCALE;
+    }
+    // UP — vertical OOB sealed (skip neighbor entirely).
+    if (y > 0) {
+        let ni = u32((y - 1) * w_i + x);
+        let n_p = pressure_in[ni];
+        let n_perm = i32(perm[ni]);
+        let mp = min(me_perm, n_perm);
+        if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
+    }
+    // DOWN
+    if (y < h_i - 1) {
+        let ni = u32((y + 1) * w_i + x);
+        let n_p = pressure_in[ni];
+        let n_perm = i32(perm[ni]);
+        let mp = min(me_perm, n_perm);
+        if (mp > 0) { new_p += (n_p - me_p) * mp / DIFF_SCALE; }
+    }
+    pressure_out[i] = new_p;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ComputeUniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// GPU compute pipeline + storage buffers for pressure diffusion. Replaces
+/// the CPU `World::pressure()` pass — same numerics (4-neighbor flux at
+/// DIFF_SCALE=2048, ITERS=3 by default), runs on the GPU as a compute
+/// shader on storage buffers. Sync readback into `cell.pressure` at the
+/// end so downstream CPU passes see the diffused field.
+struct PressureComputeCtx {
+    pipeline: wgpu::ComputePipeline,
+    uniform_buf: wgpu::Buffer,
+    pressure_a: wgpu::Buffer,
+    pressure_b: wgpu::Buffer,
+    perm_buf: wgpu::Buffer,
+    readback_buf: wgpu::Buffer,
+    bind_a_to_b: wgpu::BindGroup,
+    bind_b_to_a: wgpu::BindGroup,
+    pressure_staging: Vec<i32>,
+    perm_staging: Vec<u32>,
+    iters: u32,
+}
+
+impl PressureComputeCtx {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let cell_count = W * H;
+        let buf_bytes = (cell_count * 4) as wgpu::BufferAddress; // i32 / u32 = 4 bytes
+
+        let uniforms = ComputeUniforms {
+            width: W as u32,
+            height: H as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-pressure-compute-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        // Force initial uniform upload.
+        queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let make_storage = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: buf_bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let pressure_a = make_storage("alembic-pressure-a");
+        let pressure_b = make_storage("alembic-pressure-b");
+        let perm_buf = make_storage("alembic-perm");
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-pressure-readback"),
+            size: buf_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-pressure-compute-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bind_a_to_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pressure-bind-a-to-b"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pressure_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pressure_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: perm_buf.as_entire_binding() },
+            ],
+        });
+        let bind_b_to_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pressure-bind-b-to-a"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: pressure_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pressure_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: perm_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-pressure-compute-shader"),
+            source: wgpu::ShaderSource::Wgsl(PRESSURE_COMPUTE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-pressure-compute-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-pressure-compute-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        PressureComputeCtx {
+            pipeline,
+            uniform_buf,
+            pressure_a,
+            pressure_b,
+            perm_buf,
+            readback_buf,
+            bind_a_to_b,
+            bind_b_to_a,
+            pressure_staging: vec![0i32; cell_count],
+            perm_staging: vec![0u32; cell_count],
+            iters: 3,
+        }
+    }
+
+    fn dispatch(&mut self, world: &mut World, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let cell_count = W * H;
+        // Pack cell.pressure (i16) into i32 staging, perm (u8) into u32 staging.
+        for i in 0..cell_count {
+            self.pressure_staging[i] = world.cells[i].pressure as i32;
+            self.perm_staging[i] = world.cells[i].el.pressure_p().permeability as u32;
+        }
+        queue.write_buffer(&self.pressure_a, 0, bytemuck::cast_slice(&self.pressure_staging));
+        queue.write_buffer(&self.perm_buf, 0, bytemuck::cast_slice(&self.perm_staging));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("alembic-pressure-encoder"),
+        });
+        let wg_x = (W as u32 + 15) / 16;
+        let wg_y = (H as u32 + 15) / 16;
+        for iter in 0..self.iters {
+            let bind = if iter % 2 == 0 { &self.bind_a_to_b } else { &self.bind_b_to_a };
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-pressure-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, bind, &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+        // Final write target: even-iter writes B; odd writes A.
+        // ITERS=3 → iter 0,1,2 → writes B,A,B → final in B.
+        let final_buf = if self.iters % 2 == 1 { &self.pressure_b } else { &self.pressure_a };
+        encoder.copy_buffer_to_buffer(
+            final_buf, 0, &self.readback_buf, 0,
+            (cell_count * 4) as wgpu::BufferAddress,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Map for readback. wgpu::PollType::Wait blocks the CPU until
+        // the GPU finishes — sync, but without GL's per-call flush
+        // overhead. Compute + readback should be a few ms total.
+        let slice = self.readback_buf.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        let _ = device.poll(wgpu::Maintain::Wait);
+        let _ = receiver.recv();
+        {
+            let data = slice.get_mapped_range();
+            let result: &[i32] = bytemuck::cast_slice(&data);
+            for (i, &v) in result.iter().enumerate() {
+                world.cells[i].pressure = v as i16;
+            }
+        }
+        self.readback_buf.unmap();
+    }
+}
+
 /// Per-frame uniform data for the sim display shader. Carries the
 /// sim's rendered rectangle within the window (for proper letterbox
 /// + aspect preservation) plus cursor + brush info (in screen pixels
@@ -80,6 +369,10 @@ struct GpuState {
     /// Uniform buffer carrying cursor pos + brush radius to the
     /// fragment shader so it can render a brush outline overlay.
     display_uniform: wgpu::Buffer,
+    /// GPU compute pipeline for pressure diffusion. Replaces the CPU
+    /// `World::pressure()` pass; lets us scale the grid without paying
+    /// the linear CPU cost.
+    pressure_compute: PressureComputeCtx,
     /// Window must outlive the surface. Held as Arc so the surface's
     /// 'static lifetime contract is satisfied without unsafe.
     window: Arc<Window>,
@@ -367,6 +660,8 @@ impl GpuState {
 
         let image_buffer = vec![0u8; W * H * 4];
 
+        let pressure_compute = PressureComputeCtx::new(&device, &queue);
+
         let mut state = GpuState {
             surface,
             surface_config,
@@ -378,6 +673,7 @@ impl GpuState {
             sim_bind_group,
             sim_pipeline,
             display_uniform,
+            pressure_compute,
             window,
             selected: Element::Sand,
             brush_radius: 4,
@@ -551,9 +847,11 @@ impl GpuState {
         // so the new cells participate in this tick.
         self.apply_brush();
 
-        // Tick the CPU sim unless paused.
+        // Tick the sim. Everything except pressure runs on CPU; the
+        // pressure diffusion pass dispatches to the GPU compute shader.
         if !self.paused {
-            self.world.step(macroquad::math::Vec2::new(0.0, 0.0));
+            self.world.step_skip_pressure(macroquad::math::Vec2::new(0.0, 0.0));
+            self.pressure_compute.dispatch(&mut self.world, &self.device, &self.queue);
         }
 
         // Compute the sim rectangle in framebuffer pixels, preserving
@@ -784,9 +1082,28 @@ impl ApplicationHandler for App {
                         state.selected = el;
                         return;
                     }
+                    // Arrow keys / WASD pan the camera by ~12% of the
+                    // visible window each press. Sensitive to zoom —
+                    // smaller cells = bigger jumps, since you cover
+                    // more world per keypress at lower zoom.
+                    let pan_step_px = 0.12;
+                    let win_w = state.surface_config.width as f32;
+                    let win_h = state.surface_config.height as f32;
                     match code {
                         KeyCode::Space => state.paused = !state.paused,
                         KeyCode::Backspace => state.camera_reset(),
+                        KeyCode::ArrowLeft | KeyCode::KeyA => {
+                            state.pan_pixels(win_w * pan_step_px, 0.0);
+                        }
+                        KeyCode::ArrowRight | KeyCode::KeyD => {
+                            state.pan_pixels(-win_w * pan_step_px, 0.0);
+                        }
+                        KeyCode::ArrowUp | KeyCode::KeyW => {
+                            state.pan_pixels(0.0, win_h * pan_step_px);
+                        }
+                        KeyCode::ArrowDown | KeyCode::KeyS => {
+                            state.pan_pixels(0.0, -win_h * pan_step_px);
+                        }
                         KeyCode::KeyC => {
                             for c in state.world.cells.iter_mut() {
                                 if !c.is_frozen() {

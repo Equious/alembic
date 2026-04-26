@@ -3776,6 +3776,18 @@ impl World {
     }
 
     pub fn step(&mut self, wind: Vec2) {
+        self.step_inner(wind, true);
+    }
+
+    /// Step everything except the pressure diffusion pass. The wgpu
+    /// binary calls this and dispatches pressure on the GPU instead.
+    /// `pressure_sources` (CPU-cheap, sets up hydrostatic targets)
+    /// still runs — the GPU starts from those values.
+    pub fn step_skip_pressure(&mut self, wind: Vec2) {
+        self.step_inner(wind, false);
+    }
+
+    fn step_inner(&mut self, wind: Vec2, run_pressure: bool) {
         self.frame = self.frame.wrapping_add(1);
         let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
         let mut tt = std::time::Instant::now();
@@ -3821,7 +3833,9 @@ impl World {
         }
         mark!("update_cells");
         self.pressure_sources();     mark!("pressure_src");
-        self.pressure();             mark!("pressure");
+        if run_pressure {
+            self.pressure();         mark!("pressure");
+        }
         self.tick_shockwaves();      mark!("shockwaves");
         self.snapshot();             mark!("snapshot");
         let _ = tt;
