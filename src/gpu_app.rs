@@ -1931,8 +1931,29 @@ impl GpuState {
     }
 
     fn render(&mut self) {
-        // Apply paint/erase from any held mouse button before stepping
-        // so the new cells participate in this tick.
+        // GPU readbacks must happen BEFORE apply_brush + CPU step,
+        // because motion's readback fully overwrites world.cells with
+        // the prior frame's GPU motion result. If we paint first and
+        // step first, those mutations get wiped by the readback.
+        //
+        // Order:
+        //   1. poll → drain prior frame's GPU work (so map_async is ready)
+        //   2. read motion result → world.cells (full overwrite)
+        //   3. read pressure/temp deltas (only those fields)
+        //   4. apply_brush (paint into freshly post-motion cells)
+        //   5. CPU sim step (chemistry on post-paint cells)
+        //   6. stage → GPU, encode, submit, queue map for next frame
+        let t_compute_start = std::time::Instant::now();
+        if !self.paused {
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+            self.motion_compute.read_back_prev_into(&mut self.world);
+            self.pressure_compute.read_back_prev_into(&mut self.world);
+            self.thermal_compute.read_back_prev_into(&mut self.world);
+        }
+        let t_compute_readback = t_compute_start.elapsed();
+
+        // Apply paint/erase from any held mouse button. Operates on
+        // the just-read-back world.cells so the paint sticks.
         self.apply_brush();
 
         // Per-frame timing
@@ -1941,16 +1962,9 @@ impl GpuState {
             self.world.step_skip_gpu_passes_and_motion(macroquad::math::Vec2::new(0.0, 0.0));
         }
         let t_sim = t_sim_start.elapsed();
-        let t_compute_start = std::time::Instant::now();
+        let t_compute_dispatch_start = std::time::Instant::now();
         if !self.paused {
-            let _ = self.device.poll(wgpu::Maintain::Wait);
             let run_ps = self.frame_counter & 1 == 0;
-            // Read back PRIOR frame's results before staging this
-            // frame's inputs.
-            self.pressure_compute.read_back_prev_into(&mut self.world);
-            self.thermal_compute.read_back_prev_into(&mut self.world);
-            self.motion_compute.read_back_prev_into(&mut self.world);
-
             // Stage CPU → GPU.
             if run_ps {
                 self.pressure_sources_compute.stage_and_upload(&self.world, &self.queue);
@@ -1986,7 +2000,7 @@ impl GpuState {
             self.motion_compute.advance_frame();
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
-        let t_compute = t_compute_start.elapsed();
+        let t_compute = t_compute_readback + t_compute_dispatch_start.elapsed();
         let t_render_start = std::time::Instant::now();
 
         // Compute the sim rectangle in framebuffer pixels, preserving
