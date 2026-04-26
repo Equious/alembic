@@ -1381,6 +1381,178 @@ impl MotionComputeCtx {
     }
 }
 
+const COLOR_FIRES_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element flame-color flag: 1 if `flame_color()` returns Some.
+@group(0) @binding(2) var<uniform> has_flame: array<vec4<u32>, 24>;
+
+const EL_FIRE: u32 = 5u;
+const EL_WATER: u32 = 2u;
+
+fn cf_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cf_solute_el(c: vec4<u32>) -> u32 { return c.w & 0xFFu; }
+fn cf_has_flame(el_id: u32) -> bool {
+    return has_flame[el_id / 4u][el_id % 4u] != 0u;
+}
+
+// Each cell scans its 8 neighbors. If `me` is a Fire cell with no
+// solute_el yet, and any neighbor is a flame-coloring element (or
+// water carrying a flame-coloring solute), set me.solute_el = that
+// element. Per-cell write only — we only mutate cells[i].w. Race-free.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let w_i = i32(u.width);
+    let h_i = i32(u.height);
+    if (x >= w_i || y >= h_i) { return; }
+    let i = u32(y * w_i + x);
+    let c = cells[i];
+    if (cf_el(c) != EL_FIRE) { return; }
+    if (cf_solute_el(c) != 0u) { return; }
+
+    var picked: u32 = 0u;
+    let offs = array<vec2<i32>, 8>(
+        vec2<i32>( 1,  0), vec2<i32>(-1,  0),
+        vec2<i32>( 0,  1), vec2<i32>( 0, -1),
+        vec2<i32>( 1,  1), vec2<i32>( 1, -1),
+        vec2<i32>(-1,  1), vec2<i32>(-1, -1),
+    );
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let nx = x + offs[k].x;
+        let ny = y + offs[k].y;
+        if (nx < 0 || nx >= w_i || ny < 0 || ny >= h_i) { continue; }
+        let n = cells[u32(ny * w_i + nx)];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; break; }
+        if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; break; }
+        }
+    }
+    if (picked != 0u) {
+        // Write picked into cells[i].w bits 0-7 (solute_el),
+        // preserving solute_amt + solute_derived_id + pad.
+        let hi = cells[i].w & 0xFFFFFF00u;
+        cells[i].w = hi | (picked & 0xFFu);
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ColorFiresUniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// GPU port of `World::color_fires`. Fire cells with no `solute_el`
+/// pick up the element id of any flame-coloring neighbor. Per-cell
+/// writes only, so no race control needed.
+struct ColorFiresCtx {
+    pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    uniform_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    flame_lut_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl ColorFiresCtx {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let _ = queue;
+        let uniforms = ColorFiresUniforms {
+            width: W as u32,
+            height: H as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-colorfires-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let mut lut: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let p = crate::flame_color_flag_props(el_id as u8);
+            lut[(el_id / 4) as usize][(el_id % 4) as usize] = p[0];
+        }
+        let flame_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-colorfires-flame-lut"),
+            contents: bytemuck::cast_slice(&lut),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-colorfires-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-colorfires-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: flame_lut_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-colorfires-shader"),
+            source: wgpu::ShaderSource::Wgsl(COLOR_FIRES_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-colorfires-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-colorfires-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        ColorFiresCtx { pipeline, uniform_buf, flame_lut_buf, bind_group }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-colorfires-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 const RENDER_COMPUTE_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -1707,6 +1879,9 @@ struct GpuState {
     /// GPU compute pipeline that fills `sim_texture` from `cells_buf`.
     /// Replaces the per-frame CPU pixel fill + texture upload.
     render_compute: RenderComputeCtx,
+    /// GPU port of `World::color_fires` — Fire cells inherit a flame
+    /// color from neighboring metals/salts.
+    color_fires_compute: ColorFiresCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -2032,6 +2207,7 @@ impl GpuState {
         let pressure_sources_compute = PressureSourcesCtx::new(&device, &queue, &cells_buf);
         let motion_compute = MotionComputeCtx::new(&device, &queue, &cells_buf);
         let render_compute = RenderComputeCtx::new(&device, &queue, &cells_buf, &sim_view);
+        let color_fires_compute = ColorFiresCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -2049,6 +2225,7 @@ impl GpuState {
             pressure_sources_compute,
             motion_compute,
             render_compute,
+            color_fires_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -2249,7 +2426,11 @@ impl GpuState {
 
         let t_sim_start = std::time::Instant::now();
         if !self.paused {
-            self.world.step_skip_gpu_passes_and_motion(macroquad::math::Vec2::new(0.0, 0.0));
+            // GPU runs: pressure_sources, pressure, thermal_diffuse,
+            // motion, AND color_fires. CPU still runs the rest of
+            // chemistry against world.cells.
+            let gpu_chem = crate::GpuChem { color_fires: true };
+            self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
         let t_sim = t_sim_start.elapsed();
 
@@ -2281,7 +2462,11 @@ impl GpuState {
             self.pressure_compute.encode(&mut encoder);
             // Thermal: extract → 1 diffuse iter → writeback.
             self.thermal_compute.encode(&mut encoder);
-            // Motion: 4 passes (vfall, lspread, dslide-even, dslide-odd).
+            // Color fires — Fire cells inherit flame color from neighbors.
+            // Cheap (per-cell write only, no race control). Runs before
+            // motion so newly colored fires move correctly this frame.
+            self.color_fires_compute.encode(&mut encoder);
+            // Motion: 5 passes (vfall, lspread-even/odd, dslide-even/odd).
             self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter, &self.cells_buf);
             self.queue.submit(std::iter::once(encoder.finish()));
             self.motion_compute.start_map();
