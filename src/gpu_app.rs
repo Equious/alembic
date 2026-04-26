@@ -15,6 +15,8 @@
 //! for cell colors, then a compute pipeline for the sim itself.
 
 use std::sync::Arc;
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -22,6 +24,23 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::{color_rgb, Element, World, H, W};
+
+/// Per-frame uniform data for the sim display shader. Carries cursor
+/// + brush-size info so the fragment shader can draw a brush outline
+/// without an extra pipeline pass. Fields are 4-byte aligned and the
+/// total size is 16 bytes (one std140 vec4 worth) — wgpu requires
+/// uniform buffers to be at least 16 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+struct CursorUniform {
+    /// Cursor position in cell coordinates. Negative when not visible.
+    cursor_x: f32,
+    cursor_y: f32,
+    /// Brush radius in cells (matches `World::paint`).
+    brush_radius: f32,
+    /// Visibility flag: 1.0 when cursor is over the sim, 0.0 otherwise.
+    visible: f32,
+}
 
 const WINDOW_TITLE: &str = "Alembic (wgpu)";
 const WINDOW_W: u32 = 1280;
@@ -52,6 +71,9 @@ struct GpuState {
     sim_texture: wgpu::Texture,
     sim_bind_group: wgpu::BindGroup,
     sim_pipeline: wgpu::RenderPipeline,
+    /// Uniform buffer carrying cursor pos + brush radius to the
+    /// fragment shader so it can render a brush outline overlay.
+    cursor_uniform: wgpu::Buffer,
     /// Window must outlive the surface. Held as Arc so the surface's
     /// 'static lifetime contract is satisfied without unsafe.
     window: Arc<Window>,
@@ -210,6 +232,14 @@ impl GpuState {
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
+        let cursor_uniform_init = CursorUniform {
+            cursor_x: -1.0, cursor_y: -1.0, brush_radius: 4.0, visible: 0.0,
+        };
+        let cursor_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-cursor-uniform"),
+            contents: bytemuck::cast_slice(&[cursor_uniform_init]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let sim_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-sim-bgl"),
             entries: &[
@@ -229,6 +259,16 @@ impl GpuState {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let sim_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -237,6 +277,7 @@ impl GpuState {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&sim_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: cursor_uniform.as_entire_binding() },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -306,6 +347,7 @@ impl GpuState {
             sim_texture,
             sim_bind_group,
             sim_pipeline,
+            cursor_uniform,
             window,
             selected: Element::Sand,
             brush_radius: 4,
@@ -376,6 +418,33 @@ impl GpuState {
         if !self.paused {
             self.world.step(macroquad::math::Vec2::new(0.0, 0.0));
         }
+
+        // Update cursor uniform so the fragment shader can draw the
+        // brush outline. Convert window-pixel cursor → cell space.
+        let cursor_data = match self.cursor_pos {
+            Some((px, py)) => {
+                let win_w = self.surface_config.width as f64;
+                let win_h = self.surface_config.height as f64;
+                let cx = (px / win_w * W as f64) as f32;
+                let cy = (py / win_h * H as f64) as f32;
+                CursorUniform {
+                    cursor_x: cx,
+                    cursor_y: cy,
+                    brush_radius: self.brush_radius as f32,
+                    visible: 1.0,
+                }
+            }
+            None => CursorUniform {
+                cursor_x: -1.0, cursor_y: -1.0,
+                brush_radius: self.brush_radius as f32,
+                visible: 0.0,
+            },
+        };
+        self.queue.write_buffer(
+            &self.cursor_uniform,
+            0,
+            bytemuck::cast_slice(&[cursor_data]),
+        );
 
         // Fill the CPU pixel buffer from cell colors. Same path as the
         // legacy macroquad render loop, just writing to our local Vec
@@ -556,10 +625,8 @@ impl ApplicationHandler for App {
 }
 
 /// Sim display shader — fullscreen triangle samples the W×H sim
-/// texture. UVs map to [0,1]² with origin at the top-left to match
-/// our cell indexing (`cells[y * W + x]`). Out-of-range pixels go
-/// to a panel-grey background so the sim stays in its proper
-/// aspect ratio when the window is wider/taller than W:H.
+/// texture. Also draws a brush-radius outline at the cursor so the
+/// player can see what they're about to paint.
 const SIM_DISPLAY_SHADER: &str = r#"
 const SIM_W: f32 = 320.0;
 const SIM_H: f32 = 315.0;
@@ -569,15 +636,20 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
 };
 
+struct Cursor {
+    cursor_x: f32,
+    cursor_y: f32,
+    brush_radius: f32,
+    visible: f32,
+};
+
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    // Standard fullscreen triangle trick.
     var pos = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>( 3.0, -1.0),
         vec2<f32>(-1.0,  3.0),
     );
-    // UVs with origin top-left (y inverted vs clip space).
     var uv = array<vec2<f32>, 3>(
         vec2<f32>(0.0, 1.0),
         vec2<f32>(2.0, 1.0),
@@ -591,12 +663,29 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @group(0) @binding(0) var sim_tex: texture_2d<f32>;
 @group(0) @binding(1) var sim_samp: sampler;
+@group(0) @binding(2) var<uniform> cursor: Cursor;
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // For now: stretch the sim across the whole window. Letterbox
-    // logic comes later when we wire up the side panel.
-    return textureSample(sim_tex, sim_samp, in.uv);
+    let base = textureSample(sim_tex, sim_samp, in.uv);
+    if (cursor.visible < 0.5) {
+        return base;
+    }
+    // Convert this fragment's UV into cell coordinates so we can
+    // measure distance to the cursor in cell-space (matches the
+    // brush_radius units passed in from World::paint).
+    let cell_pos = vec2<f32>(in.uv.x * SIM_W, in.uv.y * SIM_H);
+    let dist = distance(cell_pos, vec2<f32>(cursor.cursor_x, cursor.cursor_y));
+    // Thin outline ~0.7 cells wide at the brush_radius circle. The
+    // antialiasing comes for free from fragment-vs-cell granularity
+    // (window is much larger than the cell grid → many fragments
+    // per cell → smooth ring).
+    let on_ring = abs(dist - cursor.brush_radius) < 0.7;
+    if (on_ring) {
+        // Bright outline that's visible against any base color.
+        return mix(base, vec4<f32>(1.0, 1.0, 1.0, 1.0), 0.65);
+    }
+    return base;
 }
 "#;
 
