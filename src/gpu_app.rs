@@ -23,10 +23,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::{color_rgb, motion_props, pack_cell, pressure_source_props, thermal_profile_vec4, unpack_cell, CellGpu, Element, World, H, W};
-// silence unused warnings for items consumed via crate:: paths inside
-// the motion ctx (pack_cell, unpack_cell, motion_props, CellGpu).
-const _USE: (fn(crate::Cell) -> CellGpu, fn(CellGpu) -> crate::Cell, fn(u8) -> [f32; 4]) = (pack_cell, unpack_cell, motion_props);
+use crate::{color_rgb, motion_props, pressure_source_props, thermal_profile_vec4, Element, World, H, W};
+// Reference motion_props from a const so the `crate::motion_props`
+// path inside the motion ctx body doesn't trip the unused-import
+// lint when the only use is via the inner `crate::` path.
+#[allow(dead_code)]
+const _USE_MOTION_PROPS: fn(u8) -> [f32; 4] = motion_props;
 
 const THERMAL_COMPUTE_SHADER: &str = r#"
 struct Uniforms {
@@ -1026,8 +1028,13 @@ const KIND_FIRE: u32   = 6u;
 const FLAG_FROZEN: u32 = 0x02u;
 
 fn cell_idx(x: u32, y: u32) -> u32 { return y * u.width + x; }
+// Cell layout (16 bytes, repr(C)):
+//   x.byte0 = el, x.byte1 = derived_id, x.bytes2-3 = life
+//   y.byte0 = seed, y.byte1 = flag, y.bytes2-3 = temp
+//   z.byte0 = moisture, z.byte1 = burn, z.bytes2-3 = pressure
+//   w.byte0 = solute_el, w.byte1 = solute_amt, w.byte2 = solute_derived_id
 fn cell_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
-fn cell_flag(c: vec4<u32>) -> u32 { return (c.x >> 24u) & 0xFFu; }
+fn cell_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
 fn cell_kind(c: vec4<u32>) -> u32 { return u32(motion_props[cell_el(c)].x); }
 fn cell_density(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].y; }
 fn cell_frozen(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_FROZEN) != 0u; }
@@ -1148,7 +1155,6 @@ struct MotionComputeCtx {
     cells_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
     pass_bind_groups: [wgpu::BindGroup; 2],
-    cells_staging: Vec<crate::CellGpu>,
     write_idx: usize,
     has_data: [bool; 2],
 }
@@ -1156,7 +1162,7 @@ struct MotionComputeCtx {
 impl MotionComputeCtx {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let cell_count = W * H;
-        let cell_bytes = (cell_count * std::mem::size_of::<crate::CellGpu>()) as wgpu::BufferAddress;
+        let cell_bytes = (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
 
         // Per-element motion props: kind_id, density, falling, is_liquid.
         let mut props_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
@@ -1250,6 +1256,7 @@ impl MotionComputeCtx {
             compilation_options: Default::default(),
             cache: None,
         });
+        let _ = cell_count;
         MotionComputeCtx {
             pipeline,
             pass_uniform_bufs,
@@ -1257,18 +1264,16 @@ impl MotionComputeCtx {
             cells_buf,
             readback_bufs,
             pass_bind_groups,
-            cells_staging: vec![crate::CellGpu::default(); cell_count],
             write_idx: 0,
             has_data: [false; 2],
         }
     }
 
     fn stage_and_upload(&mut self, world: &World, queue: &wgpu::Queue) {
-        let cell_count = W * H;
-        for i in 0..cell_count {
-            self.cells_staging[i] = crate::pack_cell(world.cells[i]);
-        }
-        queue.write_buffer(&self.cells_buf, 0, bytemuck::cast_slice(&self.cells_staging));
+        // Zero-copy: world.cells is repr(C), 16 bytes/cell, GPU layout
+        // matches directly. queue.write_buffer hands the bytes off to
+        // wgpu's upload path without us touching individual cells.
+        queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&world.cells));
     }
 
     /// Encode the 2 motion passes for one frame.
@@ -1303,7 +1308,7 @@ impl MotionComputeCtx {
         }
         encoder.copy_buffer_to_buffer(
             &self.cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
-            (cell_count * std::mem::size_of::<crate::CellGpu>()) as wgpu::BufferAddress,
+            (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress,
         );
     }
 
@@ -1320,10 +1325,8 @@ impl MotionComputeCtx {
         let slice = self.readback_bufs[read_idx].slice(..);
         {
             let data = slice.get_mapped_range();
-            let result: &[crate::CellGpu] = bytemuck::cast_slice(&data);
-            for (i, &g) in result.iter().enumerate() {
-                world.cells[i] = crate::unpack_cell(g);
-            }
+            // Zero-copy: GPU buffer is exactly Cell-shaped bytes.
+            crate::cells_copy_from_bytes(&mut world.cells, &data);
         }
         self.readback_bufs[read_idx].unmap();
         self.has_data[read_idx] = false;
@@ -1899,18 +1902,9 @@ impl GpuState {
     }
 
     fn render(&mut self) {
-        // GPU readbacks must happen BEFORE apply_brush + CPU step,
-        // because motion's readback fully overwrites world.cells with
-        // the prior frame's GPU motion result. If we paint first and
-        // step first, those mutations get wiped by the readback.
-        //
-        // Order:
-        //   1. poll → drain prior frame's GPU work (so map_async is ready)
-        //   2. read motion result → world.cells (full overwrite)
-        //   3. read pressure/temp deltas (only those fields)
-        //   4. apply_brush (paint into freshly post-motion cells)
-        //   5. CPU sim step (chemistry on post-paint cells)
-        //   6. stage → GPU, encode, submit, queue map for next frame
+        // Read prior frame's GPU motion result FIRST so paint and
+        // CPU step land on top of post-motion cells (and aren't
+        // wiped by a stale readback).
         let t_compute_start = std::time::Instant::now();
         if !self.paused {
             let _ = self.device.poll(wgpu::Maintain::Wait);
@@ -1920,10 +1914,7 @@ impl GpuState {
         }
         let t_compute_readback = t_compute_start.elapsed();
 
-        // Pending C-key clear runs AFTER the readback so it isn't
-        // wiped by motion's full-cells overwrite. apply_brush and
-        // step then operate on the cleared state and the next stage
-        // upload pushes the clear into the GPU buffer.
+        // Pending C-key clear runs AFTER readback so it sticks.
         if self.pending_clear {
             for c in self.world.cells.iter_mut() {
                 if !c.is_frozen() {
@@ -1932,21 +1923,18 @@ impl GpuState {
             }
             self.pending_clear = false;
         }
-
-        // Apply paint/erase from any held mouse button. Operates on
-        // the just-read-back world.cells so the paint sticks.
         self.apply_brush();
 
-        // Per-frame timing
         let t_sim_start = std::time::Instant::now();
         if !self.paused {
             self.world.step_skip_gpu_passes_and_motion(macroquad::math::Vec2::new(0.0, 0.0));
         }
         let t_sim = t_sim_start.elapsed();
-        let t_compute_dispatch_start = std::time::Instant::now();
+
+        let t_dispatch_start = std::time::Instant::now();
         if !self.paused {
             let run_ps = self.frame_counter & 1 == 0;
-            // Stage CPU → GPU.
+
             if run_ps {
                 self.pressure_sources_compute.stage_and_upload(&self.world, &self.queue);
                 self.pressure_compute.stage_perm_only(&self.world, &self.queue);
@@ -1955,6 +1943,7 @@ impl GpuState {
             }
             let amb = self.world.ambient_offset;
             self.thermal_compute.stage_and_upload(&self.world, &self.queue, self.frame_counter, amb);
+            // Zero-copy cells upload — straight memcpy, no per-cell loop.
             self.motion_compute.stage_and_upload(&self.world, &self.queue);
 
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1981,7 +1970,7 @@ impl GpuState {
             self.motion_compute.advance_frame();
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
-        let t_compute = t_compute_readback + t_compute_dispatch_start.elapsed();
+        let t_compute = t_compute_readback + t_dispatch_start.elapsed();
         let t_render_start = std::time::Instant::now();
 
         // Compute the sim rectangle in framebuffer pixels, preserving

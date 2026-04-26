@@ -309,76 +309,55 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     a
 };
 
-/// 16-byte packed `Cell` for GPU storage buffers. Ordered as four
-/// `u32`s so it works in WGSL `array<vec4<u32>>`. Pack layout:
-///   pack0: el(8) | derived_id(8) | seed(8) | flag(8)
-///   pack1: u16 reinterpret-cast of (temp_i16, pressure_i16) — bit-cast.
-///         Stored as: low 16 = (temp as u16), high 16 = (pressure as u16).
-///   pack2: life(16) | moisture(8) | burn(8)
-///   pack3: solute_el(8) | solute_amt(8) | solute_derived_id(8) | _reserved(8)
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct CellGpu {
-    pub pack0: u32,
-    pub pack1: u32,
-    pub pack2: u32,
-    pub pack3: u32,
+/// `Cell` is `#[repr(C)]` with field byte layout:
+///   0: el (u8)         8: moisture (u8)
+///   1: derived_id (u8) 9: burn (u8)
+///   2-3: life (u16)    10-11: pressure (i16)
+///   4: seed (u8)       12: solute_el (u8)
+///   5: flag (u8)       13: solute_amt (u8)
+///   6-7: temp (i16)    14: solute_derived_id (u8)
+///                      15: trailing padding
+/// Total: 16 bytes, perfectly matching WGSL `array<vec4<u32>>`. GPU
+/// uploads and readbacks are now zero-copy memcpys via the helpers
+/// below — no per-cell pack/unpack loops, no field shuffling.
+const _: () = {
+    let want = 16usize;
+    let got  = std::mem::size_of::<Cell>();
+    if want != got {
+        // Compile-time check: panics with a clear message if Cell's
+        // size drifts from the WGSL contract.
+        panic!("Cell must be exactly 16 bytes for the GPU layout");
+    }
+};
+
+/// View `world.cells` as a raw byte slice for GPU upload. Zero-copy.
+/// The trailing padding byte is unspecified but stable in practice
+/// (heap zero-init on alloc, Cell field writes don't touch it). The
+/// motion shader never reads bytes past offset 14.
+#[inline]
+pub fn cells_as_bytes(cells: &[Cell]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            cells.as_ptr() as *const u8,
+            std::mem::size_of_val(cells),
+        )
+    }
 }
 
+/// Copy a GPU readback byte slice into `cells`. Zero per-cell work.
+/// SAFETY: `data` must come from a previous `cells_as_bytes`-shaped
+/// upload (i.e. exactly `cells.len() * 16` bytes, with bytes 0-14 of
+/// each 16-byte cell holding valid Cell fields). The motion shader
+/// only swaps whole 16-byte cells, so this invariant is preserved.
 #[inline]
-pub fn pack_cell(c: Cell) -> CellGpu {
-    let pack0 = (c.el as u32)
-        | ((c.derived_id as u32) << 8)
-        | ((c.seed as u32) << 16)
-        | ((c.flag as u32) << 24);
-    let pack1 = (c.temp as u16 as u32) | ((c.pressure as u16 as u32) << 16);
-    let pack2 = (c.life as u32) | ((c.moisture as u32) << 16) | ((c.burn as u32) << 24);
-    let pack3 = (c.solute_el as u32)
-        | ((c.solute_amt as u32) << 8)
-        | ((c.solute_derived_id as u32) << 16);
-    CellGpu { pack0, pack1, pack2, pack3 }
-}
-
-/// Convert a `u8` back to `Element`. Element is `repr(u8)` with
-/// variants in the dense range `0..ELEMENT_COUNT`. We transmute the
-/// byte directly. SAFETY: caller must ensure `id < ELEMENT_COUNT` —
-/// values outside the variant set are UB. Callers in this module
-/// (the GPU readback and pack/unpack helpers) only ever receive
-/// `id`s that came from a `Cell`'s prior `el as u8`, so they round-
-/// trip safely.
-#[inline]
-pub fn element_from_u8(id: u8) -> Element {
-    debug_assert!((id as usize) < ELEMENT_COUNT);
-    unsafe { std::mem::transmute(id) }
-}
-
-#[inline]
-pub fn unpack_cell(g: CellGpu) -> Cell {
-    let el_id = (g.pack0 & 0xFF) as u8;
-    let derived_id = ((g.pack0 >> 8) & 0xFF) as u8;
-    let seed = ((g.pack0 >> 16) & 0xFF) as u8;
-    let flag = ((g.pack0 >> 24) & 0xFF) as u8;
-    let temp = (g.pack1 & 0xFFFF) as u16 as i16;
-    let pressure = ((g.pack1 >> 16) & 0xFFFF) as u16 as i16;
-    let life = (g.pack2 & 0xFFFF) as u16;
-    let moisture = ((g.pack2 >> 16) & 0xFF) as u8;
-    let burn = ((g.pack2 >> 24) & 0xFF) as u8;
-    let solute_el = (g.pack3 & 0xFF) as u8;
-    let solute_amt = ((g.pack3 >> 8) & 0xFF) as u8;
-    let solute_derived_id = ((g.pack3 >> 16) & 0xFF) as u8;
-    Cell {
-        el: element_from_u8(el_id),
-        derived_id,
-        life,
-        seed,
-        flag,
-        temp,
-        moisture,
-        burn,
-        pressure,
-        solute_el: element_from_u8(solute_el),
-        solute_amt,
-        solute_derived_id,
+pub fn cells_copy_from_bytes(cells: &mut [Cell], data: &[u8]) {
+    debug_assert_eq!(data.len(), cells.len() * std::mem::size_of::<Cell>());
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            cells.as_mut_ptr() as *mut u8,
+            data.len(),
+        );
     }
 }
 
@@ -2503,6 +2482,7 @@ impl Element {
 
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub el: Element,
