@@ -361,16 +361,6 @@ pub fn cells_copy_from_bytes(cells: &mut [Cell], data: &[u8]) {
     }
 }
 
-/// Per-element flag: 1 if this element has a flame-test color
-/// (Cu, Na, K, Ca, Mg, B, Salt — see `flame_color`), 0 otherwise.
-/// Returned as a vec4<u32> for the standard packed-LUT layout.
-pub fn flame_color_flag_props(id: u8) -> [u32; 4] {
-    let i = id as usize;
-    if i >= ELEMENT_COUNT { return [0; 4]; }
-    let el: Element = unsafe { std::mem::transmute(id) };
-    [if flame_color(el).is_some() { 1 } else { 0 }, 0, 0, 0]
-}
-
 /// Base color for an element id, packed as `[r, g, b, alpha=255]`
 /// (u8 each), suitable for a per-element WGSL color LUT. Mirrors
 /// `Element::base_color` exactly. Returns `[0,0,0,255]` for ids
@@ -3941,17 +3931,6 @@ impl World {
     pub fn step(&mut self, wind: Vec2) {
         self.step_inner(wind, true, true);
     }
-}
-
-/// Bitmask of chemistry passes that are running on GPU compute and
-/// should therefore be skipped on CPU. As more passes get ported,
-/// add fields here. `Default` = nothing on GPU (CPU runs everything).
-#[derive(Clone, Copy, Default)]
-pub struct GpuChem {
-    pub color_fires: bool,
-}
-
-impl World {
 
     /// Step everything except the pressure diffusion pass. The wgpu
     /// binary calls this and dispatches pressure on the GPU instead.
@@ -3977,18 +3956,11 @@ impl World {
     /// Skip pressure_sources, pressure, thermal_diffuse, AND motion
     /// (`update_cell` sweep) — used when motion runs on GPU compute.
     pub fn step_skip_gpu_passes_and_motion(&mut self, wind: Vec2) {
-        self.step_inner_full3(wind, false, false, false, false, GpuChem::default());
-    }
-
-    /// Same as `step_skip_gpu_passes_and_motion` but also skips the
-    /// chemistry passes flagged in `gpu_chem` (those are running on
-    /// GPU compute too).
-    pub fn step_skip_gpu_v2(&mut self, wind: Vec2, gpu_chem: GpuChem) {
-        self.step_inner_full3(wind, false, false, false, false, gpu_chem);
+        self.step_inner_full2(wind, false, false, false, false);
     }
 
     fn step_inner(&mut self, wind: Vec2, run_pressure: bool, run_thermal_diffuse: bool) {
-        self.step_inner_full3(wind, run_pressure, run_thermal_diffuse, true, true, GpuChem::default());
+        self.step_inner_full2(wind, run_pressure, run_thermal_diffuse, true, true);
     }
 
     fn step_inner_full(
@@ -3998,7 +3970,7 @@ impl World {
         run_thermal_diffuse: bool,
         run_pressure_sources: bool,
     ) {
-        self.step_inner_full3(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, true, GpuChem::default());
+        self.step_inner_full2(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, true);
     }
 
     fn step_inner_full2(
@@ -4008,18 +3980,6 @@ impl World {
         run_thermal_diffuse: bool,
         run_pressure_sources: bool,
         run_motion: bool,
-    ) {
-        self.step_inner_full3(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, run_motion, GpuChem::default());
-    }
-
-    fn step_inner_full3(
-        &mut self,
-        wind: Vec2,
-        run_pressure: bool,
-        run_thermal_diffuse: bool,
-        run_pressure_sources: bool,
-        run_motion: bool,
-        gpu_chem: GpuChem,
     ) {
         self.frame = self.frame.wrapping_add(1);
         let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
@@ -4055,9 +4015,7 @@ impl World {
         self.halogen_displacement(); mark!("halogen_disp");
         self.hg_amalgamation();      mark!("hg_amalg");
         self.flame_test_emission();  mark!("flame_emit");
-        if !gpu_chem.color_fires {
-            self.color_fires();      mark!("color_fires");
-        }
+        self.color_fires();          mark!("color_fires");
         if run_thermal_diffuse {
             self.thermal();          mark!("thermal");
         } else {
