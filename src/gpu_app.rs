@@ -715,8 +715,8 @@ const KIND_GAS: u32    = 5u;
 const KIND_FIRE: u32   = 6u;
 
 // One thread per column. Walks vertically computing the column-
-// integrated hydrostatic pressure plus per-cell thermal target,
-// then blends current pressure → target with the asymmetric rule
+// integrated hydrostatic pressure plus per-cell thermal tgt,
+// then blends current pressure → tgt with the asymmetric rule
 // (gas/fire only blend up; everything else blends both ways).
 @compute @workgroup_size(64, 1, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -756,11 +756,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             && kind_id != KIND_FIRE);
         let is_frozen = (flag_in[i] & FLAG_FROZEN) != 0u;
 
-        // Pass 1: thermal target.
-        var target: i32 = 0;
+        // Pass 1: thermal tgt.
+        var tgt: i32 = 0;
         if (is_pressurizable) {
             let t = (temp_in[i] - 20) * 5;
-            target = clamp(t, -300, 4000);
+            tgt = clamp(t, -300, 4000);
         }
 
         // Pass 2: hydrostatic column integration.
@@ -770,13 +770,13 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 col_p = col_p + weight * u.gravity_mag;
                 let p_c = i32(clamp(col_p, -4000.0, 4000.0));
-                target = clamp(target + p_c, -4000, 4000);
+                tgt = clamp(tgt + p_c, -4000, 4000);
             }
         }
 
-        // Pass 3: asymmetric blend toward target.
+        // Pass 3: asymmetric blend toward tgt.
         let current = pressure_in[i];
-        let delta = target - current;
+        let delta = tgt - current;
         var new_p = current;
         if (delta > 0) {
             var stp = (delta * 5) / 100;
@@ -807,7 +807,7 @@ struct PressureSourcesUniforms {
     _pad2: u32,
 }
 
-/// GPU compute pipeline for the hydrostatic + thermal pressure target
+/// GPU compute pipeline for the hydrostatic + thermal pressure tgt
 /// pass (`World::pressure_sources`). Largest single CPU-bound pass at
 /// 1200×900 (~9-11ms); has no race conditions (column scan + per-cell
 /// blend), so it ports cleanly with one thread per column.
@@ -1061,7 +1061,7 @@ struct GpuState {
     /// GPU compute pipeline for thermal diffusion (heat exchange +
     /// ambient blend). Replaces `World::thermal_diffuse()`.
     thermal_compute: ThermalComputeCtx,
-    /// GPU compute pipeline for hydrostatic + thermal pressure target
+    /// GPU compute pipeline for hydrostatic + thermal pressure tgt
     /// (`World::pressure_sources`). Largest single CPU pass; column
     /// scan is GPU-friendly with one thread per column.
     pressure_sources_compute: PressureSourcesCtx,
