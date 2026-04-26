@@ -1035,47 +1035,47 @@ fn cell_frozen(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_FROZEN) != 0u
 //
 // Adjacent columns are independent — straight vertical fall doesn't
 // cross columns — so per-column threads have no race conditions.
+// FLAG_UPDATED bit lives at bit 0 of the flag byte (byte 1 of cell.y),
+// i.e. bit 8 of cell.y. clear_flags zeros it at the start of every
+// frame, so motion can use it as a "I already moved this frame" gate.
+fn cell_updated(c: vec4<u32>) -> bool { return (c.y & 0x100u) != 0u; }
+fn mark_updated(c: vec4<u32>) -> vec4<u32> {
+    return vec4<u32>(c.x, c.y | 0x100u, c.z, c.w);
+}
+
+// Single density-based vertical motion rule. Heavier-on-top swaps
+// with lighter-on-bottom — that's it. With proper signed densities
+// (gas=-1..-5, empty=0, water=10, sand=20, lava=30):
+//   * sand(20) on empty(0)  → swap (sand falls)
+//   * water(10) on empty(0) → swap (water falls)
+//   * empty(0) on steam(-3) → swap (steam rises by buoyancy)
+//   * steam(-3) on empty(0) → no swap (steam doesn't fall through air)
+//   * Cl(3) on empty(0)     → swap (heavy gas falls slowly)
+//   * fire(-5) on empty(0)  → no swap; empty(0) on fire(-5) → swap (fire rises)
+// FLAG_UPDATED keeps each cell to one move per frame, matching the
+// CPU sim's row-sweep semantics.
 fn vertical_fall(x: u32) {
-    // Run the column scan multiple times per frame. Each pass shifts
-    // a falling column by one row, so 4 iterations = up to 4 rows of
-    // fall per frame — closer to terminal velocity, less of "things
-    // hang in the air for ages." Cheap: 4 × 900 cell visits per
-    // thread on the GPU.
-    for (var iter = 0u; iter < 4u; iter = iter + 1u) {
-        var y = i32(u.height) - 2;
-        loop {
-            if (y < 0) { break; }
-            let i_here = cell_idx(x, u32(y));
-            let i_below = cell_idx(x, u32(y + 1));
-            let c_here = cells[i_here];
-            let c_below = cells[i_below];
+    var y = i32(u.height) - 2;
+    loop {
+        if (y < 0) { break; }
+        let i_here = cell_idx(x, u32(y));
+        let i_below = cell_idx(x, u32(y + 1));
+        let c_here = cells[i_here];
+        let c_below = cells[i_below];
 
-            if (!cell_frozen(c_here) && !cell_frozen(c_below)) {
-                let kh = cell_kind(c_here);
-                let kb = cell_kind(c_below);
-                let dh = cell_density(c_here);
-                let db = cell_density(c_below);
-
-                let h_falls = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
-                let b_open  = (kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
-                // Heavier-on-top falls into lighter-on-bottom.
-                if (h_falls && b_open && dh > db) {
-                    cells[i_here]  = c_below;
-                    cells[i_below] = c_here;
-                }
-                // Buoyancy: lighter-on-bottom rises into heavier-on-top.
-                // Empty/gas on top with denser gas/fire below swaps so
-                // gases bubble up. Without this rule, steam, smoke, and
-                // other gases just sit in mid-air.
-                else if ((kh == KIND_EMPTY || kh == KIND_GAS)
-                      && (kb == KIND_GAS || kb == KIND_FIRE)
-                      && kh != kb) {
-                    cells[i_here]  = c_below;
-                    cells[i_below] = c_here;
-                }
+        let kh = cell_kind(c_here);
+        let kb = cell_kind(c_below);
+        let h_movable = (kh != KIND_SOLID) && !cell_frozen(c_here) && !cell_updated(c_here);
+        let b_movable = (kb != KIND_SOLID) && !cell_frozen(c_below) && !cell_updated(c_below);
+        if (h_movable && b_movable) {
+            let dh = cell_density(c_here);
+            let db = cell_density(c_below);
+            if (dh > db) {
+                cells[i_here]  = mark_updated(c_below);
+                cells[i_below] = mark_updated(c_here);
             }
-            y = y - 1;
         }
+        y = y - 1;
     }
 }
 
@@ -1097,44 +1097,37 @@ fn diagonal_slide(x: u32, parity: u32) {
     let nx = i32(x) + dir;
     if (nx < 0 || nx >= i32(u.width)) { return; }
 
-    // 4 iterations to match vfall — diagonal slides also propagate
-    // multiple rows per frame for fast pile settling.
-    for (var iter = 0u; iter < 4u; iter = iter + 1u) {
-        var y = i32(u.height) - 2;
-        loop {
-            if (y < 0) { break; }
-            let i_here = cell_idx(x, u32(y));
-            let i_below = cell_idx(x, u32(y + 1));
-            let i_diag  = cell_idx(u32(nx), u32(y + 1));
-            let c_here  = cells[i_here];
-            let c_below = cells[i_below];
-            let c_diag  = cells[i_diag];
+    var y = i32(u.height) - 2;
+    loop {
+        if (y < 0) { break; }
+        let i_here = cell_idx(x, u32(y));
+        let i_below = cell_idx(x, u32(y + 1));
+        let i_diag  = cell_idx(u32(nx), u32(y + 1));
+        let c_here  = cells[i_here];
+        let c_below = cells[i_below];
+        let c_diag  = cells[i_diag];
 
-            if (!cell_frozen(c_here) && !cell_frozen(c_diag)) {
-                let kh = cell_kind(c_here);
-                let kb = cell_kind(c_below);
-                let kd = cell_kind(c_diag);
-                let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
-                let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
-                let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
-                // Only the TOP cell of a pile column may slide. If there's
-                // another sand-like cell above us, sliding here would leave
-                // a gap that vfall couldn't fill until next frame — visible
-                // as horizontal voids running through the pile. With this
-                // check, internal cells stay put while the surface slides.
-                var above_blocks = false;
-                if (y > 0) {
-                    let i_above = cell_idx(x, u32(y - 1));
-                    let ka = cell_kind(cells[i_above]);
-                    above_blocks = (ka == KIND_POWDER || ka == KIND_GRAVEL || ka == KIND_LIQUID);
-                }
-                if (h_slides && b_blocks && d_open && !above_blocks) {
-                    cells[i_here] = c_diag;
-                    cells[i_diag] = c_here;
-                }
+        if (!cell_frozen(c_here) && !cell_frozen(c_diag)
+            && !cell_updated(c_here) && !cell_updated(c_diag)) {
+            let kh = cell_kind(c_here);
+            let kb = cell_kind(c_below);
+            let kd = cell_kind(c_diag);
+            let h_slides = (kh == KIND_POWDER || kh == KIND_GRAVEL || kh == KIND_LIQUID);
+            let b_blocks = !(kb == KIND_EMPTY || kb == KIND_GAS || kb == KIND_FIRE);
+            let d_open   = (kd == KIND_EMPTY || kd == KIND_GAS || kd == KIND_FIRE);
+            // Only the TOP cell of a pile column may slide.
+            var above_blocks = false;
+            if (y > 0) {
+                let i_above = cell_idx(x, u32(y - 1));
+                let ka = cell_kind(cells[i_above]);
+                above_blocks = (ka == KIND_POWDER || ka == KIND_GRAVEL || ka == KIND_LIQUID);
             }
-            y = y - 1;
+            if (h_slides && b_blocks && d_open && !above_blocks) {
+                cells[i_here] = mark_updated(c_diag);
+                cells[i_diag] = mark_updated(c_here);
+            }
         }
+        y = y - 1;
     }
 }
 
@@ -1163,34 +1156,33 @@ fn liquid_spread(y: u32, parity: u32) {
         let i_b = cell_idx(u32(nx), y);
         let c_a = cells[i_a];
         let c_b = cells[i_b];
-        if (!cell_frozen(c_a) && !cell_frozen(c_b)) {
+        if (!cell_frozen(c_a) && !cell_frozen(c_b)
+            && !cell_updated(c_a) && !cell_updated(c_b)) {
             let ka = cell_kind(c_a);
             let kb = cell_kind(c_b);
-            // Only spread if cell BELOW is solid/liquid (i.e. liquid
-            // is sitting on something — otherwise vertical fall handles it).
-            // Cheap proxy: just check directly-below cell at this y+1.
             let i_below = cell_idx(u32(x), y + 1u);
             let c_below = cells[i_below];
             let kbel = cell_kind(c_below);
             let supported = (kbel != KIND_EMPTY && kbel != KIND_GAS && kbel != KIND_FIRE);
             if (supported && ka == KIND_LIQUID && (kb == KIND_EMPTY || kb == KIND_GAS)) {
-                cells[i_a] = c_b;
-                cells[i_b] = c_a;
+                cells[i_a] = mark_updated(c_b);
+                cells[i_b] = mark_updated(c_a);
             }
         }
         x = x + step;
     }
 }
 
-// Pass 5/6 — gas turbulence. Each gas/fire cell, with PRNG-driven
-// probability, swaps with the empty cell to its left or right. The
-// thread is per-COLUMN; we walk the column and for each gas cell
-// pick a direction from a hash of (cell_index, frame). Even-column
-// vs odd-column sub-passes keep writes to the target column race-
-// free (an even thread writes its own column AND the odd column
-// next door; in that sub-pass no odd-column thread is running).
+// Pass 5/6 — gas turbulence: every gas/fire cell, with PRNG-driven
+// probability, swaps with an empty horizontal neighbor (left or right
+// chosen by hash). Combined with vertical_fall's density-based rise
+// (when the gas is lighter than empty), the result is a turbulent
+// cloud that slowly drifts up or down based on the gas's signed
+// density — not a column shooting to the ceiling.
 //
-// Result: gas blobs disperse instead of sitting as solid masses.
+// Even-column vs odd-column sub-passes keep writes race-free: an
+// even-x thread writes its own column AND the odd column next door;
+// in that sub-pass no odd-x thread is running.
 fn hash_u32_motion(a: u32, b: u32) -> u32 {
     var h: u32 = a * 2654435761u;
     h ^= b * 1597334677u;
@@ -1202,7 +1194,7 @@ fn hash_u32_motion(a: u32, b: u32) -> u32 {
     return h;
 }
 
-fn gas_drift(x: u32, parity: u32) {
+fn gas_dynamics(x: u32, parity: u32) {
     if ((x & 1u) != parity) { return; }
     let h = i32(u.height);
     let w_i = i32(u.width);
@@ -1212,9 +1204,10 @@ fn gas_drift(x: u32, parity: u32) {
         let i_here = cell_idx(x, u32(y));
         let c_here = cells[i_here];
         let kh = cell_kind(c_here);
-        if ((kh == KIND_GAS || kh == KIND_FIRE) && !cell_frozen(c_here)) {
+        if ((kh == KIND_GAS || kh == KIND_FIRE)
+            && !cell_frozen(c_here) && !cell_updated(c_here)) {
             let r = hash_u32_motion(i_here, u.frame);
-            // ~50% chance to attempt a drift this frame.
+            // ~50% chance to attempt a lateral drift this frame.
             if ((r & 0x80u) != 0u) {
                 let dir: i32 = select(-1, 1, (r & 0x40u) != 0u);
                 let nx = i32(x) + dir;
@@ -1222,9 +1215,10 @@ fn gas_drift(x: u32, parity: u32) {
                     let i_n = cell_idx(u32(nx), u32(y));
                     let c_n = cells[i_n];
                     let kn = cell_kind(c_n);
-                    if (kn == KIND_EMPTY && !cell_frozen(c_n)) {
-                        cells[i_here] = c_n;
-                        cells[i_n] = c_here;
+                    if (kn == KIND_EMPTY
+                        && !cell_frozen(c_n) && !cell_updated(c_n)) {
+                        cells[i_here] = mark_updated(c_n);
+                        cells[i_n]    = mark_updated(c_here);
                     }
                 }
             }
@@ -1258,11 +1252,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (u.pass_id == 5u) {
         let x = gid.x;
         if (x >= u.width) { return; }
-        gas_drift(x, 0u);
+        gas_dynamics(x, 0u);
     } else if (u.pass_id == 6u) {
         let x = gid.x;
         if (x >= u.width) { return; }
-        gas_drift(x, 1u);
+        gas_dynamics(x, 1u);
     }
 }
 "#;
