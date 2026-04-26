@@ -1068,16 +1068,6 @@ fn can_enter(src_cell: vec4<u32>, tx: i32, ty: i32, dy: i32) -> bool {
 // automatic, so a column shifts down by one per frame without
 // fragmenting (which is what Margolus block updates produced).
 //
-// Adjacent columns are independent — straight vertical fall doesn't
-// cross columns — so per-column threads have no race conditions.
-// FLAG_UPDATED bit lives at bit 0 of the flag byte (byte 1 of cell.y),
-// i.e. bit 8 of cell.y. clear_flags zeros it at the start of every
-// frame, so motion can use it as a "I already moved this frame" gate.
-fn cell_updated(c: vec4<u32>) -> bool { return (c.y & 0x100u) != 0u; }
-fn mark_updated(c: vec4<u32>) -> vec4<u32> {
-    return vec4<u32>(c.x, c.y | 0x100u, c.z, c.w);
-}
-
 // Pass 0 — vertical fall. Faithful port of update_powder, update_gravel,
 // and update_liquid's straight-down step. Per-column thread, walks
 // bottom-up so cascading happens within one pass. Each cell's "can I
