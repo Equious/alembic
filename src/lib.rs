@@ -97,7 +97,7 @@ pub enum Element {
     // Melts near body temp, ignites in air, detonates in water.
     Cs = 54,
 }
-const ELEMENT_COUNT: usize = 55;
+pub const ELEMENT_COUNT: usize = 55;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind { Empty, Solid, Gravel, Powder, Liquid, Gas, Fire }
@@ -2466,6 +2466,10 @@ pub const HISTORY_CAPACITY: usize = 240;   // ~4 seconds of rewind at 60 fps
 pub struct World {
     pub cells: Vec<Cell>,
     pub temp_scratch: Vec<i16>,
+    /// Element-presence flags, refreshed once per frame by step_inner.
+    /// Lets chemistry passes that depend on a specific element early-
+    /// exit before iterating ~1M cells.
+    pub present_elements: [bool; ELEMENT_COUNT],
     pub pressure_scratch: Vec<i16>,
     pub pressure_perm_cache: Vec<u8>,
     pub pressure_field: Vec<i16>,
@@ -2529,6 +2533,7 @@ impl World {
         World {
             cells: vec![Cell::EMPTY; W * H],
             temp_scratch: vec![20; W * H],
+            present_elements: [false; ELEMENT_COUNT],
             pressure_scratch: vec![0; W * H],
             pressure_perm_cache: vec![0; W * H],
             pressure_field: vec![0; W * H],
@@ -3819,7 +3824,15 @@ impl World {
                 tt = std::time::Instant::now();
             }};
         }
-        for c in self.cells.iter_mut() { c.flag &= !Cell::FLAG_UPDATED; }
+        // Walk cells once: clear the per-frame UPDATED bit AND build
+        // the element-presence bitmap. Single pass keeps it O(N).
+        let mut present = [false; ELEMENT_COUNT];
+        for c in self.cells.iter_mut() {
+            c.flag &= !Cell::FLAG_UPDATED;
+            let id = c.el as usize;
+            if id < ELEMENT_COUNT { present[id] = true; }
+        }
+        self.present_elements = present;
         mark!("clear_flags");
         if wind.length_squared() > 0.0001 {
             self.compute_wind_exposure();
@@ -4860,7 +4873,15 @@ impl World {
                 tt = std::time::Instant::now();
             }};
         }
-        for c in self.cells.iter_mut() { c.flag &= !Cell::FLAG_UPDATED; }
+        // Walk cells once: clear the per-frame UPDATED bit AND build
+        // the element-presence bitmap. Single pass keeps it O(N).
+        let mut present = [false; ELEMENT_COUNT];
+        for c in self.cells.iter_mut() {
+            c.flag &= !Cell::FLAG_UPDATED;
+            let id = c.el as usize;
+            if id < ELEMENT_COUNT { present[id] = true; }
+        }
+        self.present_elements = present;
         mark!("clear_flags");
         if wind.length_squared() > 0.0001 {
             self.compute_wind_exposure();
@@ -5230,6 +5251,11 @@ impl World {
     //
     //     2 Al + Fe₂O₃  →  Al₂O₃ + 2 Fe + huge exotherm
     fn thermite(&mut self) {
+        // Skip the full-grid scan when neither Rust nor Al exists.
+        if !self.present_elements[Element::Rust as usize]
+            && !self.present_elements[Element::Al as usize] {
+            return;
+        }
         const BURN_DURATION: u8 = 30;
         const BURN_TEMP: i16 = 2500;
         // 1700°C — hot enough that the products glow visibly orange/red
@@ -5405,6 +5431,7 @@ impl World {
     // burn site will pick up the color independently from their
     // own neighbors at spawn time.
     fn color_fires(&mut self) {
+        if !self.present_elements[Element::Fire as usize] { return; }
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5438,6 +5465,7 @@ impl World {
     }
 
     fn magnesium_burn(&mut self) {
+        if !self.present_elements[Element::Mg as usize] { return; }
         const BURN_DURATION: u8 = 50;
         const BURN_TEMP: i16 = 3000;
         const FINAL_TEMP: i16 = 1700;
@@ -5704,6 +5732,7 @@ impl World {
     // both cells in PHASE_LIQUID — the SOLID metal dissolves into Hg's
     // liquid phase. (2) skips ferrous metals (Fe, Ni) which don't amalgamate.
     fn hg_amalgamation(&mut self) {
+        if !self.present_elements[Element::Hg as usize] { return; }
         // Slow reaction so the user sees a gradual amalgam spread,
         // not a flash conversion of the entire contact line.
         const RATE: f32 = 0.05;
@@ -5760,6 +5789,7 @@ impl World {
     // this models F + (metal-Cl salt) → (metal-F salt) + Cl gas. Targets
     // both Element::Salt (bespoke NaCl) and any derived metal-Cl compound.
     fn halogen_displacement(&mut self) {
+        if !self.present_elements[Element::F as usize] { return; }
         const RATE: f32 = 0.30;
         const REACTION_HEAT: i16 = 200;
         for y in 0..H as i32 {
@@ -5833,6 +5863,11 @@ impl World {
     // Frozen (build-mode) Glass etches 50× slower so a glass window
     // doesn't vanish in the instant a single F atom drifts into it.
     fn glass_etching(&mut self) {
+        if !self.present_elements[Element::F as usize]
+            || (!self.present_elements[Element::Glass as usize]
+                && !self.present_elements[Element::MoltenGlass as usize]) {
+            return;
+        }
         const ETCH_RATE: f32 = 0.20;
         const REACTION_HEAT: i16 = 800;
         for y in 0..H as i32 {
