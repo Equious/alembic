@@ -361,6 +361,18 @@ pub fn cells_copy_from_bytes(cells: &mut [Cell], data: &[u8]) {
     }
 }
 
+/// Base color for an element id, packed as `[r, g, b, alpha=255]`
+/// (u8 each), suitable for a per-element WGSL color LUT. Mirrors
+/// `Element::base_color` exactly. Returns `[0,0,0,255]` for ids
+/// that don't correspond to a defined element.
+pub fn base_color_props(id: u8) -> [u8; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0, 0, 0, 255]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    let (r, g, b) = el.base_color();
+    [r, g, b, 255]
+}
+
 /// Per-element permeability for the GPU pressure-diffusion shader.
 /// Returned as a vec4 (only x is used) so it slots into the standard
 /// `array<vec4<u32>, 24>` uniform layout (96 elements packed 4 per vec).

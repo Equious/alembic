@@ -1381,6 +1381,255 @@ impl MotionComputeCtx {
     }
 }
 
+const RENDER_COMPUTE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> cells: array<vec4<u32>>;
+// Per-element base colors: one packed RGBA8 (u32) per element id,
+// 96 elements packed 4 per vec4<u32>.
+@group(0) @binding(2) var<uniform> color_lut: array<vec4<u32>, 24>;
+@group(0) @binding(3) var sim_tex: texture_storage_2d<rgba8unorm, write>;
+
+const FLAG_FROZEN: u32 = 0x02u;
+const PHASE_MASK:  u32 = 0x0Cu;
+const PHASE_NATIVE: u32 = 0u;
+const PHASE_SOLID:  u32 = 1u;
+const PHASE_LIQUID: u32 = 2u;
+const PHASE_GAS:    u32 = 3u;
+
+const EL_EMPTY: u32 = 0u;
+const EL_WATER: u32 = 2u;
+const EL_FIRE:  u32 = 5u;
+
+fn cell_el_render(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cell_seed_render(c: vec4<u32>) -> u32 { return c.y & 0xFFu; }
+fn cell_flag_render(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn cell_moisture_render(c: vec4<u32>) -> u32 { return c.z & 0xFFu; }
+fn cell_temp_render(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn cell_phase(c: vec4<u32>) -> u32 {
+    return (cell_flag_render(c) & PHASE_MASK) >> 2u;
+}
+fn cell_frozen_render(c: vec4<u32>) -> bool {
+    return (cell_flag_render(c) & FLAG_FROZEN) != 0u;
+}
+
+fn unpack_rgb(packed: u32) -> vec3<f32> {
+    let r = f32(packed & 0xFFu) / 255.0;
+    let g = f32((packed >> 8u) & 0xFFu) / 255.0;
+    let b = f32((packed >> 16u) & 0xFFu) / 255.0;
+    return vec3<f32>(r, g, b);
+}
+
+fn lookup_color(el_id: u32) -> vec3<f32> {
+    return unpack_rgb(color_lut[el_id / 4u][el_id % 4u]);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    let c = cells[i];
+    let el = cell_el_render(c);
+
+    var color = lookup_color(el);
+
+    if (el == EL_EMPTY) {
+        textureStore(sim_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(color, 1.0));
+        return;
+    }
+
+    // Seed-driven brightness variation (small per-cell noise).
+    let seed_i = i32(cell_seed_render(c));
+    let v = f32((seed_i - 128) / 16) / 255.0;
+    color = clamp(color + vec3<f32>(v, v, v), vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Moisture darkening — wet powders/solids look darker and blue-tinged.
+    let moisture = cell_moisture_render(c);
+    if (moisture > 20u && el != EL_WATER) {
+        let wet = clamp((f32(moisture) - 20.0) / 235.0, 0.0, 1.0) * 0.55;
+        color.r = color.r * (1.0 - wet);
+        color.g = color.g * (1.0 - wet * 0.9);
+        color.b = color.b * (1.0 - wet * 0.6) + (70.0 / 255.0) * wet;
+    }
+
+    // Thermal glow — hot cells shift through red→orange→yellow→white.
+    let temp = cell_temp_render(c);
+    if (temp > 250 && el != EL_FIRE) {
+        let warm_heat = clamp(f32(temp - 250) / 1500.0, 0.0, 1.0);
+        let warm_mix = warm_heat * 0.8;
+        color = mix(color, vec3<f32>(1.0, 200.0/255.0, 80.0/255.0), warm_mix);
+        if (temp > 1750) {
+            let white_t = clamp(f32(temp - 1750) / 1250.0, 0.0, 1.0);
+            let white_mix = white_t * 0.9;
+            color = mix(color, vec3<f32>(1.0, 1.0, 1.0), white_mix);
+        }
+    }
+
+    // Frozen (rigid-body) cells get a cool brighten so locked walls
+    // are visually distinct.
+    if (cell_frozen_render(c)) {
+        color.r = min(color.r + 20.0/255.0, 1.0);
+        color.g = min(color.g + 20.0/255.0, 1.0);
+        color.b = min(color.b + 30.0/255.0, 1.0);
+    }
+
+    // Phase tint — forced (non-native) phases shift toward cold,
+    // hot, or washed-out depending on which way the phase changed.
+    let phase = cell_phase(c);
+    if (phase == PHASE_SOLID) {
+        color = vec3<f32>(color.r * 0.7, color.g * 0.7, color.b * 0.9 + 20.0/255.0);
+    } else if (phase == PHASE_LIQUID) {
+        color = vec3<f32>(color.r * 0.9 + 30.0/255.0, color.g * 0.7 + 15.0/255.0, color.b * 0.5);
+    } else if (phase == PHASE_GAS) {
+        color = vec3<f32>(color.r * 0.5 + 8.0/255.0, color.g * 0.5 + 8.0/255.0, color.b * 0.5 + 12.0/255.0);
+    }
+
+    textureStore(sim_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct RenderUniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// GPU compute pipeline that fills `sim_texture` from `cells_buf`.
+/// Replaces the per-frame CPU pixel-fill loop + `queue.write_texture`
+/// upload — now CPU does no per-cell work for rendering.
+struct RenderComputeCtx {
+    pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    uniform_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    color_lut_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl RenderComputeCtx {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cells_buf: &wgpu::Buffer,
+        sim_view: &wgpu::TextureView,
+    ) -> Self {
+        let _ = queue;
+        let uniforms = RenderUniforms {
+            width: W as u32,
+            height: H as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-render-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Color LUT — packed RGBA8 per element, 96 elements in 24 vec4<u32>.
+        let mut color_lut: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let rgba = crate::base_color_props(el_id as u8);
+            let packed = (rgba[0] as u32)
+                | ((rgba[1] as u32) << 8)
+                | ((rgba[2] as u32) << 16)
+                | ((rgba[3] as u32) << 24);
+            color_lut[(el_id / 4) as usize][(el_id % 4) as usize] = packed;
+        }
+        let color_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-render-color-lut"),
+            contents: bytemuck::cast_slice(&color_lut),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-render-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-render-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: color_lut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sim_view) },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-render-shader"),
+            source: wgpu::ShaderSource::Wgsl(RENDER_COMPUTE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-render-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-render-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        RenderComputeCtx {
+            pipeline,
+            uniform_buf,
+            color_lut_buf,
+            bind_group,
+        }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-render-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 /// Per-frame uniform data for the sim display shader. Carries the
 /// sim's rendered rectangle within the window (for proper letterbox
 /// + aspect preservation) plus cursor + brush info (in screen pixels
@@ -1427,8 +1676,7 @@ struct GpuState {
     /// through `color_rgb()`, and upload the result for display.
     world: World,
     /// CPU scratch — packed RGBA8 pixels for one frame, W*H*4 bytes.
-    image_buffer: Vec<u8>,
-    /// GPU texture mirroring `image_buffer`. Bound to the fragment
+    /// GPU texture written by the render compute. Bound to the fragment
     /// shader's sampler, drawn as a fullscreen quad.
     sim_texture: wgpu::Texture,
     sim_bind_group: wgpu::BindGroup,
@@ -1456,6 +1704,9 @@ struct GpuState {
     /// and is a foundation for future chemistry compute shaders that
     /// also live on the packed `CellGpu` buffer.
     motion_compute: MotionComputeCtx,
+    /// GPU compute pipeline that fills `sim_texture` from `cells_buf`.
+    /// Replaces the per-frame CPU pixel fill + texture upload.
+    render_compute: RenderComputeCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -1627,7 +1878,12 @@ impl GpuState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            // Sampled by the display pipeline AND written by the
+            // render compute. STORAGE_BINDING lets the compute write
+            // pixels directly without a CPU intermediate.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                 | wgpu::TextureUsages::COPY_DST
+                 | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let sim_view = sim_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1752,8 +2008,6 @@ impl GpuState {
         world.paint(cx - 60, floor_y - 80, 6, Element::Water, 0, false);
         world.paint(cx + 50, floor_y - 5, 4, Element::Stone, 0, true);
 
-        let image_buffer = vec![0u8; W * H * 4];
-
         // GPU-resident cell state. Single 16 MB allocation, populated
         // once from initial world.cells, then mutated only by GPU
         // compute and small CPU paint/clear writes. Every compute
@@ -1777,6 +2031,7 @@ impl GpuState {
         let thermal_compute = ThermalComputeCtx::new(&device, &queue, &cells_buf);
         let pressure_sources_compute = PressureSourcesCtx::new(&device, &queue, &cells_buf);
         let motion_compute = MotionComputeCtx::new(&device, &queue, &cells_buf);
+        let render_compute = RenderComputeCtx::new(&device, &queue, &cells_buf, &sim_view);
 
         let mut state = GpuState {
             surface,
@@ -1784,7 +2039,6 @@ impl GpuState {
             device,
             queue,
             world,
-            image_buffer,
             sim_texture,
             sim_bind_group,
             sim_pipeline,
@@ -1794,6 +2048,7 @@ impl GpuState {
             thermal_compute,
             pressure_sources_compute,
             motion_compute,
+            render_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -2072,47 +2327,9 @@ impl GpuState {
             bytemuck::cast_slice(&[display_data]),
         );
 
-        // Fill the CPU pixel buffer from cell colors. Same path as the
-        // legacy macroquad render loop, just writing to our local Vec
-        // instead of a macroquad Image.
-        for i in 0..(W * H) {
-            let c = self.world.cells[i];
-            if c.el == Element::Empty {
-                let base = i * 4;
-                self.image_buffer[base]     = 2;
-                self.image_buffer[base + 1] = 2;
-                self.image_buffer[base + 2] = 6;
-                self.image_buffer[base + 3] = 255;
-                continue;
-            }
-            let [r, g, b] = color_rgb(c);
-            let base = i * 4;
-            self.image_buffer[base]     = r;
-            self.image_buffer[base + 1] = g;
-            self.image_buffer[base + 2] = b;
-            self.image_buffer[base + 3] = 255;
-        }
-
-        // Upload to GPU texture.
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.sim_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.image_buffer,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * W as u32),
-                rows_per_image: Some(H as u32),
-            },
-            wgpu::Extent3d {
-                width: W as u32,
-                height: H as u32,
-                depth_or_array_layers: 1,
-            },
-        );
+        // The render compute pass below dispatches as part of the
+        // frame encoder — it reads cells_buf and writes sim_texture
+        // directly, replacing the old CPU pixel-fill + texture upload.
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -2126,6 +2343,9 @@ impl GpuState {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("alembic-frame-encoder"),
         });
+        // First: render compute pass fills sim_texture from cells_buf.
+        // Then: the display pipeline samples sim_texture to the swapchain.
+        self.render_compute.encode(&mut encoder);
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("alembic-sim-pass"),
