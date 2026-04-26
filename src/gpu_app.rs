@@ -222,12 +222,19 @@ struct PressureComputeCtx {
     pressure_a: wgpu::Buffer,
     pressure_b: wgpu::Buffer,
     perm_buf: wgpu::Buffer,
-    readback_buf: wgpu::Buffer,
+    /// Double-buffered readback. Frame N writes to readback_bufs[write_idx]
+    /// and queues a map_async; frame N+1 reads from the same buffer (now
+    /// mapped after a single shared device.poll). Removes the per-frame
+    /// GPU sync stall — by the time we want the data, it's already
+    /// finished computing during the inter-frame interval.
+    readback_bufs: [wgpu::Buffer; 2],
     bind_a_to_b: wgpu::BindGroup,
     bind_b_to_a: wgpu::BindGroup,
     pressure_staging: Vec<i32>,
     perm_staging: Vec<u32>,
     iters: u32,
+    write_idx: usize,
+    has_data: [bool; 2],
 }
 
 impl PressureComputeCtx {
@@ -262,12 +269,18 @@ impl PressureComputeCtx {
         let pressure_a = make_storage("alembic-pressure-a");
         let pressure_b = make_storage("alembic-pressure-b");
         let perm_buf = make_storage("alembic-perm");
-        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("alembic-pressure-readback"),
-            size: buf_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let make_readback = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: buf_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let readback_bufs = [
+            make_readback("alembic-pressure-readback-0"),
+            make_readback("alembic-pressure-readback-1"),
+        ];
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-pressure-compute-bgl"),
@@ -357,12 +370,14 @@ impl PressureComputeCtx {
             pressure_a,
             pressure_b,
             perm_buf,
-            readback_buf,
+            readback_bufs,
             bind_a_to_b,
             bind_b_to_a,
             pressure_staging: vec![0i32; cell_count],
             perm_staging: vec![0u32; cell_count],
             iters: 3,
+            write_idx: 0,
+            has_data: [false; 2],
         }
     }
 
@@ -392,17 +407,24 @@ impl PressureComputeCtx {
         }
         let final_buf = if self.iters % 2 == 1 { &self.pressure_b } else { &self.pressure_a };
         encoder.copy_buffer_to_buffer(
-            final_buf, 0, &self.readback_buf, 0,
+            final_buf, 0, &self.readback_bufs[self.write_idx], 0,
             (cell_count * 4) as wgpu::BufferAddress,
         );
     }
 
-    fn start_map(&self) {
-        self.readback_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    fn start_map(&mut self) {
+        self.readback_bufs[self.write_idx]
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |_| {});
+        self.has_data[self.write_idx] = true;
     }
 
-    fn read_back_into(&self, world: &mut World) {
-        let slice = self.readback_buf.slice(..);
+    /// Read the OTHER buffer (filled last frame). Skips on the first
+    /// frame when no prior data exists.
+    fn read_back_prev_into(&mut self, world: &mut World) {
+        let read_idx = 1 - self.write_idx;
+        if !self.has_data[read_idx] { return; }
+        let slice = self.readback_bufs[read_idx].slice(..);
         {
             let data = slice.get_mapped_range();
             let result: &[i32] = bytemuck::cast_slice(&data);
@@ -410,7 +432,12 @@ impl PressureComputeCtx {
                 world.cells[i].pressure = v as i16;
             }
         }
-        self.readback_buf.unmap();
+        self.readback_bufs[read_idx].unmap();
+        self.has_data[read_idx] = false;
+    }
+
+    fn advance_frame(&mut self) {
+        self.write_idx = 1 - self.write_idx;
     }
 }
 
@@ -435,11 +462,13 @@ struct ThermalComputeCtx {
     temp_a: wgpu::Buffer,
     temp_b: wgpu::Buffer,
     el_buf: wgpu::Buffer,
-    readback_buf: wgpu::Buffer,
+    readback_bufs: [wgpu::Buffer; 2],
     bind_a_to_b: wgpu::BindGroup,
     bind_b_to_a: wgpu::BindGroup,
     temp_staging: Vec<i32>,
     el_staging: Vec<u32>,
+    write_idx: usize,
+    has_data: [bool; 2],
 }
 
 impl ThermalComputeCtx {
@@ -484,12 +513,18 @@ impl ThermalComputeCtx {
         let temp_a = make_storage("alembic-temp-a");
         let temp_b = make_storage("alembic-temp-b");
         let el_buf = make_storage("alembic-el");
-        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("alembic-thermal-readback"),
-            size: buf_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let make_readback = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: buf_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let readback_bufs = [
+            make_readback("alembic-thermal-readback-0"),
+            make_readback("alembic-thermal-readback-1"),
+        ];
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-thermal-bgl"),
@@ -562,11 +597,13 @@ impl ThermalComputeCtx {
             temp_a,
             temp_b,
             el_buf,
-            readback_buf,
+            readback_bufs,
             bind_a_to_b,
             bind_b_to_a,
             temp_staging: vec![0i32; cell_count],
             el_staging: vec![0u32; cell_count],
+            write_idx: 0,
+            has_data: [false; 2],
         }
     }
 
@@ -601,19 +638,23 @@ impl ThermalComputeCtx {
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
         encoder.copy_buffer_to_buffer(
-            &self.temp_b, 0, &self.readback_buf, 0,
+            &self.temp_b, 0, &self.readback_bufs[self.write_idx], 0,
             (cell_count * 4) as wgpu::BufferAddress,
         );
-        // Keep ownership-only fields lint-quiet.
         let _ = (&self.bind_b_to_a, &self.profiles_buf, &self.temp_a);
     }
 
-    fn start_map(&self) {
-        self.readback_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    fn start_map(&mut self) {
+        self.readback_bufs[self.write_idx]
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |_| {});
+        self.has_data[self.write_idx] = true;
     }
 
-    fn read_back_into(&self, world: &mut World) {
-        let slice = self.readback_buf.slice(..);
+    fn read_back_prev_into(&mut self, world: &mut World) {
+        let read_idx = 1 - self.write_idx;
+        if !self.has_data[read_idx] { return; }
+        let slice = self.readback_bufs[read_idx].slice(..);
         {
             let data = slice.get_mapped_range();
             let result: &[i32] = bytemuck::cast_slice(&data);
@@ -621,7 +662,12 @@ impl ThermalComputeCtx {
                 world.cells[i].temp = v.clamp(-273, 4000) as i16;
             }
         }
-        self.readback_buf.unmap();
+        self.readback_bufs[read_idx].unmap();
+        self.has_data[read_idx] = false;
+    }
+
+    fn advance_frame(&mut self) {
+        self.write_idx = 1 - self.write_idx;
     }
 }
 
@@ -1184,10 +1230,21 @@ impl GpuState {
         let t_sim = t_sim_start.elapsed();
         let t_compute_start = std::time::Instant::now();
         if !self.paused {
-            // Combined compute pass: stage both inputs, encode both
-            // dispatches in one command buffer, single submit, single
-            // map_async pair, single device.poll(Wait). Cuts the GPU
-            // sync overhead in half vs running them serially.
+            // Double-buffered compute. Sequence:
+            //   1. poll() — drains last frame's GPU work + map_async
+            //      callbacks (near-zero in steady state since the GPU
+            //      had a full frame to finish during winit's vsync).
+            //   2. read PREVIOUS frame's results from the buffer that
+            //      was queued for map last frame.
+            //   3. stage current frame's inputs (CPU → write_buffer).
+            //   4. encode + submit current compute (writes to the
+            //      OTHER buffer).
+            //   5. queue map_async on that buffer for next frame.
+            //   6. swap write_idx for both ctxs.
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+            self.pressure_compute.read_back_prev_into(&mut self.world);
+            self.thermal_compute.read_back_prev_into(&mut self.world);
+
             self.pressure_compute.stage_and_upload(&self.world, &self.queue);
             let amb = self.world.ambient_offset;
             self.thermal_compute.stage_and_upload(&self.world, &self.queue, self.frame_counter, amb);
@@ -1197,14 +1254,10 @@ impl GpuState {
             self.pressure_compute.encode(&mut encoder);
             self.thermal_compute.encode(&mut encoder);
             self.queue.submit(std::iter::once(encoder.finish()));
-            // Queue both maps before polling — poll(Wait) drains all
-            // pending GPU work, so both buffers become readable in
-            // a single sync.
             self.pressure_compute.start_map();
             self.thermal_compute.start_map();
-            let _ = self.device.poll(wgpu::Maintain::Wait);
-            self.pressure_compute.read_back_into(&mut self.world);
-            self.thermal_compute.read_back_into(&mut self.world);
+            self.pressure_compute.advance_frame();
+            self.thermal_compute.advance_frame();
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
         let t_compute = t_compute_start.elapsed();
