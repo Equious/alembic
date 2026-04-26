@@ -97,6 +97,23 @@ struct GpuState {
     erase_down: bool,
     /// Pause toggle (Space).
     paused: bool,
+    /// Either Ctrl is currently held (gates wheel → zoom).
+    ctrl_held: bool,
+    /// Last cursor pos while middle-mouse drag is active. None when
+    /// middle button is up — middle press latches the start, each
+    /// cursor move applies the pan delta and re-anchors here.
+    middle_drag_from: Option<(f64, f64)>,
+
+    // ---- Camera state ----
+    /// World-space cell coordinate at the center of the view.
+    /// Default: (W/2, H/2) → sim is centered. Pan moves this around.
+    cam_center_x: f32,
+    cam_center_y: f32,
+    /// Pixels per cell. Default: whatever fits the sim into the window
+    /// while preserving aspect (the "1× zoom" baseline). Larger values
+    /// zoom in (fewer cells visible, each takes more pixels). Smaller
+    /// values zoom out below baseline — the surrounding void shows.
+    cam_scale: f32,
 }
 
 impl GpuState {
@@ -346,7 +363,7 @@ impl GpuState {
 
         let image_buffer = vec![0u8; W * H * 4];
 
-        GpuState {
+        let mut state = GpuState {
             surface,
             surface_config,
             device,
@@ -364,45 +381,89 @@ impl GpuState {
             paint_down: false,
             erase_down: false,
             paused: false,
-        }
+            ctrl_held: false,
+            middle_drag_from: None,
+            cam_center_x: W as f32 * 0.5,
+            cam_center_y: H as f32 * 0.5,
+            cam_scale: 1.0,
+        };
+        state.camera_reset();
+        state
     }
 
-    /// The sim's render rectangle in framebuffer pixels, preserving
-    /// the native W:H aspect ratio. Returns (min_x, min_y, max_x, max_y)
-    /// and the scale factor (pixels per cell). Letterbox / pillarbox
-    /// bars fill the remaining window space.
+    /// Compute the pixels-per-cell that would fit the sim entirely
+    /// within the current window (preserving aspect, with letterbox
+    /// or pillarbox bars on the leftover dimension). This is the
+    /// baseline "1× zoom" reference.
+    fn fit_scale(&self) -> f32 {
+        let win_w = self.surface_config.width as f32;
+        let win_h = self.surface_config.height as f32;
+        let by_w = win_w / W as f32;
+        let by_h = win_h / H as f32;
+        by_w.min(by_h)
+    }
+
+    /// Reset camera to the default fit-to-window view (sim centered,
+    /// scale = fit_scale). Bound to Backspace.
+    fn camera_reset(&mut self) {
+        self.cam_center_x = W as f32 * 0.5;
+        self.cam_center_y = H as f32 * 0.5;
+        self.cam_scale = self.fit_scale();
+    }
+
+    /// Cursor-anchored zoom. The cell currently under the cursor stays
+    /// under the cursor across the zoom — the camera center shifts to
+    /// preserve that invariant.
+    fn zoom_at(&mut self, screen_x: f32, screen_y: f32, factor: f32) {
+        let win_w = self.surface_config.width as f32;
+        let win_h = self.surface_config.height as f32;
+        // Cell under cursor at the *current* scale.
+        let cell_x = self.cam_center_x + (screen_x - win_w * 0.5) / self.cam_scale;
+        let cell_y = self.cam_center_y + (screen_y - win_h * 0.5) / self.cam_scale;
+        let fit = self.fit_scale();
+        // Bound to a reasonable range — too small loses the sim in a
+        // sea of void; too large makes individual cells fill the screen.
+        let new_scale = (self.cam_scale * factor).clamp(fit * 0.25, fit * 16.0);
+        // After zoom, solve for cam_center such that cell_x maps to screen_x.
+        self.cam_center_x = cell_x - (screen_x - win_w * 0.5) / new_scale;
+        self.cam_center_y = cell_y - (screen_y - win_h * 0.5) / new_scale;
+        self.cam_scale = new_scale;
+    }
+
+    /// Pan the camera by a screen-pixel delta. Used by middle-mouse drag.
+    fn pan_pixels(&mut self, dx: f32, dy: f32) {
+        self.cam_center_x -= dx / self.cam_scale;
+        self.cam_center_y -= dy / self.cam_scale;
+    }
+
+    /// Sim render rectangle in framebuffer pixels, derived from the
+    /// camera state. May extend past the window when zoomed in (the
+    /// shader clips); may be smaller than the window when zoomed out
+    /// (void fills the gap). Returns (min_x, min_y, max_x, max_y) and
+    /// the per-cell scale.
     fn sim_pixel_rect(&self) -> ((f32, f32, f32, f32), f32) {
         let win_w = self.surface_config.width as f32;
         let win_h = self.surface_config.height as f32;
-        let win_aspect = win_w / win_h;
-        let sim_aspect = W as f32 / H as f32;
-        let (sim_w_px, sim_h_px) = if win_aspect > sim_aspect {
-            // Window wider than sim — pillarbox left/right.
-            (win_h * sim_aspect, win_h)
-        } else {
-            // Window taller than sim — letterbox top/bottom.
-            (win_w, win_w / sim_aspect)
-        };
-        let min_x = (win_w - sim_w_px) * 0.5;
-        let min_y = (win_h - sim_h_px) * 0.5;
-        let max_x = min_x + sim_w_px;
-        let max_y = min_y + sim_h_px;
-        let pixels_per_cell = sim_w_px / W as f32;
-        ((min_x, min_y, max_x, max_y), pixels_per_cell)
+        let scale = self.cam_scale;
+        let min_x = win_w * 0.5 - self.cam_center_x * scale;
+        let min_y = win_h * 0.5 - self.cam_center_y * scale;
+        let max_x = min_x + W as f32 * scale;
+        let max_y = min_y + H as f32 * scale;
+        ((min_x, min_y, max_x, max_y), scale)
     }
 
     /// Translate window-pixel cursor coords into integer grid coords,
-    /// returning None when the cursor is outside the sim rectangle
-    /// (letterbox bars). Painting only fires when this returns Some.
+    /// returning None when the cursor is outside the sim rectangle.
+    /// Camera-aware: works correctly under any zoom/pan.
     fn cursor_to_grid(&self, px: f64, py: f64) -> Option<(i32, i32)> {
-        let (rect, ppc) = self.sim_pixel_rect();
+        let (rect, scale) = self.sim_pixel_rect();
         let pxf = px as f32;
         let pyf = py as f32;
         if pxf < rect.0 || pxf > rect.2 || pyf < rect.1 || pyf > rect.3 {
             return None;
         }
-        let gx = ((pxf - rect.0) / ppc).floor() as i32;
-        let gy = ((pyf - rect.1) / ppc).floor() as i32;
+        let gx = ((pxf - rect.0) / scale).floor() as i32;
+        let gy = ((pyf - rect.1) / scale).floor() as i32;
         Some((gx.clamp(0, W as i32 - 1), gy.clamp(0, H as i32 - 1)))
     }
 
@@ -618,41 +679,75 @@ impl ApplicationHandler for App {
                 state.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.cursor_pos = Some((position.x, position.y));
+                let new_pos = (position.x, position.y);
+                // Apply pan if middle-mouse drag is in progress.
+                if let Some(prev) = state.middle_drag_from {
+                    let dx = (new_pos.0 - prev.0) as f32;
+                    let dy = (new_pos.1 - prev.1) as f32;
+                    state.pan_pixels(dx, dy);
+                    state.middle_drag_from = Some(new_pos);
+                }
+                state.cursor_pos = Some(new_pos);
             }
             WindowEvent::CursorLeft { .. } => {
                 state.cursor_pos = None;
+                state.middle_drag_from = None;
             }
             WindowEvent::MouseInput { state: mouse_state, button, .. } => {
                 let pressed = mouse_state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => state.paint_down = pressed,
                     MouseButton::Right => state.erase_down = pressed,
+                    MouseButton::Middle => {
+                        if pressed {
+                            state.middle_drag_from = state.cursor_pos;
+                        } else {
+                            state.middle_drag_from = None;
+                        }
+                    }
                     _ => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Scroll changes brush radius (simple first cut — later
-                // we'll mirror the macroquad version's modifier-key
-                // dispatch for ambient settings, prefab sizing, etc.).
-                let dir: i32 = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => if y > 0.0 { 1 } else if y < 0.0 { -1 } else { 0 },
-                    MouseScrollDelta::PixelDelta(p) => if p.y > 0.0 { 1 } else if p.y < 0.0 { -1 } else { 0 },
+                // Plain wheel → brush radius. Ctrl+wheel → camera zoom
+                // anchored at the cursor (cell under the cursor stays
+                // under the cursor across the zoom).
+                let raw_y: f32 = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 30.0,
                 };
-                state.brush_radius = (state.brush_radius + dir).clamp(1, 30);
+                if state.ctrl_held {
+                    if let Some((px, py)) = state.cursor_pos {
+                        let factor = if raw_y > 0.0 { 1.15 }
+                                     else if raw_y < 0.0 { 1.0 / 1.15 }
+                                     else { 1.0 };
+                        state.zoom_at(px as f32, py as f32, factor);
+                    }
+                } else {
+                    let dir = if raw_y > 0.0 { 1 }
+                              else if raw_y < 0.0 { -1 }
+                              else { 0 };
+                    state.brush_radius = (state.brush_radius + dir).clamp(1, 30);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed { return; }
+                let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    // Track Ctrl (both sides) for wheel-zoom gating.
+                    if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
+                        state.ctrl_held = pressed;
+                        return;
+                    }
+                    // Everything else fires on press only.
+                    if !pressed { return; }
                     if let Some(el) = GpuState::element_for_key(code) {
                         state.selected = el;
                         return;
                     }
                     match code {
                         KeyCode::Space => state.paused = !state.paused,
+                        KeyCode::Backspace => state.camera_reset(),
                         KeyCode::KeyC => {
-                            // C clears non-frozen matter (mirror the
-                            // macroquad version's clear shortcut).
                             for c in state.world.cells.iter_mut() {
                                 if !c.is_frozen() {
                                     *c = crate::Cell::EMPTY;
