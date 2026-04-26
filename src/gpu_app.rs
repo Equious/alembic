@@ -1381,6 +1381,549 @@ impl MotionComputeCtx {
     }
 }
 
+// ============================================================
+// Phase 2 chemistry passes on GPU
+// ============================================================
+//
+// These three passes share `cells_buf` and a tiny per-pass uniform.
+// All are race-free by construction:
+//   * clear_flags         — per-cell write to one bit only
+//   * color_fires         — per-cell write to one byte (cell.w lo)
+//   * flame_test_emission — Margolus 2x2, 4 phases, neighbor write
+//                           lives entirely within the same block
+
+const CLEAR_FLAGS_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+// FLAG_UPDATED = bit 0 of the flag byte. The flag byte sits in
+// bits 8-15 of cells[i].y.
+const FLAG_UPDATED_BIT_IN_Y: u32 = 0x100u;
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    cells[i].y = cells[i].y & ~FLAG_UPDATED_BIT_IN_Y;
+}
+"#;
+
+const COLOR_FIRES_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element flame-color flag: 1 if `flame_color()` returns Some.
+// 96 elements packed 4 per vec4<u32>.
+@group(0) @binding(2) var<uniform> has_flame: array<vec4<u32>, 24>;
+
+const EL_FIRE: u32 = 5u;
+const EL_WATER: u32 = 2u;
+
+fn cf_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cf_solute_el(c: vec4<u32>) -> u32 { return c.w & 0xFFu; }
+fn cf_has_flame(el_id: u32) -> bool {
+    let safe_id = min(el_id, 95u);
+    return has_flame[safe_id / 4u][safe_id % 4u] != 0u;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    let w_i = i32(u.width);
+    let h_i = i32(u.height);
+    if (x >= w_i || y >= h_i) { return; }
+    let i = u32(y * w_i + x);
+    let c = cells[i];
+    if (cf_el(c) != EL_FIRE) { return; }
+    if (cf_solute_el(c) != 0u) { return; }
+
+    var picked: u32 = 0u;
+    // 8 neighbors, fully unrolled. Inlining avoids array<vec2,8>
+    // literal in let bindings — some shader compilers spill those
+    // awkwardly and previous attempt crashed on Vulkan/NV.
+    // (1, 0)
+    if (x + 1 < w_i) {
+        let n = cells[u32(y * w_i + (x + 1))];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (-1, 0)
+    if (picked == 0u && x > 0) {
+        let n = cells[u32(y * w_i + (x - 1))];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (0, 1)
+    if (picked == 0u && y + 1 < h_i) {
+        let n = cells[u32((y + 1) * w_i + x)];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (0, -1)
+    if (picked == 0u && y > 0) {
+        let n = cells[u32((y - 1) * w_i + x)];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (1, 1)
+    if (picked == 0u && x + 1 < w_i && y + 1 < h_i) {
+        let n = cells[u32((y + 1) * w_i + (x + 1))];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (1, -1)
+    if (picked == 0u && x + 1 < w_i && y > 0) {
+        let n = cells[u32((y - 1) * w_i + (x + 1))];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (-1, 1)
+    if (picked == 0u && x > 0 && y + 1 < h_i) {
+        let n = cells[u32((y + 1) * w_i + (x - 1))];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+    // (-1, -1)
+    if (picked == 0u && x > 0 && y > 0) {
+        let n = cells[u32((y - 1) * w_i + (x - 1))];
+        let nel = cf_el(n);
+        if (cf_has_flame(nel)) { picked = nel; }
+        else if (nel == EL_WATER) {
+            let nse = cf_solute_el(n);
+            if (cf_has_flame(nse)) { picked = nse; }
+        }
+    }
+
+    if (picked != 0u) {
+        let hi = c.w & 0xFFFFFF00u;
+        cells[i].w = hi | (picked & 0xFFu);
+    }
+}
+"#;
+
+const FLAME_TEST_EMISSION_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    phase: u32,
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+@group(0) @binding(2) var<uniform> has_flame: array<vec4<u32>, 24>;
+
+const EL_EMPTY: u32 = 0u;
+const EL_FIRE:  u32 = 5u;
+
+fn fte_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn fte_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn fte_burn(c: vec4<u32>) -> u32 { return (c.z >> 8u) & 0xFFu; }
+fn fte_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn fte_updated(c: vec4<u32>) -> bool { return (fte_flag(c) & 1u) != 0u; }
+fn fte_has_flame(el: u32) -> bool {
+    let safe_id = min(el, 95u);
+    return has_flame[safe_id / 4u][safe_id % 4u] != 0u;
+}
+
+// Element::Fire baseline cell. Matches Cell::new(Element::Fire) with
+// life fixed at 60 (CPU randomizes 40..80; midpoint is fine), seed 0.
+fn make_fire(solute_el: u32) -> vec4<u32> {
+    let pack0 = 5u | (60u << 16u);
+    let pack1 = 20u << 16u;
+    let pack2 = 0u;
+    let pack3 = solute_el & 0xFFu;
+    return vec4<u32>(pack0, pack1, pack2, pack3);
+}
+
+fn is_emitter(c: vec4<u32>) -> bool {
+    return fte_el(c) != EL_FIRE
+        && fte_burn(c) == 0u
+        && !fte_updated(c)
+        && fte_temp(c) > 600
+        && fte_has_flame(fte_el(c));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let off_x = u.phase & 1u;
+    let off_y = (u.phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+    // Frame parity gate ≈ CPU's 0.40 probability — alternating
+    // emit/no-emit averages 50% emission rate per cell-frame.
+    if ((u.frame & 1u) != 0u) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    if (is_emitter(c00)) {
+        let src = fte_el(c00);
+        if (fte_el(c10) == EL_EMPTY) { c10 = make_fire(src); }
+        else if (fte_el(c01) == EL_EMPTY) { c01 = make_fire(src); }
+        else if (fte_el(c11) == EL_EMPTY) { c11 = make_fire(src); }
+    }
+    if (is_emitter(c10)) {
+        let src = fte_el(c10);
+        if (fte_el(c00) == EL_EMPTY) { c00 = make_fire(src); }
+        else if (fte_el(c11) == EL_EMPTY) { c11 = make_fire(src); }
+        else if (fte_el(c01) == EL_EMPTY) { c01 = make_fire(src); }
+    }
+    if (is_emitter(c01)) {
+        let src = fte_el(c01);
+        if (fte_el(c11) == EL_EMPTY) { c11 = make_fire(src); }
+        else if (fte_el(c00) == EL_EMPTY) { c00 = make_fire(src); }
+        else if (fte_el(c10) == EL_EMPTY) { c10 = make_fire(src); }
+    }
+    if (is_emitter(c11)) {
+        let src = fte_el(c11);
+        if (fte_el(c01) == EL_EMPTY) { c01 = make_fire(src); }
+        else if (fte_el(c10) == EL_EMPTY) { c10 = make_fire(src); }
+        else if (fte_el(c00) == EL_EMPTY) { c00 = make_fire(src); }
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ChemSimpleUniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct FlameTestUniforms {
+    width: u32,
+    height: u32,
+    phase: u32,
+    frame: u32,
+}
+
+/// GPU port of `World::clear_flags`. Trivial per-cell bit clear of
+/// the FLAG_UPDATED flag.
+struct ClearFlagsCtx {
+    pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    uniform_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl ClearFlagsCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let uniforms = ChemSimpleUniforms { width: W as u32, height: H as u32, _pad0: 0, _pad1: 0 };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-clearflags-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-clearflags-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-clearflags-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-clearflags-shader"),
+            source: wgpu::ShaderSource::Wgsl(CLEAR_FLAGS_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-clearflags-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-clearflags-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        ClearFlagsCtx { pipeline, uniform_buf, bind_group }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-clearflags-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
+/// GPU port of `World::color_fires`.
+struct ColorFiresCtx {
+    pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    uniform_buf: wgpu::Buffer,
+    #[allow(dead_code)]
+    flame_lut_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl ColorFiresCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let uniforms = ChemSimpleUniforms { width: W as u32, height: H as u32, _pad0: 0, _pad1: 0 };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-colorfires-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let mut lut: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let p = crate::flame_color_flag_props(el_id as u8);
+            lut[(el_id / 4) as usize][(el_id % 4) as usize] = p[0];
+        }
+        let flame_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-colorfires-flame-lut"),
+            contents: bytemuck::cast_slice(&lut),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-colorfires-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-colorfires-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: flame_lut_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-colorfires-shader"),
+            source: wgpu::ShaderSource::Wgsl(COLOR_FIRES_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-colorfires-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-colorfires-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        ColorFiresCtx { pipeline, uniform_buf, flame_lut_buf, bind_group }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-colorfires-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
+/// GPU port of `World::flame_test_emission`. Margolus 2×2 4-phase.
+struct FlameTestEmissionCtx {
+    pipeline: wgpu::ComputePipeline,
+    phase_uniform_bufs: [wgpu::Buffer; 4],
+    #[allow(dead_code)]
+    flame_lut_buf: wgpu::Buffer,
+    phase_bind_groups: [wgpu::BindGroup; 4],
+}
+
+impl FlameTestEmissionCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mk_uniform = |label: &str, phase: u32| {
+            let u = FlameTestUniforms { width: W as u32, height: H as u32, phase, frame: 0 };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let phase_uniform_bufs: [wgpu::Buffer; 4] = [
+            mk_uniform("alembic-flameemit-uniforms-p0", 0),
+            mk_uniform("alembic-flameemit-uniforms-p1", 1),
+            mk_uniform("alembic-flameemit-uniforms-p2", 2),
+            mk_uniform("alembic-flameemit-uniforms-p3", 3),
+        ];
+        let mut lut: Vec<[u32; 4]> = vec![[0u32; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let p = crate::flame_color_flag_props(el_id as u8);
+            lut[(el_id / 4) as usize][(el_id % 4) as usize] = p[0];
+        }
+        let flame_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-flameemit-flame-lut"),
+            contents: bytemuck::cast_slice(&lut),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-flameemit-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-flameemit-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: phase_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: flame_lut_buf.as_entire_binding() },
+            ],
+        });
+        let phase_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-flameemit-shader"),
+            source: wgpu::ShaderSource::Wgsl(FLAME_TEST_EMISSION_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-flameemit-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-flameemit-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        FlameTestEmissionCtx { pipeline, phase_uniform_bufs, flame_lut_buf, phase_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let frame_arr = [frame];
+        let frame_bytes: &[u8] = bytemuck::cast_slice(&frame_arr);
+        for i in 0..4 {
+            queue.write_buffer(&self.phase_uniform_bufs[i], 12, frame_bytes);
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        for i in 0..4 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-flameemit-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.phase_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const RENDER_COMPUTE_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -1707,6 +2250,12 @@ struct GpuState {
     /// GPU compute pipeline that fills `sim_texture` from `cells_buf`.
     /// Replaces the per-frame CPU pixel fill + texture upload.
     render_compute: RenderComputeCtx,
+    /// GPU port of `World::clear_flags`. Trivial single-bit clear.
+    clear_flags_compute: ClearFlagsCtx,
+    /// GPU port of `World::color_fires`. Per-cell flame-color inheritance.
+    color_fires_compute: ColorFiresCtx,
+    /// GPU port of `World::flame_test_emission`. Margolus 2x2.
+    flame_emit_compute: FlameTestEmissionCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -2032,6 +2581,9 @@ impl GpuState {
         let pressure_sources_compute = PressureSourcesCtx::new(&device, &queue, &cells_buf);
         let motion_compute = MotionComputeCtx::new(&device, &queue, &cells_buf);
         let render_compute = RenderComputeCtx::new(&device, &queue, &cells_buf, &sim_view);
+        let clear_flags_compute = ClearFlagsCtx::new(&device, &queue, &cells_buf);
+        let color_fires_compute = ColorFiresCtx::new(&device, &queue, &cells_buf);
+        let flame_emit_compute = FlameTestEmissionCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -2049,6 +2601,9 @@ impl GpuState {
             pressure_sources_compute,
             motion_compute,
             render_compute,
+            clear_flags_compute,
+            color_fires_compute,
+            flame_emit_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -2249,7 +2804,16 @@ impl GpuState {
 
         let t_sim_start = std::time::Instant::now();
         if !self.paused {
-            self.world.step_skip_gpu_passes_and_motion(macroquad::math::Vec2::new(0.0, 0.0));
+            // GPU runs: pressure_sources, pressure, thermal_diffuse,
+            // motion, clear_flags, color_fires, flame_test_emission.
+            // CPU runs everything else (combustion in thermal_post,
+            // chem_reactions, etc.) — those will follow in later phases.
+            let gpu_chem = crate::GpuChem {
+                clear_flags: true,
+                color_fires: true,
+                flame_test_emission: true,
+            };
+            self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
         let t_sim = t_sim_start.elapsed();
 
@@ -2271,17 +2835,27 @@ impl GpuState {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("alembic-combined-compute-encoder"),
             });
-            // PS: column scan + asymmetric blend. Writes new pressure
-            // straight into cells_buf, so the pressure diffusion below
-            // sees post-PS values when it extracts.
+            // 1. clear_flags — zero out FLAG_UPDATED on every cell so
+            //    motion/chemistry start from a clean slate.
+            self.clear_flags_compute.encode(&mut encoder);
+            // 2. PS: column scan + asymmetric blend. Writes new pressure
+            //    straight into cells_buf, so the diffusion below sees
+            //    post-PS values when it extracts.
             if run_ps {
                 self.pressure_sources_compute.encode(&mut encoder);
             }
-            // Pressure: extract → 3 diffuse iters → writeback.
+            // 3. Pressure: extract → 3 diffuse iters → writeback.
             self.pressure_compute.encode(&mut encoder);
-            // Thermal: extract → 1 diffuse iter → writeback.
+            // 4. Thermal: extract → 1 diffuse iter → writeback.
             self.thermal_compute.encode(&mut encoder);
-            // Motion: 4 passes (vfall, lspread, dslide-even, dslide-odd).
+            // 5. flame_test_emission — Margolus 4-phase, hot flame-
+            //    coloring elements emit colored Fire into block-local
+            //    empty cells.
+            self.flame_emit_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 6. color_fires — Fire cells inherit flame color from any
+            //    flame-coloring neighbor.
+            self.color_fires_compute.encode(&mut encoder);
+            // 7. Motion: 5 passes (vfall, lspread-even/odd, dslide-even/odd).
             self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter, &self.cells_buf);
             self.queue.submit(std::iter::once(encoder.finish()));
             self.motion_compute.start_map();

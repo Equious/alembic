@@ -373,6 +373,27 @@ pub fn base_color_props(id: u8) -> [u8; 4] {
     [r, g, b, 255]
 }
 
+/// Per-element flag: 1 if this element has a flame-test color
+/// (Cu, Na, K, Ca, Mg, B, Salt — see `flame_color`), 0 otherwise.
+/// Returned as a vec4<u32> for the standard packed-LUT layout.
+pub fn flame_color_flag_props(id: u8) -> [u32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0; 4]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    [if flame_color(el).is_some() { 1 } else { 0 }, 0, 0, 0]
+}
+
+/// Per-element flag: 1 if this element has an `ignite_above` thermal
+/// threshold (i.e., is flammable). Used by the GPU thermal_post pass
+/// to gate combustion checks. Currently only used as a placeholder —
+/// the bespoke combustion logic stays on CPU.
+pub fn flammable_props(id: u8) -> [u32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0; 4]; }
+    let el: Element = unsafe { std::mem::transmute(id) };
+    [if el.thermal().ignite_above.is_some() { 1 } else { 0 }, 0, 0, 0]
+}
+
 /// Per-element permeability for the GPU pressure-diffusion shader.
 /// Returned as a vec4 (only x is used) so it slots into the standard
 /// `array<vec4<u32>, 24>` uniform layout (96 elements packed 4 per vec).
@@ -3931,6 +3952,19 @@ impl World {
     pub fn step(&mut self, wind: Vec2) {
         self.step_inner(wind, true, true);
     }
+}
+
+/// Bitmask of chemistry passes that are running on GPU compute and
+/// should therefore be skipped on CPU. As more passes get ported,
+/// add fields here. `Default` = nothing on GPU (CPU runs everything).
+#[derive(Clone, Copy, Default)]
+pub struct GpuChem {
+    pub clear_flags: bool,
+    pub color_fires: bool,
+    pub flame_test_emission: bool,
+}
+
+impl World {
 
     /// Step everything except the pressure diffusion pass. The wgpu
     /// binary calls this and dispatches pressure on the GPU instead.
@@ -3956,11 +3990,18 @@ impl World {
     /// Skip pressure_sources, pressure, thermal_diffuse, AND motion
     /// (`update_cell` sweep) — used when motion runs on GPU compute.
     pub fn step_skip_gpu_passes_and_motion(&mut self, wind: Vec2) {
-        self.step_inner_full2(wind, false, false, false, false);
+        self.step_inner_full3(wind, false, false, false, false, GpuChem::default());
+    }
+
+    /// Same as `step_skip_gpu_passes_and_motion` but also skips the
+    /// chemistry passes flagged in `gpu_chem` (those are running on
+    /// GPU compute too).
+    pub fn step_skip_gpu_v2(&mut self, wind: Vec2, gpu_chem: GpuChem) {
+        self.step_inner_full3(wind, false, false, false, false, gpu_chem);
     }
 
     fn step_inner(&mut self, wind: Vec2, run_pressure: bool, run_thermal_diffuse: bool) {
-        self.step_inner_full2(wind, run_pressure, run_thermal_diffuse, true, true);
+        self.step_inner_full3(wind, run_pressure, run_thermal_diffuse, true, true, GpuChem::default());
     }
 
     fn step_inner_full(
@@ -3970,7 +4011,7 @@ impl World {
         run_thermal_diffuse: bool,
         run_pressure_sources: bool,
     ) {
-        self.step_inner_full2(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, true);
+        self.step_inner_full3(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, true, GpuChem::default());
     }
 
     fn step_inner_full2(
@@ -3981,6 +4022,18 @@ impl World {
         run_pressure_sources: bool,
         run_motion: bool,
     ) {
+        self.step_inner_full3(wind, run_pressure, run_thermal_diffuse, run_pressure_sources, run_motion, GpuChem::default());
+    }
+
+    fn step_inner_full3(
+        &mut self,
+        wind: Vec2,
+        run_pressure: bool,
+        run_thermal_diffuse: bool,
+        run_pressure_sources: bool,
+        run_motion: bool,
+        gpu_chem: GpuChem,
+    ) {
         self.frame = self.frame.wrapping_add(1);
         let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
         let mut tt = std::time::Instant::now();
@@ -3990,13 +4043,21 @@ impl World {
                 tt = std::time::Instant::now();
             }};
         }
-        // Walk cells once: clear the per-frame UPDATED bit AND build
-        // the element-presence bitmap. Single pass keeps it O(N).
+        // Build the element-presence bitmap; clear FLAG_UPDATED only
+        // when the GPU isn't running clear_flags itself. Either way
+        // the presence bitmap is needed for CPU chemistry early-exits.
         let mut present = [false; ELEMENT_COUNT];
-        for c in self.cells.iter_mut() {
-            c.flag &= !Cell::FLAG_UPDATED;
-            let id = c.el as usize;
-            if id < ELEMENT_COUNT { present[id] = true; }
+        if gpu_chem.clear_flags {
+            for c in self.cells.iter() {
+                let id = c.el as usize;
+                if id < ELEMENT_COUNT { present[id] = true; }
+            }
+        } else {
+            for c in self.cells.iter_mut() {
+                c.flag &= !Cell::FLAG_UPDATED;
+                let id = c.el as usize;
+                if id < ELEMENT_COUNT { present[id] = true; }
+            }
         }
         self.present_elements = present;
         mark!("clear_flags");
@@ -4014,8 +4075,12 @@ impl World {
         self.glass_etching();        mark!("glass_etch");
         self.halogen_displacement(); mark!("halogen_disp");
         self.hg_amalgamation();      mark!("hg_amalg");
-        self.flame_test_emission();  mark!("flame_emit");
-        self.color_fires();          mark!("color_fires");
+        if !gpu_chem.flame_test_emission {
+            self.flame_test_emission(); mark!("flame_emit");
+        }
+        if !gpu_chem.color_fires {
+            self.color_fires();      mark!("color_fires");
+        }
         if run_thermal_diffuse {
             self.thermal();          mark!("thermal");
         } else {
