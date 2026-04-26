@@ -2115,6 +2115,74 @@ fn cell_physics(c: Cell) -> PhysicsProfile {
     }
 }
 
+// ============================================================================
+// GPU SIMULATION RESOURCES
+//
+// Holds the textures, render targets, and materials needed to dispatch
+// physics passes (pressure today, thermal next) on the GPU. Created once
+// from `run_game` after the macroquad context is alive, then passed into
+// `World::step_gpu` each frame.
+//
+// Encoding convention for signed i16 sim fields packed into RGBA8 textures:
+//   R = low byte, G = high byte, B/A unused.
+//   Values are bit-cast u16↔i16 (two's-complement preserved).
+// ============================================================================
+pub struct GpuPressureCtx {
+    /// Per-frame scratch image — CPU writes packed pressure here, then
+    /// uploads to `rt_a.texture` to seed iteration 0.
+    input_image: Image,
+    /// Per-frame scratch image — CPU writes packed permeability bytes
+    /// here from `pressure_perm_cache` and uploads each frame (cells
+    /// transmute, so permeability is not constant).
+    perm_image: Image,
+    perm_tex: Texture2D,
+    /// Ping-pong render targets. Iteration 0 reads input → writes rt_a;
+    /// iteration 1 reads rt_a → writes rt_b; iteration 2 reads rt_b →
+    /// writes rt_a; … For ITERS=6, the final result lands in rt_b.
+    rt_a: RenderTarget,
+    rt_b: RenderTarget,
+    /// Diffusion fragment shader pipeline.
+    material: Material,
+}
+
+impl GpuPressureCtx {
+    pub fn new() -> Self {
+        let input_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+        let perm_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+        let perm_tex = Texture2D::from_image(&perm_image);
+        perm_tex.set_filter(FilterMode::Nearest);
+        let rt_a = render_target(W as u32, H as u32);
+        rt_a.texture.set_filter(FilterMode::Nearest);
+        let rt_b = render_target(W as u32, H as u32);
+        rt_b.texture.set_filter(FilterMode::Nearest);
+        let material = match load_material(
+            ShaderSource::Glsl {
+                vertex: VERTEX_SHADER,
+                fragment: PRESSURE_DIFFUSION_FRAGMENT,
+            },
+            MaterialParams {
+                uniforms: vec![UniformDesc::new("TexelSize", UniformType::Float2)],
+                textures: vec!["PermTex".to_string()],
+                ..Default::default()
+            },
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("FATAL: pressure diffusion shader compile failed: {:?}", e);
+                std::process::exit(1);
+            }
+        };
+        GpuPressureCtx {
+            input_image,
+            perm_image,
+            perm_tex,
+            rt_a,
+            rt_b,
+            material,
+        }
+    }
+}
+
 fn atom_category_color(cat: AtomCategory) -> (u8, u8, u8) {
     match cat {
         Hydrogen        => (230, 220, 160),
@@ -4642,6 +4710,151 @@ impl World {
         // through gas motion (cells carry their pressure with them as they
         // swap). A sealed container holds its pressure indefinitely; an
         // open region's pressure dilutes as gas spreads out.
+    }
+
+    /// GPU-dispatched pressure diffusion. Same numeric model as the CPU
+    /// `pressure()` (6 iterations of 4-neighbor flux at DIFF_SCALE=2048),
+    /// but the inner loop runs as a fragment shader on render-target
+    /// textures. Pressure values are packed as signed-i16 in the RG bytes
+    /// of an RGBA8 texture; permeability rides along in a sibling R8
+    /// texture. After the iterations complete, the final render target's
+    /// pixels are read back into `cells[i].pressure` so downstream CPU
+    /// passes (motion, etc.) see the freshly-diffused field.
+    ///
+    /// Tests use the CPU `pressure()` as the reference implementation;
+    /// production (`step_gpu`) calls this method.
+    pub fn pressure_gpu(&mut self, ctx: &mut GpuPressureCtx) {
+        const ITERS: usize = 6;
+        // Refresh the permeability cache (same as the CPU path) so the
+        // GPU sees the same per-cell permeability values.
+        if self.pressure_perm_cache.len() != W * H {
+            self.pressure_perm_cache.resize(W * H, 0);
+        }
+        for (i, c) in self.cells.iter().enumerate() {
+            self.pressure_perm_cache[i] = c.el.pressure_p().permeability;
+        }
+        // Pack cell.pressure as bit-cast u16 in (R, G) bytes; perm in R.
+        for (i, c) in self.cells.iter().enumerate() {
+            let unsigned = c.pressure as u16;
+            let lo = (unsigned & 0xff) as u8;
+            let hi = ((unsigned >> 8) & 0xff) as u8;
+            ctx.input_image.bytes[i * 4]     = lo;
+            ctx.input_image.bytes[i * 4 + 1] = hi;
+            ctx.input_image.bytes[i * 4 + 2] = 0;
+            ctx.input_image.bytes[i * 4 + 3] = 255;
+            ctx.perm_image.bytes[i * 4]     = self.pressure_perm_cache[i];
+            ctx.perm_image.bytes[i * 4 + 1] = 0;
+            ctx.perm_image.bytes[i * 4 + 2] = 0;
+            ctx.perm_image.bytes[i * 4 + 3] = 255;
+        }
+        // Seed iteration 0's input by uploading into rt_a.texture.
+        ctx.rt_a.texture.update(&ctx.input_image);
+        ctx.perm_tex.update(&ctx.perm_image);
+
+        let texel = vec2(1.0 / W as f32, 1.0 / H as f32);
+        // Ping-pong: iter 0 reads rt_a → writes rt_b; iter 1 reads rt_b
+        // → writes rt_a; … For ITERS=6, the final result lands in rt_b
+        // (even-indexed write targets are rt_b; index parity = iter % 2).
+        for iter in 0..ITERS {
+            let (input_tex, output_rt) = if iter % 2 == 0 {
+                (ctx.rt_a.texture.clone(), &ctx.rt_b)
+            } else {
+                (ctx.rt_b.texture.clone(), &ctx.rt_a)
+            };
+            set_camera(&Camera2D {
+                zoom: vec2(2.0 / W as f32, 2.0 / H as f32),
+                target: vec2(W as f32 / 2.0, H as f32 / 2.0),
+                render_target: Some(output_rt.clone()),
+                ..Default::default()
+            });
+            clear_background(BLACK);
+            ctx.material.set_texture("PermTex", ctx.perm_tex.clone());
+            ctx.material.set_uniform("TexelSize", texel);
+            gl_use_material(&ctx.material);
+            draw_texture_ex(
+                &input_tex, 0.0, 0.0, WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(W as f32, H as f32)),
+                    ..Default::default()
+                },
+            );
+            gl_use_default_material();
+        }
+        set_default_camera();
+
+        // Readback: ITERS=6 → final result is in rt_b.
+        let result = ctx.rt_b.texture.get_texture_data();
+        for (i, c) in self.cells.iter_mut().enumerate() {
+            let lo = result.bytes[i * 4]     as u16;
+            let hi = result.bytes[i * 4 + 1] as u16;
+            let unsigned = (hi << 8) | lo;
+            c.pressure = unsigned as i16;
+        }
+    }
+
+    /// Production step: same physics passes as `step()`, but uses the GPU
+    /// pressure diffusion via `pressure_gpu`. Tests use `step()` (which
+    /// runs CPU pressure) as the reference; the rendering loop calls
+    /// `step_gpu` for performance.
+    pub fn step_gpu(&mut self, wind: Vec2, ctx: &mut GpuPressureCtx) {
+        self.frame = self.frame.wrapping_add(1);
+        let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
+        let mut tt = std::time::Instant::now();
+        macro_rules! mark {
+            ($name:expr) => {{
+                prof.push(($name, tt.elapsed().as_micros() as u64));
+                tt = std::time::Instant::now();
+            }};
+        }
+        for c in self.cells.iter_mut() { c.flag &= !Cell::FLAG_UPDATED; }
+        mark!("clear_flags");
+        if wind.length_squared() > 0.0001 {
+            self.compute_wind_exposure();
+        }
+        mark!("wind");
+        self.compute_energized();    mark!("energized");
+        self.joule_heating();        mark!("joule");
+        self.electrolysis();         mark!("electrolysis");
+        self.decay();                mark!("decay");
+        self.tree_support_check();   mark!("tree_support");
+        self.thermite();             mark!("thermite");
+        self.magnesium_burn();       mark!("mg_burn");
+        self.glass_etching();        mark!("glass_etch");
+        self.halogen_displacement(); mark!("halogen_disp");
+        self.hg_amalgamation();      mark!("hg_amalg");
+        self.flame_test_emission();  mark!("flame_emit");
+        self.color_fires();          mark!("color_fires");
+        self.thermal();              mark!("thermal");
+        self.chemical_reactions();   mark!("chem_reactions");
+        self.acid_displacement();    mark!("acid_disp");
+        self.alloy_acid_leach();     mark!("alloy_leach");
+        self.base_neutralization();  mark!("base_neutral");
+        self.alloy_formation();      mark!("alloy_form");
+        self.dissolve();             mark!("dissolve");
+        self.diffuse_solute();       mark!("diffuse_solute");
+        self.reactions();            mark!("reactions");
+        for y in (0..H as i32).rev() {
+            let lr = self.frame % 2 == 0;
+            for i in 0..W as i32 {
+                let x = if lr { i } else { W as i32 - 1 - i };
+                self.update_cell(x, y, wind);
+            }
+        }
+        mark!("update_cells");
+        self.pressure_sources();     mark!("pressure_src");
+        self.pressure_gpu(ctx);      mark!("pressure_gpu");
+        self.tick_shockwaves();      mark!("shockwaves");
+        self.snapshot();             mark!("snapshot");
+        let _ = tt;
+        if self.frame % 60 == 0 {
+            let total: u64 = prof.iter().map(|(_, t)| t).sum();
+            let mut sorted = prof.clone();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = sorted.iter().take(8)
+                .map(|(n, t)| format!("{}={:.1}ms", n, *t as f32 / 1000.0))
+                .collect();
+            eprintln!("[step] total={:.1}ms | {}", total as f32 / 1000.0, top.join(" "));
+        }
     }
 
     // Chemistry pass. Scans every cell + cardinal neighbor for electron-
@@ -8067,6 +8280,93 @@ void main() {
     gl_FragColor = vec4(v.rgb * amped, 1.0);
 }"#;
 
+// Pressure diffusion — runs one explicit-Euler iteration of the same
+// 4-neighbor flux model the CPU `pressure()` uses. Pressure values
+// are signed i16 packed into RG bytes (R = low, G = high; signedness
+// preserved by treating the unpacked u16 as two's-complement 16-bit).
+// Permeability is sampled as a single u8 in the R channel of PermTex.
+//
+// Boundary conditions match the CPU reference:
+//   * Horizontal out-of-bounds (uv.x < 0 or > 1) acts as open atmosphere
+//     (P=0, perm=255). Pressure leaks out the sides.
+//   * Vertical out-of-bounds (uv.y < 0 or > 1) is sealed — that
+//     neighbor contributes nothing.
+//   * Wall cells (perm == 0) keep their current pressure unchanged.
+//
+// `precision highp float` is required to faithfully encode 16-bit
+// integer values via floats — mediump may quantize and lose precision.
+const PRESSURE_DIFFUSION_FRAGMENT: &str = r#"#version 100
+precision highp float;
+varying lowp vec2 uv;
+uniform sampler2D PressureTex;
+uniform sampler2D PermTex;
+uniform vec2 TexelSize;
+
+float decode_p(vec2 uv_p) {
+    vec4 t = texture2D(PressureTex, uv_p);
+    float val = floor(t.r * 255.0 + 0.5) + floor(t.g * 255.0 + 0.5) * 256.0;
+    if (val >= 32768.0) val -= 65536.0;
+    return val;
+}
+
+float decode_perm(vec2 uv_p) {
+    return floor(texture2D(PermTex, uv_p).r * 255.0 + 0.5);
+}
+
+vec4 encode_p(float val) {
+    float v = val;
+    if (v < 0.0) v += 65536.0;
+    v = clamp(v, 0.0, 65535.0);
+    float hi = floor(v / 256.0);
+    float lo = floor(v - hi * 256.0);
+    return vec4(lo / 255.0, hi / 255.0, 0.0, 1.0);
+}
+
+void main() {
+    float me_perm = decode_perm(uv);
+    float me_p = decode_p(uv);
+    if (me_perm < 0.5) {
+        gl_FragColor = encode_p(me_p);
+        return;
+    }
+    float new_p = me_p;
+    // LEFT
+    {
+        vec2 nuv = uv + vec2(-TexelSize.x, 0.0);
+        float n_p, n_perm;
+        if (nuv.x < 0.0) { n_p = 0.0; n_perm = 255.0; }
+        else { n_p = decode_p(nuv); n_perm = decode_perm(nuv); }
+        float min_perm = min(me_perm, n_perm);
+        if (min_perm > 0.0) new_p += (n_p - me_p) * min_perm / 2048.0;
+    }
+    // RIGHT
+    {
+        vec2 nuv = uv + vec2(TexelSize.x, 0.0);
+        float n_p, n_perm;
+        if (nuv.x > 1.0) { n_p = 0.0; n_perm = 255.0; }
+        else { n_p = decode_p(nuv); n_perm = decode_perm(nuv); }
+        float min_perm = min(me_perm, n_perm);
+        if (min_perm > 0.0) new_p += (n_p - me_p) * min_perm / 2048.0;
+    }
+    // UP — sealed at top boundary
+    if (uv.y - TexelSize.y >= 0.0) {
+        vec2 nuv = uv + vec2(0.0, -TexelSize.y);
+        float n_p = decode_p(nuv);
+        float n_perm = decode_perm(nuv);
+        float min_perm = min(me_perm, n_perm);
+        if (min_perm > 0.0) new_p += (n_p - me_p) * min_perm / 2048.0;
+    }
+    // DOWN — sealed at bottom boundary
+    if (uv.y + TexelSize.y <= 1.0) {
+        vec2 nuv = uv + vec2(0.0, TexelSize.y);
+        float n_p = decode_p(nuv);
+        float n_perm = decode_perm(nuv);
+        float min_perm = min(me_perm, n_perm);
+        if (min_perm > 0.0) new_p += (n_p - me_p) * min_perm / 2048.0;
+    }
+    gl_FragColor = encode_p(new_p);
+}"#;
+
 pub async fn run_game() {
     init_ui_font();
     let mut world = World::new();
@@ -8190,6 +8490,14 @@ pub async fn run_game() {
         }
     };
     let mut gas_seed_image = gas_seed_image;
+
+    // GPU pressure scaffolding (currently unused — kept as reference).
+    // The fragment-shader-based GPU pressure proved slower than the
+    // CPU SoA implementation in this stack because of sync glReadPixels
+    // overhead and per-iteration framebuffer-bind state changes. The
+    // proper fix is moving to wgpu with real compute shaders + storage
+    // buffers + async readback (see v0.3 migration branch).
+    let _gpu_pressure_ctx = GpuPressureCtx::new();
 
     let mut selected: Element = Element::Sand;
     // derived_id sidecar: non-zero only when `selected == Element::Derived`,

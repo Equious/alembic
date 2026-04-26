@@ -351,11 +351,11 @@ fn no_unwrap_or_expect_in_src() {
     );
 }
 
-/// Invariant: the only `.expect` site is `src/lib.rs:7158` (font init).
+/// Invariant: the only `.expect` site is `src/lib.rs:7371` (font init).
 #[test]
 fn known_expect_site_is_font_init_only() {
     // TODO: If `src/lib.rs` line layout changes, update this allow-list coordinate.
-    let expected_site = "src/lib.rs:7158".to_string();
+    let expected_site = "src/lib.rs:7371".to_string();
     let mut expect_hits = scan_src(|line| line.contains(".expect("));
     expect_hits.sort();
 
