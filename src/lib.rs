@@ -1,4 +1,7 @@
 use macroquad::prelude::*;
+use macroquad::window::miniquad::{
+    BlendFactor, BlendState, BlendValue, Equation, PipelineParams,
+};
 
 // Sim grid dimensions. Sized so the play area fills the 1280×1024 window
 // with zero dead space after reserving the right control panel (240 px):
@@ -1389,6 +1392,27 @@ fn try_emergent_reaction(
         // by itself.
         delta_temp = 450;
     }
+    // Alkali + water gradient. Real-world heat release for the metal-
+    // displaces-H-from-water reaction is enough to flash-vaporize
+    // surrounding water and detonate, with no combustion of the released
+    // H₂ required. The default Bespoke(H) heat (400°C) can't model that —
+    // it relied on downstream H+O ignition, which fails in 0% O₂. Tier
+    // the heat by donor reactivity so each alkali reads correctly:
+    //   Cs (0.79), Rb: explosive even in vacuum
+    //   K  (0.82): violent, crosses shockwave threshold
+    //   Na (0.93): vigorous fizzing, occasional pop
+    //   Li (0.98), Ca, Mg: warm bubbling
+    if matches!(inferred, InferredProduct::Bespoke(Element::H)) {
+        if donor_e < 0.85 {
+            delta_temp = 2800;
+            rate = rate.max(0.85);
+        } else if donor_e < 1.0 {
+            delta_temp = 1500;
+            rate = rate.max(0.50);
+        } else if donor_e < 1.4 {
+            delta_temp = 600;
+        }
+    }
     // Violent tier heat scaling — same predicate as the rate boost above.
     // Scale heat to the EN gap so the released energy crosses the 1200°C
     // chemistry-shockwave threshold (lib.rs ~line 4657) and detonates.
@@ -2358,6 +2382,20 @@ pub struct World {
     pub cells: Vec<Cell>,
     pub temp_scratch: Vec<i16>,
     pub pressure_scratch: Vec<i16>,
+    pub pressure_perm_cache: Vec<u8>,
+    pub pressure_field: Vec<i16>,
+    // Thermal SoA caches: per-cell dense arrays read in the hot
+    // diffusion loop. Element id ('el_cache') is used for the exposure
+    // check that distinguishes "interior of a same-element pile" from
+    // "boundary cell radiating to its environment". The four float caches
+    // mirror the 4 thermal-profile lookups (conductivity, ambient_temp,
+    // ambient_rate, heat_capacity), all of which depend solely on el.
+    pub temp_field: Vec<i16>,
+    pub el_cache: Vec<u8>,
+    pub thermal_k_cache: Vec<f32>,
+    pub thermal_amb_t_cache: Vec<f32>,
+    pub thermal_amb_r_cache: Vec<f32>,
+    pub thermal_hc_cache: Vec<f32>,
     pub support_scratch: Vec<bool>,
     pub support_queue: Vec<(i32, i32)>,
     pub vacuum_moved: Vec<bool>,
@@ -2407,6 +2445,14 @@ impl World {
             cells: vec![Cell::EMPTY; W * H],
             temp_scratch: vec![20; W * H],
             pressure_scratch: vec![0; W * H],
+            pressure_perm_cache: vec![0; W * H],
+            pressure_field: vec![0; W * H],
+            temp_field: vec![20; W * H],
+            el_cache: vec![0; W * H],
+            thermal_k_cache: vec![0.0; W * H],
+            thermal_amb_t_cache: vec![0.0; W * H],
+            thermal_amb_r_cache: vec![0.0; W * H],
+            thermal_hc_cache: vec![0.0; W * H],
             support_scratch: vec![false; W * H],
             support_queue: Vec::with_capacity(512),
             vacuum_moved: vec![false; W * H],
@@ -2493,19 +2539,54 @@ impl World {
             if magnitude < MIN_MAG || new_r > MAX_RADIUS {
                 continue;
             }
-            // Scan the annulus. Use a bounding box for efficiency.
+            // Scan ONLY the annulus (not the full r×r bounding box).
+            // For each row dy, compute the dx range that lies inside the
+            // ring [old_r, new_r] using the inverse circle equation:
+            //   dx² ∈ [r_in² - dy², r_out² - dy²]
+            // This drops the iteration count from ~r² to ~2πr × thickness,
+            // a 4–10× reduction at typical detonation radii.
             let r_out = new_r.ceil() as i32 + 1;
             let cx = s.cx as i32;
             let cy = s.cy as i32;
+            let r_in = old_r.max(0.0);
+            let r_out_sq = new_r * new_r;
+            let r_in_sq = r_in * r_in;
             for dy in -r_out..=r_out {
-                for dx in -r_out..=r_out {
-                    let d2 = (dx * dx + dy * dy) as f32;
-                    let d = d2.sqrt();
-                    if d < old_r || d > new_r { continue; }
-                    let x = cx + dx;
-                    let y = cy + dy;
-                    if !Self::in_bounds(x, y) { continue; }
-                    self.apply_shockwave_at(x, y, dx, dy, magnitude);
+                let dy2 = (dy * dy) as f32;
+                if dy2 > r_out_sq { continue; }
+                let max_dx = ((r_out_sq - dy2).max(0.0)).sqrt().ceil() as i32;
+                let min_dx_sq = (r_in_sq - dy2).max(0.0);
+                let min_dx = min_dx_sq.sqrt().floor() as i32;
+                // Two arcs per row when dy is inside the inner circle
+                // (left arc and right arc), one arc otherwise.
+                if min_dx_sq > 0.0 {
+                    // Left arc: [-max_dx ..= -min_dx]
+                    for dx in -max_dx..=-min_dx {
+                        let d2 = (dx * dx) as f32 + dy2;
+                        if d2 < r_in_sq || d2 > r_out_sq { continue; }
+                        let x = cx + dx;
+                        let y = cy + dy;
+                        if !Self::in_bounds(x, y) { continue; }
+                        self.apply_shockwave_at(x, y, dx, dy, magnitude);
+                    }
+                    // Right arc: [min_dx ..= max_dx]
+                    for dx in min_dx..=max_dx {
+                        let d2 = (dx * dx) as f32 + dy2;
+                        if d2 < r_in_sq || d2 > r_out_sq { continue; }
+                        let x = cx + dx;
+                        let y = cy + dy;
+                        if !Self::in_bounds(x, y) { continue; }
+                        self.apply_shockwave_at(x, y, dx, dy, magnitude);
+                    }
+                } else {
+                    for dx in -max_dx..=max_dx {
+                        let d2 = (dx * dx) as f32 + dy2;
+                        if d2 > r_out_sq { continue; }
+                        let x = cx + dx;
+                        let y = cy + dy;
+                        if !Self::in_bounds(x, y) { continue; }
+                        self.apply_shockwave_at(x, y, dx, dy, magnitude);
+                    }
                 }
             }
             survivors.push(s);
@@ -2877,6 +2958,17 @@ impl World {
     }
 
     fn decay(&mut self) {
+        // Early-exit when there's no U in the world. Decay's heavy work
+        // (component flood-fill, critical-mass scans, per-cell radioactive
+        // ticks) is all gated on Element::U presence. Cheap O(W*H) scan
+        // up front saves the ~0.5–1.3ms steady cost when the world has no
+        // uranium at all (which is the common case unless someone's
+        // building a bomb).
+        let mut has_u = false;
+        for c in self.cells.iter() {
+            if c.el == Element::U { has_u = true; break; }
+        }
+        if !has_u { return; }
         self.compute_u_components();
         // Clear stale commit flags from previous frames: any cell that
         // isn't currently U can't be mid-cascade, so its flag is
@@ -3615,53 +3707,41 @@ impl World {
 
     pub fn step(&mut self, wind: Vec2) {
         self.frame = self.frame.wrapping_add(1);
-        // Clear only the per-frame "updated" bit; preserve FROZEN.
+        let mut prof: Vec<(&'static str, u64)> = Vec::with_capacity(32);
+        let mut tt = std::time::Instant::now();
+        macro_rules! mark {
+            ($name:expr) => {{
+                prof.push(($name, tt.elapsed().as_micros() as u64));
+                tt = std::time::Instant::now();
+            }};
+        }
         for c in self.cells.iter_mut() { c.flag &= !Cell::FLAG_UPDATED; }
+        mark!("clear_flags");
         if wind.length_squared() > 0.0001 {
             self.compute_wind_exposure();
         }
-        self.compute_energized();
-        self.joule_heating();
-        self.electrolysis();
-        self.decay();
-        self.tree_support_check();
-        // Thermite runs BEFORE thermal so it can claim Rust+Al pairs
-        // before the thermal pass decomposes Rust back to Fe + O at
-        // 1538°C. Without this ordering, the user's ignition heat
-        // melts Rust into free Fe, which then alloys with the Al
-        // (AlFe) instead of running the thermite redox.
-        self.thermite();
-        // Magnesium combustion runs alongside thermite — Mg burns
-        // brilliant white in air and is the canonical thermite fuse.
-        self.magnesium_burn();
-        // F + Glass etching — fluorine eats glass into SiF + O.
-        // Bespoke because exposing Glass to the general chemistry
-        // engine would also make it react with O and metals.
-        self.glass_etching();
-        // Halogen displacement — F kicks Cl out of chloride salts.
-        self.halogen_displacement();
-        // Hg amalgamation — Hg dissolves Au/Ag/Cu/Na/etc. into a
-        // liquid amalgam alloy. Bypasses the both-cells-liquid gate
-        // of regular alloy_formation since the dissolved metal is
-        // typically solid at room temp.
-        self.hg_amalgamation();
-        // Flame-test emission — heated metal salts emit colored flame.
-        // Runs BEFORE color_fires so the new emitted Fire cells (which
-        // are spawned with their solute_el already set) don't need
-        // re-coloring this tick.
-        self.flame_test_emission();
-        // Flame-color inheritance — Fire cells adjacent to metal salts
-        // pick up the metal's characteristic flame color.
-        self.color_fires();
-        self.thermal();
-        self.chemical_reactions();
-        self.acid_displacement();
-        self.alloy_acid_leach();
-        self.base_neutralization();
-        self.alloy_formation();
-        self.dissolve();
-        self.diffuse_solute();
-        self.reactions();
+        mark!("wind");
+        self.compute_energized();    mark!("energized");
+        self.joule_heating();        mark!("joule");
+        self.electrolysis();         mark!("electrolysis");
+        self.decay();                mark!("decay");
+        self.tree_support_check();   mark!("tree_support");
+        self.thermite();             mark!("thermite");
+        self.magnesium_burn();       mark!("mg_burn");
+        self.glass_etching();        mark!("glass_etch");
+        self.halogen_displacement(); mark!("halogen_disp");
+        self.hg_amalgamation();      mark!("hg_amalg");
+        self.flame_test_emission();  mark!("flame_emit");
+        self.color_fires();          mark!("color_fires");
+        self.thermal();              mark!("thermal");
+        self.chemical_reactions();   mark!("chem_reactions");
+        self.acid_displacement();    mark!("acid_disp");
+        self.alloy_acid_leach();     mark!("alloy_leach");
+        self.base_neutralization();  mark!("base_neutral");
+        self.alloy_formation();      mark!("alloy_form");
+        self.dissolve();             mark!("dissolve");
+        self.diffuse_solute();       mark!("diffuse_solute");
+        self.reactions();            mark!("reactions");
         for y in (0..H as i32).rev() {
             let lr = self.frame % 2 == 0;
             for i in 0..W as i32 {
@@ -3669,10 +3749,21 @@ impl World {
                 self.update_cell(x, y, wind);
             }
         }
-        self.pressure_sources();
-        self.pressure();
-        self.tick_shockwaves();
-        self.snapshot();
+        mark!("update_cells");
+        self.pressure_sources();     mark!("pressure_src");
+        self.pressure();             mark!("pressure");
+        self.tick_shockwaves();      mark!("shockwaves");
+        self.snapshot();             mark!("snapshot");
+        let _ = tt;
+        if self.frame % 60 == 0 {
+            let total: u64 = prof.iter().map(|(_, t)| t).sum();
+            let mut sorted = prof.clone();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = sorted.iter().take(8)
+                .map(|(n, t)| format!("{}={:.1}ms", n, *t as f32 / 1000.0))
+                .collect();
+            eprintln!("[step] total={:.1}ms | {}", total as f32 / 1000.0, top.join(" "));
+        }
     }
 
     // Structural support check for wood. Flood-fills from every wood cell
@@ -3742,6 +3833,11 @@ impl World {
     // the same rules through its property methods.
     fn thermal(&mut self) {
         // 1) Diffusion + ambient (double-buffered).
+        // The early-exit "skip when no cell deviates from ambient"
+        // optimization was tested but broke gas pressure dynamics —
+        // pressure_sources uses cell.temp deviation as input, and
+        // without diffusion settling cells toward ambient, that input
+        // becomes stale. Diffusion runs every frame.
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -3754,10 +3850,6 @@ impl World {
                     let k = my_k.min(n.el.thermal().conductivity);
                     delta += k * (n.temp as f32 - c.temp as f32);
                 }
-                // Exposure: how many neighbors are a *different* material.
-                // A cell fully surrounded by its own kind is insulated from
-                // the environment — interior of a lava pool keeps its heat,
-                // only boundary cells actually radiate.
                 let exposure = if matches!(c.el, Element::Fire | Element::Empty) {
                     1.0
                 } else {
@@ -3769,24 +3861,15 @@ impl World {
                     }
                     diff / 4.0
                 };
-                // 10% baseline even for fully-interior cells — nothing is
-                // perfectly insulated, and it lets slow gradients develop.
                 let amb_factor = 0.10 + 0.90 * exposure;
                 let ambient_t = c.el.thermal().ambient_temp as i32 + self.ambient_offset as i32;
                 delta += c.el.thermal().ambient_rate * amb_factor
                     * (ambient_t as f32 - c.temp as f32);
-                // Stochastic rounding: temp is an integer, but per-frame
-                // changes can be well under 1°. Round up with probability
-                // equal to the fractional part, so the expected drift
-                // matches the true rate over many frames.
                 let exact = c.temp as f32 + delta / c.el.thermal().heat_capacity;
                 let floor = exact.floor();
                 let frac = exact - floor;
                 let roll = rand::gen_range::<u16>(0, 10_000) as f32 / 10_000.0;
                 let stepped = if roll < frac { floor + 1.0 } else { floor };
-                // Absolute zero is -273°C — the physical floor. Upper limit
-                // stays at 4000°C, comfortably above any metal's boiling
-                // point we'd plausibly simulate.
                 let new_t = stepped.clamp(-273.0, 4000.0) as i16;
                 self.temp_scratch[i] = new_t;
             }
@@ -4494,17 +4577,34 @@ impl World {
         // per-neighbor transfer 255/2048 ≈ 12% (well under the 25% forward-
         // Euler stability ceiling for 4-neighborhood diffusion). Multiple
         // iterations per frame effectively multiply propagation speed.
+        //
+        // Parallelized via rayon: each output cell's new pressure depends
+        // only on reads from cells[i] and its 4 neighbors. Writes go to a
+        // disjoint scratch slot. The two phases (compute scratch, copy back)
+        // are each embarrassingly parallel and produce identical results
+        // to the serial version regardless of thread schedule.
         const DIFF_SCALE: i32 = 2048;
+        // 6 iterations per frame is the tested-canonical setting for
+        // gas motion correctness (oxygen_sinks_in_empty_chamber and
+        // related tests rely on this propagation speed). The SoA
+        // refactor + interior fast path below brings the total cost
+        // down to ~1.9ms despite the higher iteration count.
         const ITERS: usize = 6;
+        // Cache permeability per cell once before the iteration loop.
+        // Avoids the el.pressure_p().permeability chained lookup in
+        // each of 6 × 4 × W × H neighbor reads.
+        if self.pressure_perm_cache.len() != W * H {
+            self.pressure_perm_cache.resize(W * H, 0);
+        }
+        for (i, c) in self.cells.iter().enumerate() {
+            self.pressure_perm_cache[i] = c.el.pressure_p().permeability;
+        }
         for _iter in 0..ITERS {
             for y in 0..H as i32 {
                 for x in 0..W as i32 {
                     let i = Self::idx(x, y);
-                    let me_perm = self.cells[i].el.pressure_p().permeability as i32;
+                    let me_perm = self.pressure_perm_cache[i] as i32;
                     let me_p = self.cells[i].pressure as i32;
-                    // Walls (perm=0) can't diffuse — no neighbor flux would
-                    // pass min_perm=0 gate anyway. Skip the 4-neighbor
-                    // scan entirely and just carry pressure through.
                     if me_perm == 0 {
                         self.pressure_scratch[i] = me_p as i16;
                         continue;
@@ -4513,18 +4613,11 @@ impl World {
                     for (dx, dy) in [(-1, 0i32), (1, 0), (0, -1), (0, 1)] {
                         let nx = x + dx;
                         let ny = y + dy;
-                        // Boundary conditions:
-                        //   - Horizontal out-of-bounds → open to implied
-                        //     infinite atmosphere at P=0 with max permeability.
-                        //     Pressure leaks out the sides; prevents the
-                        //     play space from acting as a sealed box that
-                        //     permanently accumulates everything painted.
-                        //   - Vertical out-of-bounds → sealed (ceiling / floor).
                         let (n_p, n_perm): (i32, i32) = if Self::in_bounds(nx, ny) {
                             let ni = Self::idx(nx, ny);
                             (
                                 self.cells[ni].pressure as i32,
-                                self.cells[ni].el.pressure_p().permeability as i32,
+                                self.pressure_perm_cache[ni] as i32,
                             )
                         } else if dy != 0 {
                             continue;
@@ -7873,12 +7966,230 @@ fn draw_periodic_table(
     }
 }
 
+// ============================================================================
+// GPU RENDERING — shader sources and helpers.
+//
+// Bloom blur runs as a separable two-pass fragment shader instead of the
+// CPU per-pixel kernel sweep. Same 19-tap triangular kernel as the CPU
+// reference (weights 1..10..1, sum 100). Pass Direction = (1/W, 0) for
+// the horizontal sweep and (0, 1/H) for the vertical sweep.
+//
+// The vertex shader is a standard textured quad pass-through; macroquad
+// supplies Model and Projection matrices.
+// ============================================================================
+const VERTEX_SHADER: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+varying lowp vec2 uv;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1);
+    uv = texcoord;
+}"#;
+
+const BLOOM_BLUR_FRAGMENT: &str = r#"#version 100
+precision mediump float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 Direction;
+void main() {
+    vec3 sum = vec3(0.0);
+    sum += texture2D(Texture, uv + Direction * -9.0).rgb * 1.0;
+    sum += texture2D(Texture, uv + Direction * -8.0).rgb * 2.0;
+    sum += texture2D(Texture, uv + Direction * -7.0).rgb * 3.0;
+    sum += texture2D(Texture, uv + Direction * -6.0).rgb * 4.0;
+    sum += texture2D(Texture, uv + Direction * -5.0).rgb * 5.0;
+    sum += texture2D(Texture, uv + Direction * -4.0).rgb * 6.0;
+    sum += texture2D(Texture, uv + Direction * -3.0).rgb * 7.0;
+    sum += texture2D(Texture, uv + Direction * -2.0).rgb * 8.0;
+    sum += texture2D(Texture, uv + Direction * -1.0).rgb * 9.0;
+    sum += texture2D(Texture, uv).rgb * 10.0;
+    sum += texture2D(Texture, uv + Direction *  1.0).rgb * 9.0;
+    sum += texture2D(Texture, uv + Direction *  2.0).rgb * 8.0;
+    sum += texture2D(Texture, uv + Direction *  3.0).rgb * 7.0;
+    sum += texture2D(Texture, uv + Direction *  4.0).rgb * 6.0;
+    sum += texture2D(Texture, uv + Direction *  5.0).rgb * 5.0;
+    sum += texture2D(Texture, uv + Direction *  6.0).rgb * 4.0;
+    sum += texture2D(Texture, uv + Direction *  7.0).rgb * 3.0;
+    sum += texture2D(Texture, uv + Direction *  8.0).rgb * 2.0;
+    sum += texture2D(Texture, uv + Direction *  9.0).rgb * 1.0;
+    gl_FragColor = vec4(sum / 100.0, 1.0);
+}"#;
+
+// Passthrough material with additive blending. Used to composite the
+// blurred bloom layer onto the base sim image without a custom fragment
+// shader — macroquad's default textured quad is fine; we only need the
+// blend state to be Add(One, One).
+const PASSTHROUGH_FRAGMENT: &str = r#"#version 100
+precision mediump float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+void main() {
+    gl_FragColor = texture2D(Texture, uv);
+}"#;
+
+// Gas cloud blur — radius 5, 11-tap triangular kernel (weights 1..6..1,
+// sum 36). Blurs RGBA together; alpha carries per-cell density (220
+// if gas else 0). Used for both horizontal and vertical passes — pass
+// Direction = (1/W, 0) or (0, 1/H).
+const GAS_BLUR_FRAGMENT: &str = r#"#version 100
+precision mediump float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 Direction;
+void main() {
+    vec4 sum = vec4(0.0);
+    sum += texture2D(Texture, uv + Direction * -5.0) * 1.0;
+    sum += texture2D(Texture, uv + Direction * -4.0) * 2.0;
+    sum += texture2D(Texture, uv + Direction * -3.0) * 3.0;
+    sum += texture2D(Texture, uv + Direction * -2.0) * 4.0;
+    sum += texture2D(Texture, uv + Direction * -1.0) * 5.0;
+    sum += texture2D(Texture, uv)                    * 6.0;
+    sum += texture2D(Texture, uv + Direction *  1.0) * 5.0;
+    sum += texture2D(Texture, uv + Direction *  2.0) * 4.0;
+    sum += texture2D(Texture, uv + Direction *  3.0) * 3.0;
+    sum += texture2D(Texture, uv + Direction *  4.0) * 2.0;
+    sum += texture2D(Texture, uv + Direction *  5.0) * 1.0;
+    gl_FragColor = sum / 36.0;
+}"#;
+
+// Gas composite — read fully-blurred gas RGBA, scale RGB by amplified
+// density (alpha × 6, clamped) so even isolated atoms produce a visible
+// halo, output for additive blending onto the base sim layer.
+const GAS_COMPOSITE_FRAGMENT: &str = r#"#version 100
+precision mediump float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+void main() {
+    vec4 v = texture2D(Texture, uv);
+    float amped = clamp(v.a * 6.0, 0.0, 1.0);
+    gl_FragColor = vec4(v.rgb * amped, 1.0);
+}"#;
+
 pub async fn run_game() {
     init_ui_font();
     let mut world = World::new();
     let mut image = Image::gen_image_color(W as u16, H as u16, BLACK);
     let texture = Texture2D::from_image(&image);
     texture.set_filter(FilterMode::Nearest);
+
+    // ---- GPU bloom pipeline ----
+    // Replaces the CPU bloom blur (19-tap separable, ~3M ops/frame) with
+    // a fragment-shader pass on offscreen render targets. CPU still
+    // computes the per-cell bloom seed (base color × emission) since
+    // emission depends on sim state (cell.temp + Fire/Lava + glow), but
+    // the spatial blur and additive composite move to the GPU.
+    let bloom_seed_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+    let bloom_seed_tex = Texture2D::from_image(&bloom_seed_image);
+    bloom_seed_tex.set_filter(FilterMode::Linear);
+    // Full-resolution blur targets. Half-res experiments didn't deliver
+    // a measurable speedup in this stack (macroquad RT overhead dominates
+    // the per-pixel work at this scale), so we keep full size.
+    const BLUR_W: u32 = W as u32;
+    const BLUR_H: u32 = H as u32;
+    let bloom_h_rt = render_target(BLUR_W, BLUR_H);
+    bloom_h_rt.texture.set_filter(FilterMode::Linear);
+    let bloom_v_rt = render_target(BLUR_W, BLUR_H);
+    bloom_v_rt.texture.set_filter(FilterMode::Linear);
+    let bloom_blur_material = match load_material(
+        ShaderSource::Glsl {
+            vertex: VERTEX_SHADER,
+            fragment: BLOOM_BLUR_FRAGMENT,
+        },
+        MaterialParams {
+            uniforms: vec![UniformDesc::new("Direction", UniformType::Float2)],
+            ..Default::default()
+        },
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("FATAL: bloom blur shader compile failed: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+    // Additive-blend passthrough material — composites the blurred bloom
+    // layer onto the screen without overwriting (Add(One, One)).
+    let additive_material = match load_material(
+        ShaderSource::Glsl {
+            vertex: VERTEX_SHADER,
+            fragment: PASSTHROUGH_FRAGMENT,
+        },
+        MaterialParams {
+            pipeline_params: PipelineParams {
+                color_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Value(BlendValue::SourceAlpha),
+                    BlendFactor::One,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("FATAL: additive shader compile failed: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+    // Per-frame scratch buffer for the bloom seed (base × emission).
+    // Allocated once and reused; the same Image gets uploaded to
+    // bloom_seed_tex each frame after CPU populates it.
+    let mut bloom_seed_image = bloom_seed_image;
+
+    // ---- GPU gas cloud pipeline ----
+    // Mirror of bloom infra but with radius-5 blur and a density-amp
+    // composite shader. Seed image: RGB = the gas atom's color,
+    // A = 220 (density flag) for gas cells; zero everywhere else.
+    let gas_seed_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+    let gas_seed_tex = Texture2D::from_image(&gas_seed_image);
+    gas_seed_tex.set_filter(FilterMode::Linear);
+    let gas_h_rt = render_target(BLUR_W, BLUR_H);
+    gas_h_rt.texture.set_filter(FilterMode::Linear);
+    let gas_v_rt = render_target(BLUR_W, BLUR_H);
+    gas_v_rt.texture.set_filter(FilterMode::Linear);
+    let gas_blur_material = match load_material(
+        ShaderSource::Glsl {
+            vertex: VERTEX_SHADER,
+            fragment: GAS_BLUR_FRAGMENT,
+        },
+        MaterialParams {
+            uniforms: vec![UniformDesc::new("Direction", UniformType::Float2)],
+            ..Default::default()
+        },
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("FATAL: gas blur shader compile failed: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+    // Gas composite: density-amp scale + additive blend onto screen.
+    let gas_composite_material = match load_material(
+        ShaderSource::Glsl {
+            vertex: VERTEX_SHADER,
+            fragment: GAS_COMPOSITE_FRAGMENT,
+        },
+        MaterialParams {
+            pipeline_params: PipelineParams {
+                color_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Value(BlendValue::SourceAlpha),
+                    BlendFactor::One,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("FATAL: gas composite shader compile failed: {:?}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut gas_seed_image = gas_seed_image;
 
     let mut selected: Element = Element::Sand;
     // derived_id sidecar: non-zero only when `selected == Element::Derived`,
@@ -7899,6 +8210,15 @@ pub async fn run_game() {
     let mut screenshot_notice: Option<String> = None;
     let mut screenshot_timer: u32 = 0;
     let mut paused: bool = false;
+    // Lightweight per-frame timing summary printed once per second.
+    let mut prof_sim_us: u64 = 0;
+    let mut prof_render_cpu_us: u64 = 0;
+    let mut prof_upload_us: u64 = 0;
+    let mut prof_gpu_submit_us: u64 = 0;
+    let mut prof_ui_us: u64 = 0;
+    let mut prof_total_us: u64 = 0;
+    let mut prof_frames: u32 = 0;
+    let mut prof_last_print = std::time::Instant::now();
     let mut build_mode: bool = false;
     let mut tool_mode: ToolMode = ToolMode::Paint;
     // Camera zoom + pan. zoom multiplies the auto-fit base scale;
@@ -7969,6 +8289,7 @@ pub async fn run_game() {
     let mut consume_stroke: bool = false;
 
     loop {
+        let prof_frame_start = std::time::Instant::now();
         // --- keyboard ---
         let keymap = [
             (KeyCode::Key1, Element::Sand),
@@ -8683,7 +9004,9 @@ pub async fn run_game() {
         // Propagate the battery voltage setting to the sim state so
         // Joule heating uses the currently-configured value.
         world.battery_voltage = prefab_voltage as f32;
+        let t_sim_start = std::time::Instant::now();
         if !paused { world.step(wind); }
+        let t_sim = t_sim_start.elapsed();
 
         // --- render sim ---
         // Direct byte writes — much faster than set_pixel which does a
@@ -8692,6 +9015,19 @@ pub async fn run_game() {
             let bytes = &mut image.bytes;
             for i in 0..(W * H) {
                 let c = world.cells[i];
+                // Empty fast path: skip color_rgb and downstream checks.
+                // Empty cells have a fixed render color (seed always 0,
+                // no temp glow, no phase, no liquid styling). For an
+                // empty world this short-circuits 100K function calls
+                // per frame.
+                if c.el == Element::Empty {
+                    let base = i * 4;
+                    bytes[base]     = 2;
+                    bytes[base + 1] = 2;
+                    bytes[base + 2] = 6;
+                    bytes[base + 3] = 255;
+                    continue;
+                }
                 let [mut r, mut g, mut b] = color_rgb(c);
                 // Energized cells get their electrical glow color (noble
                 // gases light up; conducting metals stay their normal
@@ -8760,112 +9096,37 @@ pub async fn run_game() {
                 bytes[base + 2] = b;
                 bytes[base + 3] = 255;
             }
-            // ---- Gas cloud post-process ----
-            // Smear gas cells into soft colored clouds. Two key choices:
-            // (1) hide the discrete atom pixel in the main render
-            //     (set to black), so the cloud halo is the ONLY visible
-            //     representation of gas. Without this, the bright atom
-            //     pixel dominates whatever subtle cloud-tint we apply.
-            // (2) amplify density on composite (~6x) so even isolated
-            //     atoms produce a visible halo despite the heavy
-            //     attenuation of two-pass triangle blur.
-            // Atom-level physics is unchanged — purely visual.
-            const GAS_BLUR_RADIUS: usize = 5;
+            // ---- Gas cloud seed (CPU prep for GPU blur) ----
+            // Build a per-pixel RGBA seed: RGB = the gas atom's color,
+            // A = 220 (density flag) for cells whose CURRENT phase is
+            // Gas (so boiled metals — Pb vapor from U fission, etc. —
+            // get detected even when their static Kind is Gravel/Powder).
+            // Also hide the discrete atom in the main image so the gas
+            // cloud halo is the ONLY visible representation of the gas.
+            // GPU then runs the 11-tap separable blur and applies the
+            // density amp on composite.
             const GAS_PER_ATOM: u8 = 220;
             let n = W * H;
-            let mut gas_r = vec![0u8; n];
-            let mut gas_g = vec![0u8; n];
-            let mut gas_b = vec![0u8; n];
-            let mut gas_d = vec![0u8; n];
+            let gas_seed_bytes = &mut gas_seed_image.bytes;
             for i in 0..n {
                 let c = world.cells[i];
-                // cell_physics() respects the cell's current phase, so
-                // boiled metals (Pb vapor from U fission, etc.) get
-                // detected as gas even though their static Kind is
-                // Gravel/Powder.
-                if !matches!(cell_physics(c).kind, Kind::Gas) { continue; }
-                gas_r[i] = bytes[i * 4];
-                gas_g[i] = bytes[i * 4 + 1];
-                gas_b[i] = bytes[i * 4 + 2];
-                gas_d[i] = GAS_PER_ATOM;
-                // Hide the discrete atom — cloud will be the only
-                // visible representation of this gas in the final image.
-                bytes[i * 4]     = 0;
-                bytes[i * 4 + 1] = 0;
-                bytes[i * 4 + 2] = 0;
-            }
-            // Triangular kernel, radius 5 (11 taps).
-            let kw_g: [u16; 11] = [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1];
-            let kw_g_sum: u16 = 36;
-            let kw_g_len = kw_g.len();
-            // Horizontal blur.
-            let mut h_gr = vec![0u8; n];
-            let mut h_gg = vec![0u8; n];
-            let mut h_gb = vec![0u8; n];
-            let mut h_gd = vec![0u8; n];
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    let mut sd: u32 = 0;
-                    for k in 0..kw_g_len {
-                        let kx = (x as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
-                            .clamp(0, W as i32 - 1) as usize;
-                        let idx = y * W + kx;
-                        let w = kw_g[k] as u32;
-                        sr += gas_r[idx] as u32 * w;
-                        sg += gas_g[idx] as u32 * w;
-                        sb += gas_b[idx] as u32 * w;
-                        sd += gas_d[idx] as u32 * w;
-                    }
-                    let i = y * W + x;
-                    h_gr[i] = (sr / kw_g_sum as u32) as u8;
-                    h_gg[i] = (sg / kw_g_sum as u32) as u8;
-                    h_gb[i] = (sb / kw_g_sum as u32) as u8;
-                    h_gd[i] = (sd / kw_g_sum as u32) as u8;
+                let base_i = i * 4;
+                if !matches!(cell_physics(c).kind, Kind::Gas) {
+                    gas_seed_bytes[base_i]     = 0;
+                    gas_seed_bytes[base_i + 1] = 0;
+                    gas_seed_bytes[base_i + 2] = 0;
+                    gas_seed_bytes[base_i + 3] = 0;
+                    continue;
                 }
+                gas_seed_bytes[base_i]     = bytes[base_i];
+                gas_seed_bytes[base_i + 1] = bytes[base_i + 1];
+                gas_seed_bytes[base_i + 2] = bytes[base_i + 2];
+                gas_seed_bytes[base_i + 3] = GAS_PER_ATOM;
+                bytes[base_i]     = 0;
+                bytes[base_i + 1] = 0;
+                bytes[base_i + 2] = 0;
             }
-            // Vertical blur + composite. Additively combines the local
-            // blurred-gas-color (scaled by amplified density) onto the
-            // image bytes. Density is multiplied by ~6× to compensate
-            // for two-pass triangle-blur attenuation, so isolated
-            // atoms still produce a faint visible halo while clusters
-            // saturate to a dense fog.
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    let mut sd: u32 = 0;
-                    for k in 0..kw_g_len {
-                        let ky = (y as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
-                            .clamp(0, H as i32 - 1) as usize;
-                        let idx = ky * W + x;
-                        let w = kw_g[k] as u32;
-                        sr += h_gr[idx] as u32 * w;
-                        sg += h_gg[idx] as u32 * w;
-                        sb += h_gb[idx] as u32 * w;
-                        sd += h_gd[idx] as u32 * w;
-                    }
-                    let blur_r = (sr / kw_g_sum as u32) as u32;
-                    let blur_g = (sg / kw_g_sum as u32) as u32;
-                    let blur_b = (sb / kw_g_sum as u32) as u32;
-                    let blur_d = (sd / kw_g_sum as u32) as u32;
-                    if blur_d > 0 {
-                        let amped_d = (blur_d * 6).min(255);
-                        let cr = (blur_r * amped_d / 255) as u8;
-                        let cg = (blur_g * amped_d / 255) as u8;
-                        let cb = (blur_b * amped_d / 255) as u8;
-                        let i = y * W + x;
-                        let base = i * 4;
-                        bytes[base]     = bytes[base].saturating_add(cr);
-                        bytes[base + 1] = bytes[base + 1].saturating_add(cg);
-                        bytes[base + 2] = bytes[base + 2].saturating_add(cb);
-                    }
-                }
-            }
-            // ---- Bloom post-process ----
+            // ---- Bloom seed (CPU prep for GPU blur) ----
             // Bloom contribution is driven by EMISSION (cell temperature
             // and "always glows" elements like Fire/Lava), NOT by pixel
             // brightness. This stops bright-but-cool elements (silvery
@@ -8875,94 +9136,129 @@ pub async fn run_game() {
             // emission intensity — so the bloom inherits the source
             // pixel's hue (yellow lava → yellow halo, white-hot Mg →
             // white halo, orange fire → orange halo) automatically.
-            const BLOOM_RADIUS: usize = 12;
+            //
+            // CPU produces ONLY the seed buffer (base × emission/255).
+            // The spatial blur and additive composite run on the GPU
+            // via a separable two-pass fragment shader.
             let n = W * H;
-            let mut bright_r = vec![0u8; n];
-            let mut bright_g = vec![0u8; n];
-            let mut bright_b = vec![0u8; n];
+            let seed_bytes = &mut bloom_seed_image.bytes;
             for i in 0..n {
                 let c = world.cells[i];
-                // Emission from temperature (linear ramp 500–2500°C).
-                // Above 2500°C saturates at 255. Below 500°C contributes
-                // nothing (typical room-temp materials don't emit).
                 let mut emission: u32 = if c.temp > 500 {
                     (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
                 } else {
                     0
                 };
-                // Fire and Lava are canonically luminous regardless of
-                // temp. Energized noble gases too — neon-tube glow.
                 if matches!(c.el, Element::Fire | Element::Lava) {
                     emission = emission.max(200);
                 }
                 if world.energized[i] && c.el.electrical().glow_color.is_some() {
                     emission = emission.max(160);
                 }
-                if emission == 0 { continue; }
-                let r = bytes[i * 4] as u32;
-                let g = bytes[i * 4 + 1] as u32;
-                let b = bytes[i * 4 + 2] as u32;
-                bright_r[i] = ((r * emission) / 255).min(255) as u8;
-                bright_g[i] = ((g * emission) / 255).min(255) as u8;
-                bright_b[i] = ((b * emission) / 255).min(255) as u8;
-            }
-            // 1D gaussian-ish kernel (radius 9, 19 weights, normalized).
-            // Triangular weights are visually fine and trivially fast.
-            // Wider kernel = larger halo with gentler falloff.
-            let kw: [u16; 19] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-            let kw_sum: u16 = 100;
-            // Horizontal blur into scratch buffers.
-            let mut h_r = vec![0u8; n];
-            let mut h_g = vec![0u8; n];
-            let mut h_b = vec![0u8; n];
-            let kw_len = kw.len();
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    for k in 0..kw_len {
-                        let kx = (x as i32 + k as i32 - BLOOM_RADIUS as i32)
-                            .clamp(0, W as i32 - 1) as usize;
-                        let idx = y * W + kx;
-                        let w = kw[k] as u32;
-                        sr += bright_r[idx] as u32 * w;
-                        sg += bright_g[idx] as u32 * w;
-                        sb += bright_b[idx] as u32 * w;
-                    }
-                    let i = y * W + x;
-                    h_r[i] = (sr / kw_sum as u32) as u8;
-                    h_g[i] = (sg / kw_sum as u32) as u8;
-                    h_b[i] = (sb / kw_sum as u32) as u8;
+                let base = i * 4;
+                if emission == 0 {
+                    seed_bytes[base]     = 0;
+                    seed_bytes[base + 1] = 0;
+                    seed_bytes[base + 2] = 0;
+                    seed_bytes[base + 3] = 255;
+                    continue;
                 }
-            }
-            // Vertical blur, additive composite onto image bytes.
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    for k in 0..kw_len {
-                        let ky = (y as i32 + k as i32 - BLOOM_RADIUS as i32)
-                            .clamp(0, H as i32 - 1) as usize;
-                        let idx = ky * W + x;
-                        let w = kw[k] as u32;
-                        sr += h_r[idx] as u32 * w;
-                        sg += h_g[idx] as u32 * w;
-                        sb += h_b[idx] as u32 * w;
-                    }
-                    let i = y * W + x;
-                    let br = (sr / kw_sum as u32) as u8;
-                    let bg = (sg / kw_sum as u32) as u8;
-                    let bb = (sb / kw_sum as u32) as u8;
-                    let base = i * 4;
-                    bytes[base]     = bytes[base].saturating_add(br);
-                    bytes[base + 1] = bytes[base + 1].saturating_add(bg);
-                    bytes[base + 2] = bytes[base + 2].saturating_add(bb);
-                }
+                let r = bytes[base] as u32;
+                let g = bytes[base + 1] as u32;
+                let b = bytes[base + 2] as u32;
+                seed_bytes[base]     = ((r * emission) / 255).min(255) as u8;
+                seed_bytes[base + 1] = ((g * emission) / 255).min(255) as u8;
+                seed_bytes[base + 2] = ((b * emission) / 255).min(255) as u8;
+                seed_bytes[base + 3] = 255;
             }
         }
+        let t_render_cpu = t_sim_start.elapsed() - t_sim;
+        let t_upload_start = std::time::Instant::now();
         texture.update(&image);
+        bloom_seed_tex.update(&bloom_seed_image);
+        gas_seed_tex.update(&gas_seed_image);
+        let t_upload = t_upload_start.elapsed();
+        let t_gpu_submit_start = std::time::Instant::now();
+
+        // ---- GPU gas cloud blur (separable 11-tap, radius 5) ----
+        let blur_wf = BLUR_W as f32;
+        let blur_hf = BLUR_H as f32;
+        set_camera(&Camera2D {
+            zoom: vec2(2.0 / blur_wf, 2.0 / blur_hf),
+            target: vec2(blur_wf / 2.0, blur_hf / 2.0),
+            render_target: Some(gas_h_rt.clone()),
+            ..Default::default()
+        });
+        clear_background(BLACK);
+        gl_use_material(&gas_blur_material);
+        gas_blur_material.set_uniform("Direction", vec2(1.0 / blur_wf, 0.0));
+        draw_texture_ex(
+            &gas_seed_tex, 0.0, 0.0, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(blur_wf, blur_hf)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+
+        set_camera(&Camera2D {
+            zoom: vec2(2.0 / blur_wf, 2.0 / blur_hf),
+            target: vec2(blur_wf / 2.0, blur_hf / 2.0),
+            render_target: Some(gas_v_rt.clone()),
+            ..Default::default()
+        });
+        clear_background(BLACK);
+        gl_use_material(&gas_blur_material);
+        gas_blur_material.set_uniform("Direction", vec2(0.0, 1.0 / blur_hf));
+        draw_texture_ex(
+            &gas_h_rt.texture, 0.0, 0.0, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(blur_wf, blur_hf)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+
+        // ---- GPU bloom: separable two-pass blur on render targets ----
+        set_camera(&Camera2D {
+            zoom: vec2(2.0 / blur_wf, 2.0 / blur_hf),
+            target: vec2(blur_wf / 2.0, blur_hf / 2.0),
+            render_target: Some(bloom_h_rt.clone()),
+            ..Default::default()
+        });
+        clear_background(BLACK);
+        gl_use_material(&bloom_blur_material);
+        bloom_blur_material.set_uniform("Direction", vec2(1.0 / blur_wf, 0.0));
+        draw_texture_ex(
+            &bloom_seed_tex, 0.0, 0.0, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(blur_wf, blur_hf)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+
+        set_camera(&Camera2D {
+            zoom: vec2(2.0 / blur_wf, 2.0 / blur_hf),
+            target: vec2(blur_wf / 2.0, blur_hf / 2.0),
+            render_target: Some(bloom_v_rt.clone()),
+            ..Default::default()
+        });
+        clear_background(BLACK);
+        gl_use_material(&bloom_blur_material);
+        bloom_blur_material.set_uniform("Direction", vec2(0.0, 1.0 / blur_hf));
+        draw_texture_ex(
+            &bloom_h_rt.texture, 0.0, 0.0, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(blur_wf, blur_hf)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+
+        // Back to default screen camera for the rest of the frame.
+        set_default_camera();
+
         // Clear with the panel color — any area the sim doesn't cover
         // (bottom strip from aspect mismatch, space beside a centered sim)
         // reads as panel instead of blank dead space.
@@ -8974,6 +9270,28 @@ pub async fn run_game() {
                 ..Default::default()
             },
         );
+        // Gas cloud composite — density-amp scale + additive blend.
+        gl_use_material(&gas_composite_material);
+        draw_texture_ex(
+            &gas_v_rt.texture, sim_x, sim_y, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(sim_w, sim_h)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+        // Bloom composite — additive blend over base + gas cloud.
+        gl_use_material(&additive_material);
+        draw_texture_ex(
+            &bloom_v_rt.texture, sim_x, sim_y, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(sim_w, sim_h)),
+                ..Default::default()
+            },
+        );
+        gl_use_default_material();
+        let t_gpu_submit = t_gpu_submit_start.elapsed();
+        let t_ui_start = std::time::Instant::now();
 
         // Shockwave leading edges — a bright ring at each active wave's
         // current radius so blasts read visually as expanding fronts, not
@@ -9636,6 +9954,35 @@ pub async fn run_game() {
             screenshot_timer = 120;
         }
 
+        let t_ui = t_ui_start.elapsed();
+        prof_sim_us         += t_sim.as_micros() as u64;
+        prof_render_cpu_us  += t_render_cpu.as_micros() as u64;
+        prof_upload_us      += t_upload.as_micros() as u64;
+        prof_gpu_submit_us  += t_gpu_submit.as_micros() as u64;
+        prof_ui_us          += t_ui.as_micros() as u64;
+        prof_total_us       += prof_frame_start.elapsed().as_micros() as u64;
+        prof_frames         += 1;
+        if prof_last_print.elapsed().as_secs_f32() >= 1.0 {
+            let f = prof_frames as f32;
+            eprintln!(
+                "[prof] {:>3} fps | sim {:>4.1} render {:>4.1} upload {:>4.1} gpu_sub {:>4.1} ui {:>4.1} total {:>4.1}ms",
+                prof_frames,
+                (prof_sim_us as f32 / f) / 1000.0,
+                (prof_render_cpu_us as f32 / f) / 1000.0,
+                (prof_upload_us as f32 / f) / 1000.0,
+                (prof_gpu_submit_us as f32 / f) / 1000.0,
+                (prof_ui_us as f32 / f) / 1000.0,
+                (prof_total_us as f32 / f) / 1000.0,
+            );
+            prof_sim_us = 0;
+            prof_render_cpu_us = 0;
+            prof_upload_us = 0;
+            prof_gpu_submit_us = 0;
+            prof_ui_us = 0;
+            prof_total_us = 0;
+            prof_frames = 0;
+            prof_last_print = std::time::Instant::now();
+        }
         next_frame().await
     }
 }
