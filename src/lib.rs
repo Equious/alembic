@@ -309,6 +309,30 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     a
 };
 
+/// Per-element motion props as packed vec4 for the GPU motion compute:
+///   x = kind id (Empty=0, Solid=1, Gravel=2, Powder=3, Liquid=4, Gas=5, Fire=6)
+///   y = density (signed, but we cap at 0 for the GPU shader's swap test)
+///   z = is_falling_solid_or_powder ? 1 : 0  (cells that obey gravity)
+///   w = is_liquid ? 1 : 0                   (cells that flow horizontally)
+pub fn motion_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0.0; 4]; }
+    let phys = &PHYSICS[i];
+    let kind_id: f32 = match phys.kind {
+        Kind::Empty => 0.0,
+        Kind::Solid => 1.0,
+        Kind::Gravel => 2.0,
+        Kind::Powder => 3.0,
+        Kind::Liquid => 4.0,
+        Kind::Gas => 5.0,
+        Kind::Fire => 6.0,
+    };
+    let density = phys.density.max(0) as f32;
+    let falling = matches!(phys.kind, Kind::Powder | Kind::Gravel | Kind::Liquid) as i32 as f32;
+    let is_liquid = matches!(phys.kind, Kind::Liquid) as i32 as f32;
+    [kind_id, density, falling, is_liquid]
+}
+
 /// Snapshot the per-element pressure-source data as a packed vec4 —
 /// `[kind_id_f32, cell_weight, _, _]` for the GPU pressure_sources
 /// compute. `kind_id` follows the order of `Kind` enum (Empty=0,
