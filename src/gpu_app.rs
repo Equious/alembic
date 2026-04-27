@@ -5814,6 +5814,29 @@ impl ApplicationHandler for App {
     ) {
         let Some(state) = self.state.as_mut() else { return; };
 
+        // Intercept app-level shortcut keys BEFORE egui sees them.
+        // egui consumes Tab for its own focus traversal, which would
+        // otherwise eat our Tab → periodic-table toggle.
+        if let WindowEvent::KeyboardInput { event: ref ke, .. } = event {
+            if ke.state == ElementState::Pressed {
+                if let PhysicalKey::Code(code) = ke.physical_key {
+                    match code {
+                        KeyCode::Tab => {
+                            state.pt_open = !state.pt_open;
+                            return;
+                        }
+                        KeyCode::Escape => {
+                            if state.pt_open {
+                                state.pt_open = false;
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         // egui consumes input events first so the side panel responds
         // to clicks/hovers/typing. If egui says it consumed pointer or
         // keyboard input, we suppress the matching sim handler below.
