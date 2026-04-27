@@ -2429,6 +2429,238 @@ impl SoluteCtx {
     }
 }
 
+const WATER_SAND_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0..3 = Margolus phase
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+const EL_EMPTY: u32 = 0u;
+const EL_SAND:  u32 = 1u;
+const EL_WATER: u32 = 2u;
+const EL_MUD:   u32 = 11u;
+
+const FLAG_FROZEN: u32 = 0x02u;
+
+fn ws_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn ws_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn ws_frozen(c: vec4<u32>) -> bool { return (ws_flag(c) & FLAG_FROZEN) != 0u; }
+
+fn ws_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Build an Empty / Mud cell from scratch — discards solute, derived,
+// moisture, etc., matching CPU `Cell::EMPTY` / `Cell::new(Element::Mud)`.
+fn make_empty() -> vec4<u32> { return vec4<u32>(0u, 0u, 0u, 0u); }
+fn make_mud() -> vec4<u32> {
+    // el = 11; temp at byte 6-7 of c.y → packed in c.y high 16 bits.
+    // Cell::new uses temp=20.
+    return vec4<u32>(EL_MUD, 20u << 16u, 0u, 0u);
+}
+
+// Faithful port of `World::reactions` (moisture chemistry only):
+//
+//   * water above sand  → 1/200 chance: water → empty, sand → mud
+//                          (CPU's "water-pass" with mud column = 0)
+//   * sand with water as a cardinal neighbor (N/E/W) → 1/60 chance:
+//                          sand → mud, water → empty
+//
+// Margolus 2x2 4-phase — within a phase, the four cells of a block
+// are written by a single thread, race-free. The mud column
+// percolation (water dripping through a mud layer to soak sand below)
+// is not preserved; that requires a sequential downward walk and is a
+// rare, slow effect not visible per-frame.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    let r0 = ws_hash(by * u.width + bx, u.frame);
+    let r1 = ws_hash(by * u.width + bx + 7u, u.frame ^ 0xA5A5A5A5u);
+    let r2 = ws_hash(by * u.width + bx + 13u, u.frame ^ 0x5A5A5A5Au);
+    let r3 = ws_hash(by * u.width + bx + 23u, u.frame ^ 0xC3C3C3C3u);
+
+    // Vertical pairs — water above sand. Combined CPU rate ≈ 1/45
+    // (water-pass 1/200 ∪ sand-pass-N 1/60). Use 6/256 ≈ 1/43.
+    // c00 (top) / c01 (bottom)
+    if (ws_el(c00) == EL_WATER && ws_el(c01) == EL_SAND
+        && !ws_frozen(c00) && !ws_frozen(c01)
+        && (r0 & 0xFFu) < 6u) {
+        c00 = make_empty();
+        c01 = make_mud();
+    } else if (ws_el(c00) == EL_SAND && ws_el(c01) == EL_WATER
+        && !ws_frozen(c00) && !ws_frozen(c01)
+        && (r0 & 0xFFu) < 4u) {
+        // Sand above water — CPU sand-pass checks N (above) for water,
+        // but here water is BELOW sand. CPU sand only checks N/E/W,
+        // not S. So sand-above-water is NOT a reaction. Skip.
+    }
+    // c10 (top) / c11 (bottom)
+    if (ws_el(c10) == EL_WATER && ws_el(c11) == EL_SAND
+        && !ws_frozen(c10) && !ws_frozen(c11)
+        && (r1 & 0xFFu) < 6u) {
+        c10 = make_empty();
+        c11 = make_mud();
+    }
+
+    // Horizontal pairs — sand absorbs water at sides. Rate 1/60 →
+    // 4/256 ≈ 1/64.
+    // c00 (left) / c10 (right)
+    if (ws_el(c00) == EL_SAND && ws_el(c10) == EL_WATER
+        && !ws_frozen(c00) && !ws_frozen(c10)
+        && (r2 & 0xFFu) < 4u) {
+        c00 = make_mud();
+        c10 = make_empty();
+    } else if (ws_el(c10) == EL_SAND && ws_el(c00) == EL_WATER
+        && !ws_frozen(c10) && !ws_frozen(c00)
+        && (r2 & 0xFFu) < 4u) {
+        c10 = make_mud();
+        c00 = make_empty();
+    }
+    // c01 (left) / c11 (right)
+    if (ws_el(c01) == EL_SAND && ws_el(c11) == EL_WATER
+        && !ws_frozen(c01) && !ws_frozen(c11)
+        && (r3 & 0xFFu) < 4u) {
+        c01 = make_mud();
+        c11 = make_empty();
+    } else if (ws_el(c11) == EL_SAND && ws_el(c01) == EL_WATER
+        && !ws_frozen(c11) && !ws_frozen(c01)
+        && (r3 & 0xFFu) < 4u) {
+        c11 = make_mud();
+        c01 = make_empty();
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct WaterSandUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+}
+
+/// GPU port of `World::reactions` — Water+Sand→Mud moisture chemistry.
+/// Margolus 2x2 4-phase, race-free per phase. Ports the local-pair
+/// behavior; the mud-column percolation (water dripping through 1-30
+/// mud cells to soak sand at the bottom) is lost — those conversions
+/// were rare (1/200 per frame per cell) and barely visible.
+struct WaterSandCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 4],
+    pass_bind_groups: [wgpu::BindGroup; 4],
+}
+
+impl WaterSandCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = WaterSandUniforms { width: W as u32, height: H as u32, pass_id, frame: 0 };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let pass_uniform_bufs: [wgpu::Buffer; 4] = [
+            mk_uniform("alembic-watersand-u-0", 0),
+            mk_uniform("alembic-watersand-u-1", 1),
+            mk_uniform("alembic-watersand-u-2", 2),
+            mk_uniform("alembic-watersand-u-3", 3),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-watersand-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-watersand-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-watersand-shader"),
+            source: wgpu::ShaderSource::Wgsl(WATER_SAND_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-watersand-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-watersand-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        WaterSandCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let arr = [frame];
+        let bytes: &[u8] = bytemuck::cast_slice(&arr);
+        for i in 0..4 {
+            queue.write_buffer(&self.pass_uniform_bufs[i], 12, bytes);
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        for i in 0..4 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-watersand-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -3746,6 +3978,8 @@ struct GpuState {
     /// Fire emission from burning cells — visible flames above wood
     /// fires, gunpowder ignition columns, etc. Two parity sub-passes.
     fire_emit_compute: FireEmitCtx,
+    /// Moisture chemistry: Water+Sand→Mud. Margolus 2x2 4-phase.
+    water_sand_compute: WaterSandCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -4099,6 +4333,7 @@ impl GpuState {
         let thermal_post_compute = ThermalPostCtx::new(&device, &queue, &cells_buf);
         let solute_compute = SoluteCtx::new(&device, &queue, &cells_buf);
         let fire_emit_compute = FireEmitCtx::new(&device, &queue, &cells_buf);
+        let water_sand_compute = WaterSandCtx::new(&device, &queue, &cells_buf);
 
         let mut state = GpuState {
             surface,
@@ -4128,6 +4363,7 @@ impl GpuState {
             thermal_post_compute,
             solute_compute,
             fire_emit_compute,
+            water_sand_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -4340,6 +4576,7 @@ impl GpuState {
                 thermal_post: true,
                 dissolve: true,
                 diffuse_solute: true,
+                reactions: true,
             };
             self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
@@ -4409,6 +4646,9 @@ impl GpuState {
             //     in the empty cell above (1/10 per frame). Two
             //     parity sub-passes for race-safe multi-cell write.
             self.fire_emit_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 4e. water+sand → mud moisture chemistry. Margolus 2x2
+            //     4-phase. Replaces CPU `World::reactions`.
+            self.water_sand_compute.encode(&mut encoder, &self.queue, self.frame_counter);
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.

@@ -4112,6 +4112,7 @@ pub struct GpuChem {
     pub thermal_post: bool,
     pub dissolve: bool,
     pub diffuse_solute: bool,
+    pub reactions: bool,
 }
 
 impl World {
@@ -4252,7 +4253,9 @@ impl World {
         if !gpu_chem.diffuse_solute {
             self.diffuse_solute();   mark!("diffuse_solute");
         }
-        self.reactions();            mark!("reactions");
+        if !gpu_chem.reactions {
+            self.reactions();        mark!("reactions");
+        }
         if run_motion {
             for y in (0..H as i32).rev() {
                 let lr = self.frame % 2 == 0;
