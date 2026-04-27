@@ -836,7 +836,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let c = cells[i];
         let id = cell_el_ps(c);
         let prof = profiles[id];
-        let kind_id = u32(prof.x);
+        // Phase override: a phase=GAS solid that boiled should be
+        // pressurizable; a phase=SOLID gas that froze should not.
+        // Mirrors cell_physics.kind in lib.rs.
+        let phase_bits = (cell_flag_ps(c) >> 2u) & 0x3u;
+        var kind_id: u32 = u32(prof.x);
+        if (phase_bits == 1u) { kind_id = 2u; }       // SOLID → Gravel
+        else if (phase_bits == 2u) { kind_id = 4u; }  // LIQUID
+        else if (phase_bits == 3u) { kind_id = 5u; }  // GAS
         let weight = prof.y;
 
         let is_pressurizable = (kind_id == KIND_GAS || kind_id == KIND_FIRE);
@@ -1047,12 +1054,35 @@ fn cell_idx(x: u32, y: u32) -> u32 { return y * u.width + x; }
 fn cell_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
 fn cell_derived_id(c: vec4<u32>) -> u32 { return (c.x >> 8u) & 0xFFu; }
 fn cell_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+// Phase-aware property lookup — faithful port of `cell_physics(c)`
+// from lib.rs. When the cell's phase bits (flag & 0x0C) indicate a
+// non-native phase (cooled gas → SOLID, melted solid → LIQUID,
+// boiled solid → GAS), the returned kind/density/viscosity/molar_mass
+// reflects the FORCED phase, not the element's STP defaults. Without
+// this every emergent phase change (Ne freezing, Cu melting,
+// salt boiling, …) would be invisible to motion: the phase bit
+// would be set but the cell would keep moving like its native state.
 fn cell_props(c: vec4<u32>) -> vec4<f32> {
     let el = cell_el(c);
+    var base: vec4<f32>;
     if (el == EL_DERIVED) {
-        return derived_phys[cell_derived_id(c)];
+        base = derived_phys[cell_derived_id(c)];
+    } else {
+        base = motion_props[el];
     }
-    return motion_props[el];
+    let phase = (cell_flag(c) >> 2u) & 0x3u;
+    if (phase == 0u) { return base; }                  // PHASE_NATIVE
+    let abs_d = max(abs(base.y), 1.0);
+    if (phase == 1u) {                                  // PHASE_SOLID → Gravel
+        return vec4<f32>(2.0, abs_d, 0.0, 0.0);
+    }
+    if (phase == 2u) {                                  // PHASE_LIQUID
+        var visc: f32 = 200.0;
+        if (base.z > 0.0) { visc = base.z; }
+        return vec4<f32>(4.0, max(abs_d * 0.9, 1.0), visc, base.w);
+    }
+    // phase == 3u → PHASE_GAS
+    return vec4<f32>(5.0, -max(abs_d / 8.0, 1.0), 0.0, base.w);
 }
 fn cell_kind(c: vec4<u32>) -> u32 { return u32(cell_props(c).x); }
 fn cell_density(c: vec4<u32>) -> f32 { return cell_props(c).y; }
@@ -5586,8 +5616,27 @@ fn ps_pressure(c: vec4<u32>) -> i32 {
     let raw = (c.z >> 16u) & 0xFFFFu;
     return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
 }
-fn ps_kind(c: vec4<u32>) -> u32 { return u32(motion_props[ps_el(c)].x); }
-fn ps_density(c: vec4<u32>) -> f32 { return motion_props[ps_el(c)].y; }
+// Phase-aware property lookup (same logic as motion shader's
+// cell_props). Without this a cooled gas would still pressure-
+// shove like a gas (light, fast lateral spread) instead of a
+// solid (rigid, blocks movement).
+fn ps_props(c: vec4<u32>) -> vec4<f32> {
+    let base = motion_props[ps_el(c)];
+    let phase = (ps_flag(c) >> 2u) & 0x3u;
+    if (phase == 0u) { return base; }
+    let abs_d = max(abs(base.y), 1.0);
+    if (phase == 1u) {
+        return vec4<f32>(2.0, abs_d, 0.0, 0.0);
+    }
+    if (phase == 2u) {
+        var visc: f32 = 200.0;
+        if (base.z > 0.0) { visc = base.z; }
+        return vec4<f32>(4.0, max(abs_d * 0.9, 1.0), visc, base.w);
+    }
+    return vec4<f32>(5.0, -max(abs_d / 8.0, 1.0), 0.0, base.w);
+}
+fn ps_kind(c: vec4<u32>) -> u32 { return u32(ps_props(c).x); }
+fn ps_density(c: vec4<u32>) -> f32 { return ps_props(c).y; }
 fn ps_compliance(c: vec4<u32>) -> i32 { return i32(pressure_lut[ps_el(c)].x); }
 
 fn ps_hash(a: u32, b: u32) -> u32 {
@@ -6748,8 +6797,18 @@ const KIND_POWDER: u32 = 3u;
 const FLAG_FROZEN: u32 = 0x02u;
 
 fn ts_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
-fn ts_kind(c: vec4<u32>) -> u32 { return u32(motion_props[ts_el(c)].x); }
 fn ts_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+// Phase-aware kind: a Wood cell shouldn't anchor on liquid Cu just
+// because Cu's STP state is Solid. Mirror the cell_physics phase
+// override so phase=LIQUID Cu reads as Kind::Liquid here.
+fn ts_kind(c: vec4<u32>) -> u32 {
+    let base = motion_props[ts_el(c)];
+    let phase = (ts_flag(c) >> 2u) & 0x3u;
+    if (phase == 0u) { return u32(base.x); }
+    if (phase == 1u) { return 2u; }
+    if (phase == 2u) { return 4u; }
+    return 5u;
+}
 fn ts_frozen(c: vec4<u32>) -> bool { return (ts_flag(c) & FLAG_FROZEN) != 0u; }
 fn ts_life(c: vec4<u32>) -> u32 { return (c.x >> 16u) & 0xFFFFu; }
 fn ts_set_life(c: vec4<u32>, life: u32) -> vec4<u32> {
