@@ -1581,7 +1581,14 @@ impl MotionComputeCtx {
     /// Encode all 7 motion passes for one frame, then snapshot the
     /// shared `cells_buf` into the readback buffer for next-frame
     /// CPU sync.
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32, cells_buf: &wgpu::Buffer) {
+    fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        frame: u32,
+        cells_buf: &wgpu::Buffer,
+        do_readback: bool,
+    ) {
         let cell_count = W * H;
         let frame_arr = [frame];
         let frame_bytes = bytemuck::cast_slice(&frame_arr);
@@ -1608,10 +1615,16 @@ impl MotionComputeCtx {
             cpass.set_bind_group(0, &self.pass_bind_groups[idx], &[]);
             cpass.dispatch_workgroups(wg, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
-            (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress,
-        );
+        // Only copy into the readback ring buffer when CPU is going to
+        // consume cells this frame. Skipping the copy keeps the
+        // ring's mapped buffer stable (we don't need to unmap if we
+        // didn't write to it again).
+        if do_readback {
+            encoder.copy_buffer_to_buffer(
+                cells_buf, 0, &self.readback_bufs[self.write_idx], 0,
+                (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress,
+            );
+        }
     }
 
     fn start_map(&mut self) {
@@ -9835,10 +9848,19 @@ impl GpuState {
             );
             self.joule_compute.encode(&mut encoder);
             // 7. Motion: 5 passes (vfall, lspread-even/odd, dslide-even/odd).
-            self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter, &self.cells_buf);
+            self.motion_compute.encode(
+                &mut encoder, &self.queue, self.frame_counter,
+                &self.cells_buf, needs_readback,
+            );
             self.queue.submit(std::iter::once(encoder.finish()));
-            self.motion_compute.start_map();
-            self.motion_compute.advance_frame();
+            // Ring-buffer the readback only when we actually copied
+            // into it. Skipping start_map / advance_frame on no-op
+            // frames keeps the slot stable so the next encode-with-
+            // readback can write into a known-unmapped buffer.
+            if needs_readback {
+                self.motion_compute.start_map();
+                self.motion_compute.advance_frame();
+            }
             self.frame_counter = self.frame_counter.wrapping_add(1);
         }
         let t_compute = t_compute_readback + t_dispatch_start.elapsed();
