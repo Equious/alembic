@@ -1151,11 +1151,11 @@ fn vertical_fall(x: u32) {
             if ((r & 3u) == 0u) {
                 // Check 5×5 neighborhood for Wood/Seed.
                 var supported = false;
-                for (var dy = -2i32; dy <= 2i32 && !supported; dy = dy + 1) {
-                    for (var dx = -2i32; dx <= 2i32 && !supported; dx = dx + 1) {
+                for (var dy: i32 = -2; dy <= 2 && !supported; dy = dy + 1) {
+                    for (var dx: i32 = -2; dx <= 2 && !supported; dx = dx + 1) {
                         if (dx == 0 && dy == 0) { continue; }
                         let nx = i32(x) + dx;
-                        let ny = y + dy;
+                        let ny = i32(y) + dy;
                         if (nx < 0 || nx >= i32(u.width) || ny < 0 || ny >= i32(u.height)) { continue; }
                         let n_el = cell_el(cells[cell_idx(u32(nx), u32(ny))]);
                         if (n_el == EL_WOOD || n_el == EL_SEED) { supported = true; }
