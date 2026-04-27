@@ -5311,14 +5311,17 @@ impl GpuState {
                     by_pp.insert((*period, *group), (*el, *sym, *num));
                 }
                 let max_period = atoms.iter().map(|a| a.4).max().unwrap_or(7);
+                let mut picked = false;
                 for period in 1..=max_period {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = pt_gap;
                         for group in 1..=18u8 {
                             if let Some(&(el, sym, num)) = by_pp.get(&(period, group)) {
-                                Self::pt_atom_tile(
+                                if Self::pt_atom_tile(
                                     ui, el, sym, num, pt_tile, &mut self.selected,
-                                );
+                                ) {
+                                    picked = true;
+                                }
                             } else {
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(pt_tile, pt_tile),
@@ -5342,7 +5345,9 @@ impl GpuState {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = pt_gap;
                     for &el in crate::ui_compound_palette() {
-                        Self::pt_compound_tile(ui, el, pt_tile, &mut self.selected);
+                        if Self::pt_compound_tile(ui, el, pt_tile, &mut self.selected) {
+                            picked = true;
+                        }
                     }
                 });
 
@@ -5390,9 +5395,14 @@ impl GpuState {
                             if resp.clicked() {
                                 self.selected = Element::Derived;
                                 self.selected_did = *did;
+                                picked = true;
                             }
                         }
                     });
+                }
+
+                if picked {
+                    self.pt_open = false;
                 }
 
                 ui.add_space(12.0);
@@ -5411,7 +5421,7 @@ impl GpuState {
         num: u8,
         size: f32,
         selected: &mut Element,
-    ) {
+    ) -> bool {
         let (r, g, b) = el.base_color();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(size, size),
@@ -5450,7 +5460,9 @@ impl GpuState {
         );
         if resp.clicked() {
             *selected = el;
+            return true;
         }
+        false
     }
 
     fn pt_compound_tile(
@@ -5458,7 +5470,7 @@ impl GpuState {
         el: Element,
         size: f32,
         selected: &mut Element,
-    ) {
+    ) -> bool {
         let (r, g, b) = el.base_color();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(size, size),
@@ -5501,7 +5513,9 @@ impl GpuState {
         }
         if resp.clicked() {
             *selected = el;
+            return true;
         }
+        false
     }
 
     fn render(&mut self) {
