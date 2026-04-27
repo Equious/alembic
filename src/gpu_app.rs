@@ -1665,6 +1665,12 @@ struct Uniforms {
 //   .x byte0 = primary el (CO2), byte1 = secondary el (Charcoal for Wood),
 //      byte2 = secondary prob /16 (3 = ~30%)
 @group(0) @binding(5) var<uniform> burn_decay: array<vec4<u32>, 24>;
+// Per-element generic phase-transition data — for atoms + Salt + any
+// other element following the simple (mp, bp, stp_state) curve.
+//   x = melting_point  y = boiling_point
+//   z = stp_state (0=Solid, 1=Liquid, 2=Gas)
+//   w = has_rule (1.0 = applies, 0.0 = bespoke transitions only)
+@group(0) @binding(6) var<uniform> phase_points: array<vec4<f32>, 96>;
 
 const NO_THRESHOLD: f32 = -32768.0;
 
@@ -1784,6 +1790,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // ---- Phase changes (only if combustion didn't already replace cell) ----
+    var changed: bool = false;
     let cur_el = tp_el(c);
     if (cur_el == el && tp_burn(c) == 0u) {
         let cur_t = tp_temp(c);
@@ -1794,18 +1801,21 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let target_el = u32(plo.y);
             c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
             c = tp_set_temp(c, cur_t);
+            changed = true;
         }
         // Try condense.
         else if (plo.z > -1000.0 && f32(cur_t) < plo.z) {
             let target_el = u32(plo.w);
             c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
             c = tp_set_temp(c, cur_t);
+            changed = true;
         }
         // Try melt.
         else if (phi.x > -1000.0 && f32(cur_t) > phi.x) {
             let target_el = u32(phi.y);
             c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
             c = tp_set_temp(c, cur_t);
+            changed = true;
         }
         // Try boil.
         else if (phi.z > -1000.0 && f32(cur_t) > phi.z) {
@@ -1813,6 +1823,50 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             c = vec4<u32>(target_el, c.y & 0xFFFF0000u, 0u, 0u);
             // CPU adds 15° gas overshoot.
             c = tp_set_temp(c, i32(phi.z) + 15);
+            changed = true;
+        }
+    }
+
+    // ---- Generic phase flag (atoms + Salt) ----
+    // For elements without a bespoke `*_above` / `*_below` rule above,
+    // determine whether they're in their native STP state at the
+    // current temperature and flip the phase-bits in flag accordingly.
+    // Faithful port of lib.rs:5569's "generic phase transitions" block.
+    if (!changed && tp_burn(c) == 0u) {
+        let pp = phase_points[tp_el(c)];
+        if (pp.w > 0.5) {
+            let mp = pp.x;
+            let bp = pp.y;
+            let stp = u32(pp.z);
+            let cur_t = f32(tp_temp(c));
+            // 0=Solid, 1=Liquid, 2=Gas (matches AtomState).
+            var actual: u32 = 0u;
+            if (cur_t >= bp) { actual = 2u; }
+            else if (cur_t >= mp) { actual = 1u; }
+            else { actual = 0u; }
+            // Phase flag: 0=NATIVE, 1=SOLID, 2=LIQUID, 3=GAS. NATIVE
+            // when actual == stp (cell is at its declared STP state),
+            // otherwise the matching forced phase.
+            var new_phase: u32 = 0u;
+            if (actual != stp) {
+                if (actual == 0u) { new_phase = 1u; }
+                else if (actual == 1u) { new_phase = 2u; }
+                else { new_phase = 3u; }
+            }
+            // Read current phase from flag bits 2..3.
+            let cur_flag = (c.y >> 8u) & 0xFFu;
+            let cur_phase = (cur_flag & 0x0Cu) >> 2u;
+            if (new_phase != cur_phase) {
+                // Replace flag bits 2..3 with new_phase. Also clear
+                // FLAG_FROZEN when cell leaves NATIVE — a melted wire
+                // shouldn't stay rigid (mirrors lib.rs:5631).
+                var new_flag = (cur_flag & ~0x0Cu) | ((new_phase & 3u) << 2u);
+                if (new_phase != 0u) {
+                    new_flag = new_flag & ~0x02u;  // clear FROZEN
+                }
+                let new_y = (c.y & 0xFFFF00FFu) | ((new_flag & 0xFFu) << 8u);
+                c = vec4<u32>(c.x, new_y, c.z, c.w);
+            }
         }
     }
 
@@ -1884,6 +1938,10 @@ impl ThermalPostCtx {
             contents: bytemuck::cast_slice(&decay),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let phase_points_buf = mk_lut_f32(
+            "alembic-tpost-phase-points",
+            crate::ui_atom_phase_points,
+        );
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-tpost-bgl"),
             entries: &[
@@ -1911,6 +1969,10 @@ impl ThermalPostCtx {
                     binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1923,6 +1985,7 @@ impl ThermalPostCtx {
                 wgpu::BindGroupEntry { binding: 3, resource: phase_lo_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: phase_hi_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: burn_decay_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: phase_points_buf.as_entire_binding() },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1942,6 +2005,8 @@ impl ThermalPostCtx {
             compilation_options: Default::default(),
             cache: None,
         });
+        // phase_points_buf retained via the bind group, binding 6.
+        let _ = phase_points_buf;
         ThermalPostCtx {
             pipeline,
             uniform_buf,

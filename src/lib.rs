@@ -588,6 +588,28 @@ pub fn moisture_phase_props(id: u8) -> [f32; 4] {
     [wet_thr, wet_el, dry_thr, dry_el]
 }
 
+/// Per-element generic phase-transition data for the GPU thermal_post
+/// shader. Layout: `[melting_point, boiling_point, stp_state, has_rule]`.
+/// stp_state is 0=Solid / 1=Liquid / 2=Gas. has_rule = 1.0 when the
+/// element follows the generic mp/bp curve (atoms + Salt + future
+/// generic compounds), 0.0 for bespoke-transition elements
+/// (Water/Sand/Lava etc. with their own ThermalProfile branches).
+pub fn ui_atom_phase_points(id: u8) -> [f32; 4] {
+    let el = element_from_u8(id);
+    if let Some(a) = atom_profile_for(el) {
+        let stp = match a.stp_state {
+            AtomState::Solid => 0.0,
+            AtomState::Liquid => 1.0,
+            AtomState::Gas => 2.0,
+        };
+        return [a.melting_point as f32, a.boiling_point as f32, stp, 1.0];
+    }
+    if el == Element::Salt {
+        return [801.0, 1465.0, 0.0, 1.0];
+    }
+    [0.0, 0.0, 0.0, 0.0]
+}
+
 /// Per-element radioactive activity for the GPU render shader's
 /// cyan-green pulse tint. Returns 0.0 for stable elements, otherwise
 /// `(30000.0 / half_life_frames).clamp(0.35, 1.0)` — same curve the
