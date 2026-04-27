@@ -4324,6 +4324,16 @@ struct GpuState {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
 
+    // ---- Tool / panel state (mirrors the macroquad version) ----
+    tool_mode: crate::ToolMode,
+    build_mode: bool,
+    /// Periodic-table modal overlay open. Tab toggles.
+    pt_open: bool,
+    /// Selected derived compound id when `selected == Element::Derived`.
+    selected_did: u8,
+    /// Wind vector set by the wind pad widget.
+    wind: macroquad::math::Vec2,
+
     // ---- Input state ----
     /// Currently-selected element for the paint brush.
     selected: Element,
@@ -4748,6 +4758,11 @@ impl GpuState {
             egui_ctx,
             egui_state,
             egui_renderer,
+            tool_mode: crate::ToolMode::Paint,
+            build_mode: false,
+            pt_open: false,
+            selected_did: 0,
+            wind: macroquad::math::Vec2::new(0.0, 0.0),
         };
         state.camera_reset();
         state
@@ -4904,43 +4919,92 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    /// Build the side panel UI in egui. Faithful port of the macroquad
-    /// sidebar panel: TOOLS section header, periodic-table palette
-    /// (compounds first, atoms second, derived compounds last), brush
-    /// radius slider, pause toggle, clear button, ambient sliders.
-    /// Mutations to `self.selected`, `self.brush_radius`, etc. take
-    /// effect this frame.
+    /// Build the side panel UI in egui — faithful port of the macroquad
+    /// `panel_button_rects` / `panel_ambient_rects` / `wind_pad_rect`
+    /// layout in lib.rs. Same colors, same sections, same behavior.
+    /// The periodic-table modal (Tab) is drawn separately on top.
     fn draw_ui(&mut self, ctx: &egui::Context) {
-        let panel_w = 260.0;
+        // Panel chrome — colors mirror panel_bg() and draw_panel_button.
+        let panel_bg = egui::Color32::from_rgb(18, 18, 24);
+        let btn_normal = egui::Color32::from_rgb(30, 30, 38);
+        let btn_hover = egui::Color32::from_rgb(42, 42, 54);
+        let btn_selected = egui::Color32::from_rgb(62, 90, 140);
+        let btn_border = egui::Color32::from_rgb(60, 60, 72);
+        let text_btn = egui::Color32::from_rgb(220, 220, 230);
+        let section_header = egui::Color32::from_rgb(130, 130, 150);
+        let dim_label = egui::Color32::from_rgb(150, 150, 165);
+        let value_color = egui::Color32::from_rgb(230, 230, 240);
+
         egui::SidePanel::right("alembic-side-panel")
             .resizable(false)
-            .exact_width(panel_w)
+            .exact_width(240.0)
             .frame(
                 egui::Frame::default()
-                    .fill(egui::Color32::from_rgb(18, 18, 24))
-                    .inner_margin(egui::Margin::same(10)),
+                    .fill(panel_bg)
+                    .inner_margin(egui::Margin {
+                        left: 12, right: 12, top: 10, bottom: 10,
+                    }),
             )
             .show(ctx, |ui| {
-                ui.style_mut().visuals.widgets.inactive.bg_fill =
-                    egui::Color32::from_rgb(36, 36, 46);
-                ui.style_mut().visuals.widgets.hovered.bg_fill =
-                    egui::Color32::from_rgb(56, 56, 72);
-                ui.style_mut().visuals.widgets.active.bg_fill =
-                    egui::Color32::from_rgb(70, 80, 100);
+                // Override default egui button styling so our buttons
+                // look like draw_panel_button: solid fill, 1px border,
+                // 14pt centered label.
+                Self::style_panel(ui, btn_normal, btn_hover, btn_border);
 
-                ui.heading(
-                    egui::RichText::new("ALEMBIC")
-                        .color(egui::Color32::from_rgb(220, 220, 240))
-                        .size(18.0),
+                // ---- TOOLS section ----
+                ui.label(
+                    egui::RichText::new("TOOLS").color(section_header).size(11.0),
                 );
-                ui.add_space(4.0);
+                ui.add_space(8.0);
 
-                // ---- Currently selected ----
+                // Tool buttons (Paint / Heat / Vacuum / Pipet) at fixed 30px
+                // height, full width minus margins.
+                let tools: [(&str, crate::ToolMode); 4] = [
+                    ("Paint", crate::ToolMode::Paint),
+                    ("Heat", crate::ToolMode::Heat),
+                    ("Vacuum", crate::ToolMode::Vacuum),
+                    ("Pipet", crate::ToolMode::Pipet),
+                ];
+                for (label, mode) in tools {
+                    if Self::tool_button(ui, label, self.tool_mode == mode,
+                        btn_selected, btn_normal, btn_hover, btn_border, text_btn) {
+                        self.tool_mode = mode;
+                    }
+                }
+
+                // Prefab + (eventually) its dropdown.
+                if Self::tool_button(
+                    ui, "Prefab", self.tool_mode == crate::ToolMode::Prefab,
+                    btn_selected, btn_normal, btn_hover, btn_border, text_btn,
+                ) {
+                    self.tool_mode = crate::ToolMode::Prefab;
+                }
+
+                // Wire + (eventually) its dropdown.
+                if Self::tool_button(
+                    ui, "Wire", self.tool_mode == crate::ToolMode::Wire,
+                    btn_selected, btn_normal, btn_hover, btn_border, text_btn,
+                ) {
+                    self.tool_mode = crate::ToolMode::Wire;
+                }
+
+                // Extra gap before Build (matches macroquad +14px).
+                ui.add_space(14.0);
+                let build_label = if self.build_mode { "Build: ON" } else { "Build: OFF" };
+                if Self::tool_button(
+                    ui, build_label, self.build_mode,
+                    btn_selected, btn_normal, btn_hover, btn_border, text_btn,
+                ) {
+                    self.build_mode = !self.build_mode;
+                }
+
+                // ---- Element readout ----
+                ui.add_space(14.0);
                 let sel_name = crate::ui_element_name(self.selected);
                 let (sr, sg, sb) = self.selected.base_color();
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(22.0, 22.0),
+                        egui::vec2(16.0, 16.0),
                         egui::Sense::hover(),
                     );
                     ui.painter().rect_filled(
@@ -4949,208 +5013,494 @@ impl GpuState {
                         egui::Color32::from_rgb(sr, sg, sb),
                     );
                     ui.label(
-                        egui::RichText::new(format!("Selected: {}", sel_name))
-                            .color(egui::Color32::from_rgb(230, 230, 240)),
+                        egui::RichText::new(format!("Element: {}", sel_name))
+                            .color(value_color)
+                            .size(13.0),
                     );
                 });
+
+                // ---- SIMULATION section ----
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new("SIMULATION").color(section_header).size(11.0),
+                );
                 ui.add_space(4.0);
 
-                // ---- Controls ----
-                ui.label(
-                    egui::RichText::new("CONTROLS")
-                        .color(egui::Color32::from_rgb(130, 130, 150))
-                        .size(11.0),
+                // Brush radius row — not in the macroquad panel directly
+                // (it uses [/] keys + scroll), but exposing it here is
+                // a quality-of-life addition matching the readout style.
+                Self::ambient_row(
+                    ui, "Brush",
+                    &format!("{}", self.brush_radius),
+                    dim_label, value_color,
                 );
-                ui.horizontal(|ui| {
-                    ui.label("Brush:");
-                    ui.add(
-                        egui::Slider::new(&mut self.brush_radius, 1..=30)
-                            .show_value(true),
+
+                let ambient_actual = 20 + self.world.ambient_offset;
+                Self::ambient_row(
+                    ui, "Temp",
+                    &format!("{:+}°C", ambient_actual),
+                    dim_label, value_color,
+                );
+                Self::ambient_row(
+                    ui, "O₂",
+                    &format!("{:.0}%", self.world.ambient_oxygen * 100.0),
+                    dim_label, value_color,
+                );
+                Self::ambient_row(
+                    ui, "Grav",
+                    &format!("{:.1}×", self.world.gravity),
+                    dim_label, value_color,
+                );
+
+                // ---- Wind pad ----
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new("Wind").color(dim_label).size(11.0),
+                );
+                ui.add_space(4.0);
+                let pad_size = 84.0;
+                let (wpad, wresp) = ui.allocate_exact_size(
+                    egui::vec2(pad_size, pad_size),
+                    egui::Sense::click_and_drag(),
+                );
+                let p = ui.painter();
+                let bg_pad = if wresp.hovered() {
+                    egui::Color32::from_rgb(34, 34, 46)
+                } else {
+                    egui::Color32::from_rgb(24, 24, 32)
+                };
+                p.rect_filled(wpad, 2.0, bg_pad);
+                p.rect_stroke(wpad, 2.0, egui::Stroke::new(1.0, btn_border),
+                    egui::StrokeKind::Inside);
+                let center = wpad.center();
+                let radius = pad_size * 0.5 - 2.0;
+                p.circle_stroke(center, radius, egui::Stroke::new(1.0, btn_border));
+                // Cardinal ticks
+                for (dx, dy) in [(radius, 0.0), (-radius, 0.0), (0.0, radius), (0.0, -radius)] {
+                    p.line_segment(
+                        [
+                            egui::pos2(center.x + dx * 0.85, center.y + dy * 0.85),
+                            egui::pos2(center.x + dx, center.y + dy),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 84)),
                     );
-                });
-                ui.horizontal(|ui| {
-                    let pause_text = if self.paused { "Resume" } else { "Pause" };
-                    if ui.button(pause_text).clicked() {
-                        self.paused = !self.paused;
+                }
+                // Drag/click sets wind vector. Distance from center, scaled
+                // into [0, WIND_MAX].
+                if wresp.clicked() || wresp.dragged() {
+                    if let Some(pos) = wresp.interact_pointer_pos() {
+                        let dx = pos.x - center.x;
+                        let dy = pos.y - center.y;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        if dist > 1.0 {
+                            const WIND_MAX: f32 = 2.0;
+                            let mag = (dist / radius).min(1.0) * WIND_MAX;
+                            let n = mag / dist;
+                            self.wind = macroquad::math::Vec2::new(dx * n, dy * n);
+                        }
                     }
-                    if ui.button("Clear").clicked() {
-                        self.pending_clear = true;
-                    }
-                });
+                }
+                // Arrow from center → current wind.
+                let mag = self.wind.length();
+                if mag > 0.001 {
+                    const WIND_MAX: f32 = 2.0;
+                    let scale_ = (radius / WIND_MAX) * mag.min(WIND_MAX);
+                    let dir = self.wind.normalize();
+                    let tip = egui::pos2(
+                        center.x + dir.x * scale_,
+                        center.y + dir.y * scale_,
+                    );
+                    p.line_segment(
+                        [center, tip],
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(230, 200, 120)),
+                    );
+                    p.circle_filled(tip, 3.0, egui::Color32::from_rgb(240, 210, 130));
+                }
+                p.circle_filled(center, 2.0, egui::Color32::from_rgb(140, 140, 160));
+
+                // Numeric readout right of the pad.
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("x {:+.2}", self.wind.x))
+                        .color(value_color).size(12.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("y {:+.2}", self.wind.y))
+                        .color(value_color).size(12.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("|v| {:.2}", mag))
+                        .color(dim_label).size(12.0),
+                );
+
+                // Reset wind button.
+                ui.add_space(8.0);
+                if Self::tool_button(
+                    ui, "Reset Wind", false,
+                    btn_selected, btn_normal, btn_hover, btn_border, text_btn,
+                ) {
+                    self.wind = macroquad::math::Vec2::new(0.0, 0.0);
+                }
+
+                // ---- Footnote (open periodic table) ----
+                ui.add_space(18.0);
+                ui.separator();
                 ui.add_space(6.0);
-                ui.separator();
-
-                // ---- Compound palette ----
                 ui.label(
-                    egui::RichText::new("COMPOUNDS")
-                        .color(egui::Color32::from_rgb(130, 130, 150))
-                        .size(11.0),
+                    egui::RichText::new("Press Tab — periodic table")
+                        .color(dim_label).size(11.0),
                 );
-                let compounds = crate::ui_compound_palette();
-                let tile = 30.0;
-                let cols = ((panel_w - 24.0) / (tile + 4.0)) as usize;
-                let cols = cols.max(1);
-                Self::tile_grid(ui, compounds, cols, tile, &mut self.selected);
+                ui.label(
+                    egui::RichText::new("Space — pause   |   C — clear")
+                        .color(dim_label).size(11.0),
+                );
+            });
 
+        // Periodic-table modal overlay.
+        if self.pt_open {
+            self.draw_periodic_table(ctx);
+        }
+    }
+
+    fn style_panel(
+        ui: &mut egui::Ui,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+    ) {
+        let v = &mut ui.style_mut().visuals.widgets;
+        v.inactive.bg_fill = normal;
+        v.inactive.weak_bg_fill = normal;
+        v.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+        v.hovered.bg_fill = hover;
+        v.hovered.weak_bg_fill = hover;
+        v.hovered.bg_stroke = egui::Stroke::new(1.0, border);
+        v.active.bg_fill = hover;
+        v.active.weak_bg_fill = hover;
+        v.active.bg_stroke = egui::Stroke::new(1.0, border);
+    }
+
+    /// Draws a fixed-width tool button matching draw_panel_button:
+    /// 30px tall, full panel width, 1px border, label centered, three
+    /// states (normal / hovered / selected).
+    fn tool_button(
+        ui: &mut egui::Ui,
+        label: &str,
+        selected: bool,
+        sel_color: egui::Color32,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text: egui::Color32,
+    ) -> bool {
+        let bw = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(bw, 30.0),
+            egui::Sense::click(),
+        );
+        let bg = if selected { sel_color }
+                 else if resp.hovered() { hover }
+                 else { normal };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, bg);
+        p.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, border),
+            egui::StrokeKind::Inside);
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            text,
+        );
+        // Manual gap between buttons (6px in macroquad).
+        ui.add_space(6.0);
+        resp.clicked()
+    }
+
+    /// One ambient row (Temp / O₂ / Grav) — label left, value right,
+    /// hover-glow background. Mirrors the macroquad ambient row.
+    fn ambient_row(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &str,
+        dim: egui::Color32,
+        val_color: egui::Color32,
+    ) {
+        let bw = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(bw, 28.0),
+            egui::Sense::hover(),
+        );
+        let bg = if resp.hovered() {
+            egui::Color32::from_rgb(38, 38, 48)
+        } else {
+            egui::Color32::from_rgb(24, 24, 32)
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, bg);
+        p.rect_stroke(rect, 2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 62)),
+            egui::StrokeKind::Inside);
+        p.text(
+            egui::pos2(rect.left() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            dim,
+        );
+        p.text(
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            value,
+            egui::FontId::proportional(14.0),
+            val_color,
+        );
+        ui.add_space(5.0);
+    }
+
+    /// Periodic-table modal overlay. Mirrors `draw_periodic_table` —
+    /// dim background, 18-col atom grid, compound row, derived row,
+    /// detail panel below. Click an atom or compound to paint it.
+    fn draw_periodic_table(&mut self, ctx: &egui::Context) {
+        // Full-screen dimmer + click-to-close on the dim area.
+        let bg = egui::Color32::from_rgba_unmultiplied(8, 8, 14, 220);
+        egui::Area::new(egui::Id::new("alembic-pt-dim"))
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .order(egui::Order::Background)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.painter().rect_filled(screen, 0.0, bg);
+            });
+
+        let title = egui::RichText::new("Periodic Table of Elements")
+            .color(egui::Color32::WHITE).size(22.0);
+        let close_hint = egui::RichText::new("Tab or Esc to close")
+            .color(egui::Color32::from_rgb(180, 180, 180)).size(13.0);
+
+        egui::Window::new("Periodic Table")
+            .title_bar(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(18, 18, 26))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 76)))
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(title);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(close_hint);
+                    });
+                });
+                ui.label(
+                    egui::RichText::new("click an atom or compound to paint")
+                        .color(egui::Color32::GRAY).size(11.0),
+                );
                 ui.add_space(8.0);
 
-                // ---- Other compound-like elements (Wood, Fire, Charcoal,
-                // Salt, BattPos/BattNeg, Gunpowder are not in COMPOUND_PALETTE)
-                let extras: [Element; 7] = [
-                    Element::Wood, Element::Fire, Element::Charcoal,
-                    Element::Salt, Element::Gunpowder,
-                    Element::BattPos, Element::BattNeg,
-                ];
-                Self::tile_grid(ui, &extras, cols, tile, &mut self.selected);
+                let pt_tile = 38.0;
+                let pt_gap = 3.0;
 
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ---- Atom palette (periodic-table layout) ----
-                ui.label(
-                    egui::RichText::new("ATOMS (periodic table)")
-                        .color(egui::Color32::from_rgb(130, 130, 150))
-                        .size(11.0),
-                );
-                ui.add_space(2.0);
-
+                // Atom grid — 18 groups × 9 rows (periods 1-7 + lanth + actin).
                 let atoms = crate::ui_atoms();
-                Self::periodic_table(ui, &atoms, panel_w - 24.0, &mut self.selected);
+                let mut by_pp: std::collections::HashMap<(u8, u8), (Element, &'static str, u8)> =
+                    std::collections::HashMap::new();
+                for (el, num, sym, group, period) in &atoms {
+                    by_pp.insert((*period, *group), (*el, *sym, *num));
+                }
+                let max_period = atoms.iter().map(|a| a.4).max().unwrap_or(7);
+                for period in 1..=max_period {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = pt_gap;
+                        for group in 1..=18u8 {
+                            if let Some(&(el, sym, num)) = by_pp.get(&(period, group)) {
+                                Self::pt_atom_tile(
+                                    ui, el, sym, num, pt_tile, &mut self.selected,
+                                );
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(pt_tile, pt_tile),
+                                    egui::Sense::hover(),
+                                );
+                                let _ = rect;
+                            }
+                        }
+                    });
+                    ui.add_space(pt_gap);
+                }
 
-                ui.add_space(8.0);
-                ui.separator();
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("Compounds").color(egui::Color32::LIGHT_GRAY)
+                        .size(13.0),
+                );
+                ui.add_space(4.0);
 
-                // ---- Derived compounds ----
+                // Compound row — same tile size, contiguous.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = pt_gap;
+                    for &el in crate::ui_compound_palette() {
+                        Self::pt_compound_tile(ui, el, pt_tile, &mut self.selected);
+                    }
+                });
+
+                // Derived row.
                 let derived = crate::ui_derived_palette();
                 if !derived.is_empty() {
+                    ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("DERIVED")
-                            .color(egui::Color32::from_rgb(130, 130, 150))
-                            .size(11.0),
+                        egui::RichText::new("Derived")
+                            .color(egui::Color32::LIGHT_GRAY).size(13.0),
                     );
-                    ui.add_space(2.0);
-                    egui::ScrollArea::vertical()
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                for (did, formula, [r, g, b]) in &derived {
-                                    let selected_now =
-                                        self.selected == Element::Derived;
-                                    let mut btn = egui::Button::new(
-                                        egui::RichText::new(formula)
-                                            .color(egui::Color32::WHITE)
-                                            .size(11.0),
-                                    )
-                                    .fill(egui::Color32::from_rgb(*r, *g, *b))
-                                    .min_size(egui::vec2(38.0, 28.0));
-                                    if selected_now {
-                                        btn = btn.stroke(egui::Stroke::new(
-                                            2.0,
-                                            egui::Color32::from_rgb(120, 230, 120),
-                                        ));
-                                    }
-                                    if ui.add(btn).clicked() {
-                                        self.selected = Element::Derived;
-                                        let _ = did; // selecting Derived
-                                    }
-                                }
-                            });
-                        });
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = pt_gap;
+                        for (did, formula, [r, g, b]) in &derived {
+                            let highlight = self.selected == Element::Derived
+                                && self.selected_did == *did;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(pt_tile, pt_tile),
+                                egui::Sense::click(),
+                            );
+                            let p = ui.painter();
+                            p.rect_filled(rect, 2.0, egui::Color32::from_rgb(*r, *g, *b));
+                            p.rect_stroke(rect, 2.0,
+                                egui::Stroke::new(1.0,
+                                    egui::Color32::from_rgb(40, 40, 50)),
+                                egui::StrokeKind::Inside);
+                            if highlight {
+                                p.rect_stroke(rect.expand(2.0), 3.0,
+                                    egui::Stroke::new(3.0, egui::Color32::GREEN),
+                                    egui::StrokeKind::Inside);
+                            }
+                            if resp.hovered() {
+                                p.rect_stroke(rect.expand(1.0), 3.0,
+                                    egui::Stroke::new(3.0, egui::Color32::YELLOW),
+                                    egui::StrokeKind::Inside);
+                            }
+                            p.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                formula,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                            if resp.clicked() {
+                                self.selected = Element::Derived;
+                                self.selected_did = *did;
+                            }
+                        }
+                    });
                 }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close (Esc / Tab)").clicked() {
+                        self.pt_open = false;
+                    }
+                });
             });
     }
 
-    /// Render a flat grid of element tiles. Clicking a tile sets `selected`.
-    fn tile_grid(
+    fn pt_atom_tile(
         ui: &mut egui::Ui,
-        elements: &[Element],
-        cols: usize,
-        tile: f32,
+        el: Element,
+        sym: &'static str,
+        num: u8,
+        size: f32,
         selected: &mut Element,
     ) {
-        let mut chunks = elements.chunks(cols).peekable();
-        while let Some(row) = chunks.next() {
-            ui.horizontal(|ui| {
-                for &el in row {
-                    let (r, g, b) = el.base_color();
-                    let mut btn = egui::Button::new(
-                        egui::RichText::new(crate::ui_element_name(el))
-                            .color(if luminance(r, g, b) > 128 {
-                                egui::Color32::BLACK
-                            } else {
-                                egui::Color32::WHITE
-                            })
-                            .size(11.0),
-                    )
-                    .fill(egui::Color32::from_rgb(r, g, b))
-                    .min_size(egui::vec2(tile, tile));
-                    if *selected == el {
-                        btn = btn.stroke(egui::Stroke::new(
-                            2.0,
-                            egui::Color32::from_rgb(120, 230, 120),
-                        ));
-                    }
-                    if ui.add(btn).clicked() {
-                        *selected = el;
-                    }
-                }
-            });
-            if chunks.peek().is_some() {
-                ui.add_space(2.0);
-            }
+        let (r, g, b) = el.base_color();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(size, size),
+            egui::Sense::click(),
+        );
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+        p.rect_stroke(rect, 2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 50)),
+            egui::StrokeKind::Inside);
+        if *selected == el {
+            p.rect_stroke(rect.expand(2.0), 3.0,
+                egui::Stroke::new(3.0, egui::Color32::GREEN),
+                egui::StrokeKind::Inside);
+        }
+        if resp.hovered() {
+            p.rect_stroke(rect.expand(1.0), 3.0,
+                egui::Stroke::new(3.0, egui::Color32::YELLOW),
+                egui::StrokeKind::Inside);
+        }
+        // Atomic number (top-left, small).
+        p.text(
+            rect.left_top() + egui::vec2(3.0, 3.0),
+            egui::Align2::LEFT_TOP,
+            num.to_string(),
+            egui::FontId::proportional(10.0),
+            egui::Color32::BLACK,
+        );
+        // Symbol (centered, large).
+        p.text(
+            rect.center() + egui::vec2(0.0, 3.0),
+            egui::Align2::CENTER_CENTER,
+            sym,
+            egui::FontId::proportional(18.0),
+            egui::Color32::BLACK,
+        );
+        if resp.clicked() {
+            *selected = el;
         }
     }
 
-    /// Render the atom palette in periodic-table layout (period rows,
-    /// group columns). Empty cells are placeholders (gaps in the table).
-    fn periodic_table(
+    fn pt_compound_tile(
         ui: &mut egui::Ui,
-        atoms: &[(Element, u8, &'static str, u8, u8)],
-        avail_w: f32,
+        el: Element,
+        size: f32,
         selected: &mut Element,
     ) {
-        // 18 groups but lanthanides/actinides usually broken out; we
-        // keep them inline at groups 3 for periods 6/7 to fit the panel.
-        let cols = 18.0;
-        let tile = ((avail_w - (cols - 1.0) * 2.0) / cols).max(14.0).min(28.0);
-        let mut by_pp: std::collections::BTreeMap<(u8, u8), (Element, &'static str)> =
-            std::collections::BTreeMap::new();
-        for &(el, _num, sym, group, period) in atoms {
-            by_pp.insert((period, group), (el, sym));
+        let (r, g, b) = el.base_color();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(size, size),
+            egui::Sense::click(),
+        );
+        let p = ui.painter();
+        if el == Element::Empty {
+            p.rect_filled(rect, 2.0, egui::Color32::from_rgb(40, 40, 46));
+            // Red X — eraser indicator.
+            let red = egui::Color32::from_rgb(200, 70, 70);
+            p.line_segment(
+                [
+                    rect.left_top() + egui::vec2(8.0, 8.0),
+                    rect.right_bottom() - egui::vec2(8.0, 8.0),
+                ],
+                egui::Stroke::new(2.0, red),
+            );
+            p.line_segment(
+                [
+                    rect.right_top() + egui::vec2(-8.0, 8.0),
+                    rect.left_bottom() + egui::vec2(8.0, -8.0),
+                ],
+                egui::Stroke::new(2.0, red),
+            );
+        } else {
+            p.rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
         }
-        let max_period = atoms.iter().map(|a| a.4).max().unwrap_or(7);
-        for period in 1..=max_period {
-            ui.horizontal(|ui| {
-                for group in 1..=18u8 {
-                    if let Some(&(el, sym)) = by_pp.get(&(period, group)) {
-                        let (r, g, b) = el.base_color();
-                        let dark = luminance(r, g, b) < 128;
-                        let mut btn = egui::Button::new(
-                            egui::RichText::new(sym)
-                                .color(if dark {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::BLACK
-                                })
-                                .size(10.0),
-                        )
-                        .fill(egui::Color32::from_rgb(r, g, b))
-                        .min_size(egui::vec2(tile, tile));
-                        if *selected == el {
-                            btn = btn.stroke(egui::Stroke::new(
-                                2.0,
-                                egui::Color32::from_rgb(120, 230, 120),
-                            ));
-                        }
-                        if ui.add(btn).clicked() {
-                            *selected = el;
-                        }
-                    } else {
-                        // empty slot — invisible spacer
-                        ui.add_space(tile + 2.0);
-                    }
-                }
-            });
+        p.rect_stroke(rect, 2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 50)),
+            egui::StrokeKind::Inside);
+        if *selected == el {
+            p.rect_stroke(rect.expand(2.0), 3.0,
+                egui::Stroke::new(3.0, egui::Color32::GREEN),
+                egui::StrokeKind::Inside);
+        }
+        if resp.hovered() {
+            p.rect_stroke(rect.expand(1.0), 3.0,
+                egui::Stroke::new(3.0, egui::Color32::YELLOW),
+                egui::StrokeKind::Inside);
+        }
+        if resp.clicked() {
+            *selected = el;
         }
     }
 
@@ -5585,7 +5935,16 @@ impl ApplicationHandler for App {
                             // otherwise resurrect the cleared cells).
                             state.pending_clear = true;
                         }
-                        KeyCode::Escape => event_loop.exit(),
+                        KeyCode::Tab => {
+                            state.pt_open = !state.pt_open;
+                        }
+                        KeyCode::Escape => {
+                            if state.pt_open {
+                                state.pt_open = false;
+                            } else {
+                                event_loop.exit();
+                            }
+                        }
                         _ => {}
                     }
                 }

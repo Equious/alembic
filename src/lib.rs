@@ -107,7 +107,7 @@ pub enum Kind { Empty, Solid, Gravel, Powder, Liquid, Gas, Fire }
 // Grab lifts existing cells from the sim and lets you reposition them —
 // useful for dropping reactive elements into containers you've built.
 #[derive(Clone, Copy, PartialEq)]
-enum ToolMode { Paint, Heat, Vacuum, Pipet, Prefab, Wire }
+pub enum ToolMode { Paint, Heat, Vacuum, Pipet, Prefab, Wire }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PrefabKind { Beaker, Box, Battery }
