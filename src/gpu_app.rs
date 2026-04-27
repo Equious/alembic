@@ -5194,6 +5194,386 @@ impl BurnCyclesCtx {
     }
 }
 
+const PRESSURE_SHOVE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0..3 = Margolus phase
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element pressure props: x = compliance (i32), y = perm, z = formation, w = density.
+@group(0) @binding(2) var<uniform> pressure_lut: array<vec4<f32>, 96>;
+@group(0) @binding(3) var<uniform> motion_props: array<vec4<f32>, 96>;
+
+const FLAG_FROZEN: u32 = 0x02u;
+const FLAG_UPDATED: u32 = 0x01u;
+
+const KIND_EMPTY: u32  = 0u;
+const KIND_SOLID: u32  = 1u;
+const KIND_GRAVEL: u32 = 2u;
+const KIND_POWDER: u32 = 3u;
+const KIND_LIQUID: u32 = 4u;
+const KIND_GAS: u32    = 5u;
+const KIND_FIRE: u32   = 6u;
+
+fn ps_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn ps_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn ps_frozen(c: vec4<u32>) -> bool { return (ps_flag(c) & FLAG_FROZEN) != 0u; }
+fn ps_updated(c: vec4<u32>) -> bool { return (ps_flag(c) & FLAG_UPDATED) != 0u; }
+fn ps_pressure(c: vec4<u32>) -> i32 {
+    let raw = (c.z >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn ps_kind(c: vec4<u32>) -> u32 { return u32(motion_props[ps_el(c)].x); }
+fn ps_density(c: vec4<u32>) -> f32 { return motion_props[ps_el(c)].y; }
+fn ps_compliance(c: vec4<u32>) -> i32 { return i32(pressure_lut[ps_el(c)].x); }
+
+fn ps_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Faithful port of can_enter for the pressure-shove move check.
+// Direction dy is -1=up, 0=horizontal, 1=down.
+fn ps_can_enter(c_src: vec4<u32>, c_tgt: vec4<u32>, dy: i32) -> bool {
+    let tk = ps_kind(c_tgt);
+    if (ps_frozen(c_tgt)) { return false; }
+    if (tk == KIND_EMPTY) { return true; }
+    if (tk == KIND_SOLID || tk == KIND_GRAVEL) { return false; }
+    let sk = ps_kind(c_src);
+    let sd = ps_density(c_src);
+    let td = ps_density(c_tgt);
+    if (sk == KIND_GAS && tk == KIND_GAS) { return true; }
+    if (dy > 0) { return sd > td; }
+    if (dy < 0) { return sd < td; }
+    return sd > td;
+}
+
+fn ps_mark_updated(c: vec4<u32>) -> vec4<u32> {
+    return vec4<u32>(c.x, c.y | (FLAG_UPDATED << 8u), c.z, c.w);
+}
+
+// Compute net pressure force on a cell. Returns (step_x, step_y, mag).
+// CPU `try_pressure_shove` (lib.rs:8037).
+struct ShoveDecision {
+    step_x: i32,
+    step_y: i32,
+    mag: i32,
+}
+fn shove_decision(x: i32, y: i32, c: vec4<u32>) -> ShoveDecision {
+    var out: ShoveDecision;
+    out.step_x = 0; out.step_y = 0; out.mag = 0;
+    if (ps_compliance(c) == 0) { return out; }
+    let wi = i32(u.width);
+    let hi = i32(u.height);
+    var net_x: i32 = 0;
+    var net_y: i32 = 0;
+    let n_p_left = select(
+        0,
+        ps_pressure(cells[u32(y) * u.width + u32(x - 1)]),
+        x - 1 >= 0,
+    );
+    let n_p_right = select(
+        0,
+        ps_pressure(cells[u32(y) * u.width + u32(x + 1)]),
+        x + 1 < wi,
+    );
+    let n_p_up = select(
+        0,
+        ps_pressure(cells[u32(y - 1) * u.width + u32(x)]),
+        y - 1 >= 0,
+    );
+    let n_p_down = select(
+        0,
+        ps_pressure(cells[u32(y + 1) * u.width + u32(x)]),
+        y + 1 < hi,
+    );
+    // pressure on (-1, 0) pushes toward (+1, 0): net_x -= -1 * p = +p.
+    net_x = net_x - (-1 * n_p_left);
+    net_x = net_x - (1 * n_p_right);
+    net_y = net_y - (-1 * n_p_up);
+    net_y = net_y - (1 * n_p_down);
+    let mag2 = net_x * net_x + net_y * net_y;
+    out.mag = i32(sqrt(f32(mag2)));
+    if (out.mag < 400) { return out; }
+    if (abs(net_x) >= abs(net_y)) {
+        out.step_x = select(-1, 1, net_x > 0);
+        if (net_x == 0) { out.step_x = 0; }
+    } else {
+        out.step_y = select(-1, 1, net_y > 0);
+        if (net_y == 0) { out.step_y = 0; }
+    }
+    return out;
+}
+
+// Try to pressure-shove cell c at local position (lx, ly) within
+// the Margolus block. Returns the new (a, b) cells if a swap happened.
+struct ShoveResult {
+    fired: u32,
+    a: vec4<u32>,
+    b: vec4<u32>,
+    target_kind: u32,        // 0=c00, 1=c10, 2=c01, 3=c11 — slot of the swap target
+    src_kind: u32,
+}
+
+fn try_shove(
+    src_kind: u32,
+    c_src: vec4<u32>,
+    bxi: i32, byi: i32,
+    seed: u32,
+    c00: vec4<u32>, c10: vec4<u32>, c01: vec4<u32>, c11: vec4<u32>,
+) -> ShoveResult {
+    var out: ShoveResult;
+    out.fired = 0u; out.a = c_src; out.b = c_src;
+    out.target_kind = 0u; out.src_kind = src_kind;
+    if (ps_updated(c_src) || ps_frozen(c_src)) { return out; }
+    var x = bxi; var y = byi;
+    if (src_kind == 1u) { x = bxi + 1; }
+    if (src_kind == 2u) { y = byi + 1; }
+    if (src_kind == 3u) { x = bxi + 1; y = byi + 1; }
+    let dec = shove_decision(x, y, c_src);
+    if (dec.mag < 400) { return out; }
+    let nx = x + dec.step_x;
+    let ny = y + dec.step_y;
+    // Only shove WITHIN the Margolus block to keep writes race-free.
+    var tgt_kind: u32 = 4u;
+    if (nx == bxi     && ny == byi)     { tgt_kind = 0u; }
+    if (nx == bxi + 1 && ny == byi)     { tgt_kind = 1u; }
+    if (nx == bxi     && ny == byi + 1) { tgt_kind = 2u; }
+    if (nx == bxi + 1 && ny == byi + 1) { tgt_kind = 3u; }
+    if (tgt_kind == 4u || tgt_kind == src_kind) { return out; }
+    var c_tgt: vec4<u32>;
+    if (tgt_kind == 0u) { c_tgt = c00; }
+    else if (tgt_kind == 1u) { c_tgt = c10; }
+    else if (tgt_kind == 2u) { c_tgt = c01; }
+    else { c_tgt = c11; }
+    if (ps_updated(c_tgt)) { return out; }
+    if (!ps_can_enter(c_src, c_tgt, dec.step_y)) { return out; }
+    let take = clamp((dec.mag * ps_compliance(c_src)) / 512, 0, 255);
+    let r = ps_hash(seed, u.frame ^ src_kind);
+    if (i32(r % 256u) >= take) { return out; }
+    out.fired = 1u;
+    out.a = ps_mark_updated(c_tgt);   // src position gets target cell
+    out.b = ps_mark_updated(c_src);   // target position gets src cell
+    out.target_kind = tgt_kind;
+    return out;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+    let block_seed = by * u.width + bx;
+    let bxi = i32(bx);
+    let byi = i32(by);
+    var fired = false;
+
+    // Try each cell in canonical order; first successful shove
+    // commits to the block. Within-block targeting only.
+    if (!fired) {
+        let r = try_shove(0u, c00, bxi, byi, block_seed, c00, c10, c01, c11);
+        if (r.fired != 0u) {
+            // Source = c00 → target slot.
+            if (r.target_kind == 1u) { c00 = r.a; c10 = r.b; }
+            else if (r.target_kind == 2u) { c00 = r.a; c01 = r.b; }
+            else if (r.target_kind == 3u) { c00 = r.a; c11 = r.b; }
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_shove(1u, c10, bxi, byi, block_seed, c00, c10, c01, c11);
+        if (r.fired != 0u) {
+            if (r.target_kind == 0u) { c10 = r.a; c00 = r.b; }
+            else if (r.target_kind == 2u) { c10 = r.a; c01 = r.b; }
+            else if (r.target_kind == 3u) { c10 = r.a; c11 = r.b; }
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_shove(2u, c01, bxi, byi, block_seed, c00, c10, c01, c11);
+        if (r.fired != 0u) {
+            if (r.target_kind == 0u) { c01 = r.a; c00 = r.b; }
+            else if (r.target_kind == 1u) { c01 = r.a; c10 = r.b; }
+            else if (r.target_kind == 3u) { c01 = r.a; c11 = r.b; }
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_shove(3u, c11, bxi, byi, block_seed, c00, c10, c01, c11);
+        if (r.fired != 0u) {
+            if (r.target_kind == 0u) { c11 = r.a; c00 = r.b; }
+            else if (r.target_kind == 1u) { c11 = r.a; c10 = r.b; }
+            else if (r.target_kind == 2u) { c11 = r.a; c01 = r.b; }
+        }
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct PressureShoveUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+}
+
+/// GPU port of `World::try_pressure_shove` — pressure-driven cell
+/// displacement. Cells with non-zero compliance check their 4-cardinal
+/// pressure neighbors, compute a net force, and (if magnitude ≥ 400)
+/// swap with the dominant-direction neighbor scaled by compliance.
+/// Margolus 2x2 4-phase keeps the 2-cell swap race-free.
+struct PressureShoveCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 4],
+    pass_bind_groups: [wgpu::BindGroup; 4],
+}
+
+impl PressureShoveCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        // Pressure profile LUT: [compliance, permeability, formation_pressure, density].
+        let mut press_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            let raw = crate::pressure_perm_props(i as u8);
+            // raw is [u32; 4]: perm, compliance, formation, _ — but we
+            // need [compliance, perm, formation, density]. Reorder.
+            press_data[i] = [
+                raw[1] as f32,         // compliance
+                raw[0] as f32,         // permeability
+                raw[2] as f32,         // formation_pressure
+                0.0,                   // density unused
+            ];
+        }
+        let press_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-pshove-press-lut"),
+            contents: bytemuck::cast_slice(&press_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let mut motion_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            motion_data[i] = crate::motion_props(i as u8);
+        }
+        let motion_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-pshove-motion-lut"),
+            contents: bytemuck::cast_slice(&motion_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = PressureShoveUniforms {
+                width: W as u32, height: H as u32, pass_id, frame: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let pass_uniform_bufs: [wgpu::Buffer; 4] = [
+            mk_uniform("alembic-pshove-u-0", 0),
+            mk_uniform("alembic-pshove-u-1", 1),
+            mk_uniform("alembic-pshove-u-2", 2),
+            mk_uniform("alembic-pshove-u-3", 3),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-pshove-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-pshove-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: press_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: motion_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-pshove-shader"),
+            source: wgpu::ShaderSource::Wgsl(PRESSURE_SHOVE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-pshove-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-pshove-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let _ = press_buf;
+        let _ = motion_buf;
+        PressureShoveCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let arr = [frame];
+        let bytes: &[u8] = bytemuck::cast_slice(&arr);
+        for buf in &self.pass_uniform_bufs {
+            queue.write_buffer(buf, 12, bytes);
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        for i in 0..4 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-pshove-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -6155,6 +6535,9 @@ struct Uniforms {
 @group(0) @binding(3) var sim_tex: texture_storage_2d<rgba8unorm, write>;
 // Derived compound color mirror — vec4<f32> per slot, RGBA in [0,1].
 @group(0) @binding(4) var<uniform> derived_color: array<vec4<f32>, 256>;
+// Per-element radioactive-activity (0..1). Drives the cyan-green
+// glow pulse for U / Ra / etc. 96 entries packed 4 per vec4<f32>.
+@group(0) @binding(5) var<uniform> radio_lut: array<vec4<f32>, 24>;
 
 const FLAG_FROZEN: u32 = 0x02u;
 const PHASE_MASK:  u32 = 0x0Cu;
@@ -6249,6 +6632,22 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         color.b = min(color.b + 30.0/255.0, 1.0);
     }
 
+    // Radioactive glow — bright pulsing cyan-green tint for U / Ra etc.
+    // Phase from seed + temp low byte (so stationary cells still pulse).
+    let activity = radio_lut[el / 4u][el % 4u];
+    if (activity > 0.0) {
+        let temp_byte = u32(temp) & 0xFFu;
+        let phase_byte = (cell_seed_render(c) + temp_byte) & 0xFFu;
+        let pulse_norm = (f32(phase_byte) / 255.0) * 2.0 - 1.0;
+        let pulse = 0.6 + 0.4 * abs(pulse_norm);
+        let mix_amt = min(activity * pulse * 0.75, 0.85);
+        color = mix(
+            color,
+            vec3<f32>(120.0/255.0, 1.0, 160.0/255.0),
+            mix_amt,
+        );
+    }
+
     // Phase tint — forced (non-native) phases shift toward cold,
     // hot, or washed-out depending on which way the phase changed.
     let phase = cell_phase(c);
@@ -6322,6 +6721,18 @@ impl RenderComputeCtx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Radioactive activity LUT — 96 floats packed 4 per vec4<f32>.
+        let mut radio_lut: Vec<[f32; 4]> = vec![[0.0; 4]; 24];
+        for el_id in 0u32..96u32 {
+            let v = crate::radioactive_activity(el_id as u8);
+            radio_lut[(el_id / 4) as usize][(el_id % 4) as usize] = v;
+        }
+        let radio_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-render-radio-lut"),
+            contents: bytemuck::cast_slice(&radio_lut),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-render-bgl"),
             entries: &[
@@ -6350,6 +6761,10 @@ impl RenderComputeCtx {
                     binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -6361,6 +6776,7 @@ impl RenderComputeCtx {
                 wgpu::BindGroupEntry { binding: 2, resource: color_lut_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sim_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: derived_color_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: radio_lut_buf.as_entire_binding() },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -6380,6 +6796,8 @@ impl RenderComputeCtx {
             compilation_options: Default::default(),
             cache: None,
         });
+        // radio_lut_buf retained via bind_group, binding 5.
+        let _ = radio_lut_buf;
         RenderComputeCtx {
             pipeline,
             uniform_buf,
@@ -6526,6 +6944,9 @@ struct GpuState {
     /// Burn-cycle chemistries: thermite + magnesium_burn (per-cell
     /// burn-tick + Margolus ignition/consume).
     burn_compute: BurnCyclesCtx,
+    /// Pressure-driven cell displacement (try_pressure_shove). Margolus
+    /// 2x2 4-phase. Drives gas dispersion and water leveling.
+    pshove_compute: PressureShoveCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -6973,6 +7394,7 @@ impl GpuState {
         let chem_compute = ChemReactionsCtx::new(&device, &queue, &cells_buf);
         let sup_chem_compute = SupportingChemCtx::new(&device, &queue, &cells_buf);
         let burn_compute = BurnCyclesCtx::new(&device, &queue, &cells_buf);
+        let pshove_compute = PressureShoveCtx::new(&device, &queue, &cells_buf);
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -7029,6 +7451,7 @@ impl GpuState {
             chem_compute,
             sup_chem_compute,
             burn_compute,
+            pshove_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -9066,6 +9489,10 @@ impl GpuState {
             // 6. color_fires — Fire cells inherit flame color from any
             //    flame-coloring neighbor.
             self.color_fires_compute.encode(&mut encoder);
+            // 6b. Pressure-shove. Runs BEFORE motion so cells displaced
+            //     by pressure gradients don't get yanked by gravity in
+            //     the same frame. Margolus 2x2 4-phase, race-free.
+            self.pshove_compute.encode(&mut encoder, &self.queue, self.frame_counter);
             // 7. Motion: 5 passes (vfall, lspread-even/odd, dslide-even/odd).
             self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter, &self.cells_buf);
             self.queue.submit(std::iter::once(encoder.finish()));

@@ -588,6 +588,20 @@ pub fn moisture_phase_props(id: u8) -> [f32; 4] {
     [wet_thr, wet_el, dry_thr, dry_el]
 }
 
+/// Per-element radioactive activity for the GPU render shader's
+/// cyan-green pulse tint. Returns 0.0 for stable elements, otherwise
+/// `(30000.0 / half_life_frames).clamp(0.35, 1.0)` — same curve the
+/// CPU `color_rgb` uses.
+pub fn radioactive_activity(id: u8) -> f32 {
+    let el = element_from_u8(id);
+    if let Some(a) = atom_profile_for(el) {
+        if a.half_life_frames > 0 {
+            return (30000.0 / a.half_life_frames as f32).clamp(0.35, 1.0);
+        }
+    }
+    0.0
+}
+
 pub fn motion_props(id: u8) -> [f32; 4] {
     let i = id as usize;
     if i >= ELEMENT_COUNT { return [0.0; 4]; }
@@ -3967,12 +3981,19 @@ impl World {
         // up front saves the ~0.5–1.3ms steady cost when the world has no
         // uranium at all (which is the common case unless someone's
         // building a bomb).
+        // Detect any radioactive atom (U or Ra). The U-specific work
+        // (component flood-fill, criticality, burst commits, central
+        // blasts) is gated on U presence; the per-cell decay tick at
+        // the end of this function runs as long as ANY radioactive
+        // atom is present so Ra ages even without U in the scene.
         let mut has_u = false;
+        let mut has_radioactive = false;
         for c in self.cells.iter() {
-            if c.el == Element::U { has_u = true; break; }
+            if c.el == Element::U { has_u = true; has_radioactive = true; break; }
+            if c.el == Element::Ra { has_radioactive = true; }
         }
-        if !has_u { return; }
-        self.compute_u_components();
+        if !has_radioactive { return; }
+        if has_u { self.compute_u_components(); }
         // Clear stale commit flags from previous frames: any cell that
         // isn't currently U can't be mid-cascade, so its flag is
         // garbage. Without this reset, a position that committed during
