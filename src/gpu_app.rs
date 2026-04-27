@@ -3363,6 +3363,514 @@ impl GlassEtchCtx {
     }
 }
 
+const CHEM_REACTIONS_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0..3 = Margolus phase
+    frame: u32,
+    ambient_oxygen: f32,
+    ambient_offset: i32,
+    _pad0: u32,
+    _pad1: u32,
+}
+struct Products {
+    water: u32,
+    salt:  u32,
+    rust:  u32,
+    co2:   u32,
+    h:     u32,
+    steam: u32,
+    derived: u32,
+    empty: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element chemistry profile: x=electronegativity, y=valence (f32),
+// z=atomic_mass, w=has_chem_flag.
+@group(0) @binding(2) var<uniform> chem_lut: array<vec4<f32>, 96>;
+// Flat 96×96 byte LUT packed into vec4<u32>: derived_id at [a*96+b].
+// 0xFF = no derived product.
+@group(0) @binding(3) var<uniform> atom_pair_did: array<vec4<u32>, 576>;
+// Bespoke product element ids (Water/Salt/Rust/CO2/H/Steam/Derived/Empty).
+@group(0) @binding(4) var<uniform> products: Products;
+
+const FLAG_UPDATED: u32 = 0x01u;
+
+fn cr_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cr_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn cr_updated(c: vec4<u32>) -> bool { return (cr_flag(c) & FLAG_UPDATED) != 0u; }
+fn cr_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+
+fn cr_get_did(a: u32, b: u32) -> u32 {
+    let i = a * 96u + b;
+    let q = atom_pair_did[i / 16u];
+    let lane = (i / 4u) % 4u;
+    let byte_in_lane = i % 4u;
+    let word = q[lane];
+    return (word >> (byte_in_lane * 8u)) & 0xFFu;
+}
+
+fn cr_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+fn make_cell(el: u32, did: u32, temp: i32) -> vec4<u32> {
+    let clamped = clamp(temp, -273, 5000);
+    let traw = u32(clamped) & 0xFFFFu;
+    let x = (el & 0xFFu) | ((did & 0xFFu) << 8u);
+    // FLAG_UPDATED marks the new cell as already-processed this frame.
+    let y = (FLAG_UPDATED << 8u) | (traw << 16u);
+    return vec4<u32>(x, y, 0u, 0u);
+}
+
+// Catalyst flags from a 4×3 area covering both cells of a horizontal
+// pair (or 3×4 for vertical). Returns (has_water, has_salt) packed
+// into a vec2<u32> as 0/1 each.
+fn catalyst_flags(
+    x0: i32, y0: i32, w: i32, h: i32,
+    width: u32, height: u32,
+) -> vec2<u32> {
+    var has_water: u32 = 0u;
+    var has_salt: u32 = 0u;
+    let wi = i32(width);
+    let hi = i32(height);
+    for (var dy: i32 = 0; dy < h; dy = dy + 1) {
+        for (var dx: i32 = 0; dx < w; dx = dx + 1) {
+            let nx = x0 + dx;
+            let ny = y0 + dy;
+            if (nx < 0 || nx >= wi || ny < 0 || ny >= hi) { continue; }
+            let nc = cells[u32(ny) * width + u32(nx)];
+            let el = cr_el(nc);
+            // Element ids: Water=2, Steam=7, Ice=14, Salt=40.
+            if (el == 2u || el == 7u || el == 14u) { has_water = 1u; }
+            if (el == 40u) { has_salt = 1u; }
+        }
+    }
+    return vec2<u32>(has_water, has_salt);
+}
+
+// Result of a single pair chemistry attempt — same as ReactionOutcome
+// in lib.rs. Encoded as a struct so the shader can return early when
+// no reaction fires.
+struct ReactionResult {
+    fired: u32,           // 1 if pair reacted this frame
+    a_out: vec4<u32>,
+    b_out: vec4<u32>,
+}
+
+// Faithful port of try_emergent_reaction → if fired, build product
+// cells for both endpoints. Uses the catalyst neighborhood scan, the
+// activation-energy bucket, the rate ladder, and the bespoke /
+// derived product table.
+fn try_react(
+    c_a: vec4<u32>, c_b: vec4<u32>,
+    catalyst_x0: i32, catalyst_y0: i32,
+    catalyst_w: i32, catalyst_h: i32,
+    rng_seed: u32,
+) -> ReactionResult {
+    var out: ReactionResult;
+    out.fired = 0u;
+    out.a_out = c_a;
+    out.b_out = c_b;
+
+    let el_a = cr_el(c_a);
+    let el_b = cr_el(c_b);
+    if (el_a == 0u || el_b == 0u) { return out; }
+    if (el_a == el_b) { return out; }
+    if (cr_updated(c_a) || cr_updated(c_b)) { return out; }
+
+    let prof_a = chem_lut[el_a];
+    let prof_b = chem_lut[el_b];
+    if (prof_a.w < 0.5 || prof_b.w < 0.5) { return out; }
+    let ea = prof_a.x;
+    let eb = prof_b.x;
+    if (ea == 0.0 || eb == 0.0) { return out; }
+
+    let delta_e = abs(ea - eb);
+    if (delta_e < 0.4) { return out; }
+
+    // Donor = lower EN, acceptor = higher EN.
+    var donor_el: u32; var acceptor_el: u32;
+    var donor_v: f32; var acceptor_v: f32;
+    var donor_e: f32; var acceptor_e: f32;
+    if (ea < eb) {
+        donor_el = el_a; acceptor_el = el_b;
+        donor_v = prof_a.y; acceptor_v = prof_b.y;
+        donor_e = ea; acceptor_e = eb;
+    } else {
+        donor_el = el_b; acceptor_el = el_a;
+        donor_v = prof_b.y; acceptor_v = prof_a.y;
+        donor_e = eb; acceptor_e = ea;
+    }
+    if (donor_v > 4.0 || acceptor_v < 5.0) { return out; }
+
+    // Catalyst neighborhood scan.
+    let cats = catalyst_flags(
+        catalyst_x0, catalyst_y0, catalyst_w, catalyst_h,
+        u.width, u.height,
+    );
+    let has_water = cats.x;
+    let has_salt = cats.y;
+    let has_electrolyte = (has_water | has_salt) != 0u;
+
+    // Activation energy.
+    let acceptor_bonus = i32(max(acceptor_e - 2.5, 0.0) * 300.0);
+    let donor_metal_bonus = select(0, 200, donor_e < 2.0);
+    var activation: i32;
+    if (delta_e >= 2.5) { activation = -200; }
+    else if (delta_e >= 1.6) { activation = 100; }
+    else if (delta_e >= 0.9) { activation = 400; }
+    else { activation = 800; }
+    activation = activation - acceptor_bonus - donor_metal_bonus;
+    if (has_electrolyte) { activation = activation - 200; }
+    let t_a = cr_temp(c_a);
+    let t_b = cr_temp(c_b);
+    if (t_a < activation || t_b < activation) { return out; }
+
+    // Bespoke product matching.
+    // (donor=H, acceptor=O) → Water; (Na, Cl) → Salt; (Fe, O) → Rust;
+    // (C, O) → CO2; metal(EN<1.4, val<=2) + Water/Ice/Steam → H.
+    // Element ids: H=18, O=22, Na=25, Cl=31, Fe=34, C=20.
+    var bespoke_kind: u32 = 0u; // 0=none, 1=water, 2=salt, 3=rust, 4=co2, 5=h-from-water
+    if (donor_el == 18u && acceptor_el == 22u) { bespoke_kind = 1u; }
+    else if (donor_el == 25u && acceptor_el == 31u) { bespoke_kind = 2u; }
+    else if (donor_el == 34u && acceptor_el == 22u) { bespoke_kind = 3u; }
+    else if (donor_el == 20u && acceptor_el == 22u) { bespoke_kind = 4u; }
+    // Metal-in-water: donor is the cell with EN<1.4, val<=2,
+    // acceptor is Water(2)/Ice(14)/Steam(7).
+    if (bespoke_kind == 0u && donor_e < 1.4 && donor_v <= 2.0
+        && (acceptor_el == 2u || acceptor_el == 14u || acceptor_el == 7u)) {
+        bespoke_kind = 5u;
+    }
+
+    // Derived fallback when no bespoke applies.
+    var product_el: u32 = products.empty;
+    var product_did: u32 = 0u;
+    var product_kind: u32 = 0u;
+    if (bespoke_kind == 1u) { product_el = products.water;  product_kind = 1u; }
+    else if (bespoke_kind == 2u) { product_el = products.salt; product_kind = 2u; }
+    else if (bespoke_kind == 3u) { product_el = products.rust; product_kind = 3u; }
+    else if (bespoke_kind == 4u) { product_el = products.co2;  product_kind = 4u; }
+    else if (bespoke_kind == 5u) { product_el = products.h;    product_kind = 5u; }
+    else {
+        let did = cr_get_did(donor_el, acceptor_el);
+        if (did == 0xFFu) { return out; }
+        product_el = products.derived;
+        product_did = did;
+        product_kind = 6u;
+    }
+
+    // Rate ladder. Catalyst multipliers: water=3×, salt=5×.
+    var rate: f32 = min(delta_e * 0.2, 1.0);
+    if (has_water != 0u) { rate = rate * 3.0; }
+    if (has_salt != 0u) { rate = rate * 5.0; }
+    if (product_kind == 3u) { rate = min(rate * 0.0005, 0.05); }       // Rust
+    if (product_kind == 6u) { rate = min(rate * 0.01, 0.2); }          // Derived
+    if (donor_e < 0.85) { rate = min(rate * 18.0, 0.99); }              // Cs
+    if (delta_e >= 2.8 && donor_e < 1.0 && product_kind == 6u) {
+        rate = max(rate, 0.85);
+    }
+    rate = clamp(rate, 0.0, 1.0);
+
+    // RNG gate.
+    let r = cr_hash(rng_seed, u.frame);
+    let frac = f32(r & 0xFFFFu) / 65536.0;
+    if (frac > rate) { return out; }
+
+    // Heat release per product type.
+    var delta_temp: i32;
+    if (product_kind == 1u) { delta_temp = 1800; }                       // Water
+    else if (product_kind == 4u) { delta_temp = 900; }                   // CO2
+    else if (product_kind == 5u) { delta_temp = 400; }                   // H
+    else if (product_kind == 2u) { delta_temp = 150; }                   // Salt
+    else if (product_kind == 3u) { delta_temp = 20; }                    // Rust
+    else { delta_temp = i32(min(delta_e * 30.0, 80.0)); }                // Derived
+    if (donor_e < 0.85 && product_kind == 6u) { delta_temp = 450; }
+    if (product_kind == 5u) {
+        if (donor_e < 0.85) { delta_temp = 2800; rate = max(rate, 0.85); }
+        else if (donor_e < 1.0) { delta_temp = 1500; rate = max(rate, 0.50); }
+        else if (donor_e < 1.4) { delta_temp = 600; }
+    }
+    if (delta_e >= 2.8 && donor_e < 1.0 && product_kind == 6u) {
+        delta_temp = i32(delta_e * 1000.0);
+    }
+
+    // Metal-in-water special case — donor cell becomes H, acceptor
+    // becomes Steam. All other reactions: both cells become product.
+    let metal_in_water = product_kind == 5u
+        && (acceptor_el == 2u || acceptor_el == 14u || acceptor_el == 7u);
+    var a_new: vec4<u32>;
+    var b_new: vec4<u32>;
+    if (metal_in_water) {
+        // (donor cell is c_a if ea < eb; otherwise c_b)
+        if (ea < eb) {
+            a_new = make_cell(products.h, 0u, t_a + delta_temp);
+            b_new = make_cell(products.steam, 0u, t_b + delta_temp);
+        } else {
+            a_new = make_cell(products.steam, 0u, t_a + delta_temp);
+            b_new = make_cell(products.h, 0u, t_b + delta_temp);
+        }
+    } else {
+        a_new = make_cell(product_el, product_did, t_a + delta_temp);
+        b_new = make_cell(product_el, product_did, t_b + delta_temp);
+    }
+
+    out.fired = 1u;
+    out.a_out = a_new;
+    out.b_out = b_new;
+    return out;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    let bxi = i32(bx);
+    let byi = i32(by);
+    let block_seed = by * u.width + bx;
+
+    // Try each pair in canonical order; first hit consumes the block.
+    // Catalyst window for horizontal pair: 4-wide × 3-tall starting
+    // one cell up-left of the leftmost cell. For vertical pair:
+    // 3-wide × 4-tall starting one cell up-left.
+    var fired = false;
+
+    if (!fired) {
+        let r = try_react(c00, c10, bxi - 1, byi - 1, 4, 3, block_seed);
+        if (r.fired != 0u) {
+            c00 = r.a_out; c10 = r.b_out;
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_react(c01, c11, bxi - 1, byi, 4, 3, block_seed ^ 0xA5A5A5A5u);
+        if (r.fired != 0u) {
+            c01 = r.a_out; c11 = r.b_out;
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_react(c00, c01, bxi - 1, byi - 1, 3, 4, block_seed ^ 0x5A5A5A5Au);
+        if (r.fired != 0u) {
+            c00 = r.a_out; c01 = r.b_out;
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_react(c10, c11, bxi, byi - 1, 3, 4, block_seed ^ 0xC3C3C3C3u);
+        if (r.fired != 0u) {
+            c10 = r.a_out; c11 = r.b_out;
+        }
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ChemReactionsUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+    ambient_oxygen: f32,
+    ambient_offset: i32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ChemProductsUniform {
+    products: [u32; 8],
+}
+
+/// GPU port of the emergent chemistry framework — chemical_reactions
+/// plus the supporting always-running passes (acid_displacement,
+/// alloy_formation, alloy_acid_leach, base_neutralization), all
+/// collapsed into a single Margolus 2x2 4-phase compute. Catalyst
+/// neighborhood scan, activation energy bucket, rate ladder, bespoke
+/// product table, derived-id LUT — everything that try_emergent_reaction
+/// computes in lib.rs is replicated in WGSL.
+struct ChemReactionsCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 4],
+    pass_bind_groups: [wgpu::BindGroup; 4],
+}
+
+impl ChemReactionsCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        // Chemistry profile LUT — (EN, valence, mass, has_chem) per element.
+        let mut chem_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            chem_data[i] = crate::ui_atom_chem_props(i as u8);
+        }
+        let chem_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-chem-lut"),
+            contents: bytemuck::cast_slice(&chem_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // 96×96 derived-id LUT (pre-registered atom pairs).
+        let pair_data = crate::ui_atom_pair_did_lut();
+        let pair_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-chem-pair-lut"),
+            contents: bytemuck::cast_slice(&pair_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Bespoke product element ids.
+        let product_uniform = ChemProductsUniform {
+            products: crate::ui_chem_product_ids(),
+        };
+        let products_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-chem-products"),
+            contents: bytemuck::cast_slice(&[product_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = ChemReactionsUniforms {
+                width: W as u32,
+                height: H as u32,
+                pass_id,
+                frame: 0,
+                ambient_oxygen: 0.21,
+                ambient_offset: 0,
+                _pad0: 0, _pad1: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let pass_uniform_bufs: [wgpu::Buffer; 4] = [
+            mk_uniform("alembic-chem-u-0", 0),
+            mk_uniform("alembic-chem-u-1", 1),
+            mk_uniform("alembic-chem-u-2", 2),
+            mk_uniform("alembic-chem-u-3", 3),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-chem-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-chem-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: chem_lut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: pair_lut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: products_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-chem-shader"),
+            source: wgpu::ShaderSource::Wgsl(CHEM_REACTIONS_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-chem-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-chem-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // chem_lut_buf, pair_lut_buf, products_buf retained via the
+        // bind groups; they live as long as the ctx.
+        let _ = chem_lut_buf;
+        let _ = pair_lut_buf;
+        let _ = products_buf;
+        ChemReactionsCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        frame: u32,
+        ambient_oxygen: f32,
+        ambient_offset: i16,
+    ) {
+        // Update frame + ambient fields on every uniform buffer.
+        for buf in &self.pass_uniform_bufs {
+            queue.write_buffer(buf, 12, bytemuck::cast_slice(&[frame]));
+            queue.write_buffer(buf, 16, bytemuck::cast_slice(&[ambient_oxygen]));
+            queue.write_buffer(buf, 20, bytemuck::cast_slice(&[ambient_offset as i32]));
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        for i in 0..4 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-chem-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -4687,6 +5195,8 @@ struct GpuState {
     /// Moisture absorption + wicking + evaporation + passive drying.
     /// Replaces the moisture sections of CPU `World::thermal_post`.
     moisture_compute: MoistureCtx,
+    /// Emergent chemistry framework — chemical_reactions et al.
+    chem_compute: ChemReactionsCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -5131,6 +5641,7 @@ impl GpuState {
             .unwrap_or(0) as u32;
         let glass_etch_compute = GlassEtchCtx::new(&device, &queue, &cells_buf, sif_derived_id);
         let moisture_compute = MoistureCtx::new(&device, &queue, &cells_buf);
+        let chem_compute = ChemReactionsCtx::new(&device, &queue, &cells_buf);
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -5184,6 +5695,7 @@ impl GpuState {
             water_sand_compute,
             glass_etch_compute,
             moisture_compute,
+            chem_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -7087,6 +7599,7 @@ impl GpuState {
                 reactions: true,
                 glass_etching: true,
                 moisture: true,
+                chemical_reactions: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
@@ -7165,6 +7678,15 @@ impl GpuState {
             //     evaporation + passive drying. Replaces the moisture
             //     section of CPU `World::thermal_post`.
             self.moisture_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 4h. emergent chemistry — chemical_reactions, plus the
+            //     supporting always-running passes. Margolus 2x2,
+            //     uses the pre-registered atom_pair_did LUT and the
+            //     chem_lut for activation/rate gating.
+            self.chem_compute.encode(
+                &mut encoder, &self.queue, self.frame_counter,
+                self.world.ambient_oxygen,
+                self.world.ambient_offset,
+            );
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.

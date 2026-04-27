@@ -1966,6 +1966,144 @@ pub fn register_compound(donor: Element, acceptor: Element) -> Option<u8> {
     derive_or_lookup(donor, acceptor)
 }
 
+/// Decode a raw u8 cell-element byte into the `Element` enum. Element
+/// is `#[repr(u8)]` so the byte cast back is well-defined for any
+/// known variant; unknown values fall back to `Empty`.
+pub fn element_from_u8(id: u8) -> Element {
+    match id {
+        0 => Element::Empty,
+        1 => Element::Sand,
+        2 => Element::Water,
+        3 => Element::Stone,
+        4 => Element::Wood,
+        5 => Element::Fire,
+        6 => Element::CO2,
+        7 => Element::Steam,
+        8 => Element::Lava,
+        9 => Element::Obsidian,
+        10 => Element::Seed,
+        11 => Element::Mud,
+        12 => Element::Leaves,
+        13 => Element::Oil,
+        14 => Element::Ice,
+        15 => Element::MoltenGlass,
+        16 => Element::Glass,
+        17 => Element::Charcoal,
+        18 => Element::H,   19 => Element::He,
+        20 => Element::C,   21 => Element::N,   22 => Element::O,
+        23 => Element::F,   24 => Element::Ne,
+        25 => Element::Na,  26 => Element::Mg,  27 => Element::Al,
+        28 => Element::Si,  29 => Element::P,   30 => Element::S,
+        31 => Element::Cl,  32 => Element::K,   33 => Element::Ca,
+        34 => Element::Fe,  35 => Element::Cu,  36 => Element::Au,
+        37 => Element::Hg,  38 => Element::U,
+        39 => Element::Rust, 40 => Element::Salt,
+        41 => Element::Derived,
+        42 => Element::Gunpowder,
+        43 => Element::Quartz, 44 => Element::Firebrick,
+        45 => Element::Ar,
+        46 => Element::BattPos, 47 => Element::BattNeg,
+        48 => Element::Zn, 49 => Element::Ag, 50 => Element::Ni,
+        51 => Element::Pb, 52 => Element::B,   53 => Element::Ra,
+        54 => Element::Cs,
+        _ => Element::Empty,
+    }
+}
+
+/// Per-element chemistry profile snapshot for the GPU framework.
+/// Layout: `[electronegativity, valence_electrons, atomic_mass, has_chem]`.
+/// `has_chem` is 1.0 if the element participates in emergent chemistry
+/// (atom OR Water/Ice/Steam/Oil), 0.0 otherwise. Compound overrides
+/// from `element_chemistry()` are baked in here so the shader doesn't
+/// have to special-case them.
+pub fn ui_atom_chem_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0.0; 4]; }
+    // Try the unified element_chemistry path first — it returns the
+    // (electronegativity, valence, atomic_mass) triple a reaction
+    // expects, including compound overrides.
+    let el = element_from_u8(id);
+    if let Some((e, v, m)) = element_chemistry(el) {
+        return [e, v as f32, m, 1.0];
+    }
+    [0.0, 0.0, 0.0, 0.0]
+}
+
+/// Pre-register every (atom, atom) pair so derived_ids are pinned and
+/// known at the time the GPU shader runs. Returns a flat 96×96
+/// lookup of derived_id (255 = no derived product). The order matches
+/// `derive_or_lookup(donor, acceptor)` semantics — the shader resolves
+/// donor / acceptor before indexing.
+///
+/// 96×96 = 9216 entries × 1 byte → fits comfortably in a uniform
+/// buffer (16 KB minimum). Pads to vec4<u32> for std140 — 9216 / 16 =
+/// 576 vec4 slots.
+pub fn ui_atom_pair_did_lut() -> Vec<[u32; 4]> {
+    // Pre-register every (atom, atom) pair so the derived registry is
+    // populated before the GPU shader runs. derive_or_lookup is a
+    // no-op for already-registered pairs, so calling repeatedly is
+    // safe and idempotent.
+    let atom_ids: Vec<u8> = ATOMS
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.implemented)
+        .filter_map(|(i, _)| atom_to_element(i))
+        .map(|el| el as u8)
+        .collect();
+    for &a in &atom_ids {
+        for &b in &atom_ids {
+            if a == b { continue; }
+            let _ = derive_or_lookup(element_from_u8(a), element_from_u8(b));
+        }
+    }
+    // Build the flat 96×96 byte LUT.
+    let mut bytes: Vec<u8> = vec![255u8; 96 * 96];
+    DERIVED_COMPOUNDS.with(|r| {
+        let reg = r.borrow();
+        for (i, c) in reg.iter().enumerate() {
+            if c.constituents.len() != 2 { continue; }
+            let (a_el, _) = c.constituents[0];
+            let (b_el, _) = c.constituents[1];
+            let a = a_el as u8 as usize;
+            let b = b_el as u8 as usize;
+            if a < 96 && b < 96 {
+                bytes[a * 96 + b] = i as u8;
+                bytes[b * 96 + a] = i as u8;
+            }
+        }
+    });
+    // Pack 16 bytes per vec4<u32>.
+    let mut out: Vec<[u32; 4]> = Vec::with_capacity(96 * 96 / 16);
+    for chunk in bytes.chunks(16) {
+        let mut q = [0u32; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            let lane = i / 4;
+            let byte_in_lane = i % 4;
+            q[lane] |= (b as u32) << (byte_in_lane * 8);
+        }
+        out.push(q);
+    }
+    out
+}
+
+/// Element-id constants the chemistry shader needs as bespoke
+/// product targets. Returns `[Water, Salt, Rust, CO2, H, Steam,
+/// Derived, Empty]` packed into a single `[u32; 8]` (vec4 × 2). The
+/// shader uses these directly rather than encoding the IDs as magic
+/// numbers; adds resilience if the Element enum ever shifts.
+pub fn ui_chem_product_ids() -> [u32; 8] {
+    [
+        Element::Water as u32,
+        Element::Salt as u32,
+        Element::Rust as u32,
+        Element::CO2 as u32,
+        Element::H as u32,
+        Element::Steam as u32,
+        Element::Derived as u32,
+        Element::Empty as u32,
+    ]
+}
+
 /// Stable list of paintable compound elements for UI palettes — same
 /// as the macroquad periodic-table compound row.
 pub fn ui_compound_palette() -> &'static [Element] {
@@ -4396,6 +4534,10 @@ pub struct GpuChem {
     /// thermal_post on CPU will skip its moisture sections so the
     /// two passes don't double-fire.
     pub moisture: bool,
+    /// Emergent chemistry framework on GPU — chemical_reactions and
+    /// the four supporting passes (acid_displacement, alloy_formation,
+    /// alloy_acid_leach, base_neutralization).
+    pub chemical_reactions: bool,
 }
 
 impl World {
@@ -4527,11 +4669,13 @@ impl World {
             // changes) only when GPU isn't doing it.
             self.thermal_post();     mark!("thermal_post");
         }
-        self.chemical_reactions();   mark!("chem_reactions");
-        self.acid_displacement();    mark!("acid_disp");
-        self.alloy_acid_leach();     mark!("alloy_leach");
-        self.base_neutralization();  mark!("base_neutral");
-        self.alloy_formation();      mark!("alloy_form");
+        if !gpu_chem.chemical_reactions {
+            self.chemical_reactions();   mark!("chem_reactions");
+            self.acid_displacement();    mark!("acid_disp");
+            self.alloy_acid_leach();     mark!("alloy_leach");
+            self.base_neutralization();  mark!("base_neutral");
+            self.alloy_formation();      mark!("alloy_form");
+        }
         if !gpu_chem.dissolve {
             self.dissolve();         mark!("dissolve");
         }
