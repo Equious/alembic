@@ -1005,6 +1005,9 @@ struct Uniforms {
 // vec4 per element: x = kind_id, y = density (signed),
 //                   z = viscosity, w = molar_mass
 @group(0) @binding(2) var<uniform> motion_props: array<vec4<f32>, 96>;
+// Derived compound mirror: same layout as motion_props, indexed by
+// cell.derived_id when cell.el == Element::Derived (41).
+@group(0) @binding(3) var<uniform> derived_phys: array<vec4<f32>, 256>;
 
 const KIND_EMPTY: u32  = 0u;
 const KIND_SOLID: u32  = 1u;
@@ -1016,14 +1019,23 @@ const KIND_FIRE: u32   = 6u;
 
 const FLAG_UPDATED: u32 = 0x01u;
 const FLAG_FROZEN:  u32 = 0x02u;
+const EL_DERIVED:   u32 = 41u;
 
 fn cell_idx(x: u32, y: u32) -> u32 { return y * u.width + x; }
 fn cell_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cell_derived_id(c: vec4<u32>) -> u32 { return (c.x >> 8u) & 0xFFu; }
 fn cell_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
-fn cell_kind(c: vec4<u32>) -> u32 { return u32(motion_props[cell_el(c)].x); }
-fn cell_density(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].y; }
-fn cell_viscosity(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].z; }
-fn cell_molar_mass(c: vec4<u32>) -> f32 { return motion_props[cell_el(c)].w; }
+fn cell_props(c: vec4<u32>) -> vec4<f32> {
+    let el = cell_el(c);
+    if (el == EL_DERIVED) {
+        return derived_phys[cell_derived_id(c)];
+    }
+    return motion_props[el];
+}
+fn cell_kind(c: vec4<u32>) -> u32 { return u32(cell_props(c).x); }
+fn cell_density(c: vec4<u32>) -> f32 { return cell_props(c).y; }
+fn cell_viscosity(c: vec4<u32>) -> f32 { return cell_props(c).z; }
+fn cell_molar_mass(c: vec4<u32>) -> f32 { return cell_props(c).w; }
 fn cell_frozen(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_FROZEN) != 0u; }
 fn cell_updated(c: vec4<u32>) -> bool { return (cell_flag(c) & FLAG_UPDATED) != 0u; }
 fn mark_updated(c: vec4<u32>) -> vec4<u32> {
@@ -1420,7 +1432,12 @@ struct MotionComputeCtx {
 }
 
 impl MotionComputeCtx {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cells_buf: &wgpu::Buffer,
+        derived_phys_buf: &wgpu::Buffer,
+    ) -> Self {
         let cell_count = W * H;
         let cell_bytes = (cell_count * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
 
@@ -1484,6 +1501,10 @@ impl MotionComputeCtx {
                     binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
             ],
         });
         let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1493,6 +1514,7 @@ impl MotionComputeCtx {
                 wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: motion_props_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: derived_phys_buf.as_entire_binding() },
             ],
         });
         let pass_bind_groups: [wgpu::BindGroup; 7] = [
@@ -3366,6 +3388,8 @@ struct Uniforms {
 // 96 elements packed 4 per vec4<u32>.
 @group(0) @binding(2) var<uniform> color_lut: array<vec4<u32>, 24>;
 @group(0) @binding(3) var sim_tex: texture_storage_2d<rgba8unorm, write>;
+// Derived compound color mirror — vec4<f32> per slot, RGBA in [0,1].
+@group(0) @binding(4) var<uniform> derived_color: array<vec4<f32>, 256>;
 
 const FLAG_FROZEN: u32 = 0x02u;
 const PHASE_MASK:  u32 = 0x0Cu;
@@ -3374,11 +3398,13 @@ const PHASE_SOLID:  u32 = 1u;
 const PHASE_LIQUID: u32 = 2u;
 const PHASE_GAS:    u32 = 3u;
 
-const EL_EMPTY: u32 = 0u;
-const EL_WATER: u32 = 2u;
-const EL_FIRE:  u32 = 5u;
+const EL_EMPTY:   u32 = 0u;
+const EL_WATER:   u32 = 2u;
+const EL_FIRE:    u32 = 5u;
+const EL_DERIVED: u32 = 41u;
 
 fn cell_el_render(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn cell_derived_id_render(c: vec4<u32>) -> u32 { return (c.x >> 8u) & 0xFFu; }
 fn cell_seed_render(c: vec4<u32>) -> u32 { return c.y & 0xFFu; }
 fn cell_flag_render(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
 fn cell_moisture_render(c: vec4<u32>) -> u32 { return c.z & 0xFFu; }
@@ -3414,6 +3440,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let el = cell_el_render(c);
 
     var color = lookup_color(el);
+    if (el == EL_DERIVED) {
+        color = derived_color[cell_derived_id_render(c)].rgb;
+    }
 
     if (el == EL_EMPTY) {
         textureStore(sim_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(color, 1.0));
@@ -3497,6 +3526,7 @@ impl RenderComputeCtx {
         queue: &wgpu::Queue,
         cells_buf: &wgpu::Buffer,
         sim_view: &wgpu::TextureView,
+        derived_color_buf: &wgpu::Buffer,
     ) -> Self {
         let _ = queue;
         let uniforms = RenderUniforms {
@@ -3551,6 +3581,10 @@ impl RenderComputeCtx {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3561,6 +3595,7 @@ impl RenderComputeCtx {
                 wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: color_lut_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sim_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: derived_color_buf.as_entire_binding() },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3659,6 +3694,15 @@ struct GpuState {
     /// runtime. CPU's `world.cells` is a mirror synced once per frame
     /// at the start of render() and pushed back before dispatch.
     cells_buf: wgpu::Buffer,
+    /// GPU mirror of the CPU `DERIVED_COMPOUNDS` registry. 256 slots,
+    /// each holding (kind_id, density, viscosity, molar_mass) +
+    /// (r,g,b,1) in 2 vec4<f32>. Synced at the start of each frame
+    /// because compounds are registered dynamically by CPU chemistry.
+    derived_phys_buf: wgpu::Buffer,
+    derived_color_buf: wgpu::Buffer,
+    /// CPU staging vectors for the derived sync — reused per frame.
+    derived_phys_staging: Vec<[f32; 4]>,
+    derived_color_staging: Vec<[f32; 4]>,
     /// GPU compute pipeline for pressure diffusion. Replaces the CPU
     /// `World::pressure()` pass; lets us scale the grid without paying
     /// the linear CPU cost.
@@ -4022,11 +4066,31 @@ impl GpuState {
         // upload before the GPU dispatch.
         queue.write_buffer(&cells_buf, 0, crate::cells_as_bytes(&world.cells));
 
+        // Derived compound registry mirror. 256 entries × 2 vec4<f32>.
+        let derived_buf_bytes = (crate::DERIVED_GPU_CAPACITY * 16) as wgpu::BufferAddress;
+        let derived_phys_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-derived-phys"),
+            size: derived_buf_bytes,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let derived_color_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-derived-color"),
+            size: derived_buf_bytes,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut derived_phys_staging = vec![[0.0f32; 4]; crate::DERIVED_GPU_CAPACITY];
+        let mut derived_color_staging = vec![[0.0f32; 4]; crate::DERIVED_GPU_CAPACITY];
+        crate::export_derived_to_gpu(&mut derived_phys_staging, &mut derived_color_staging);
+        queue.write_buffer(&derived_phys_buf, 0, bytemuck::cast_slice(&derived_phys_staging));
+        queue.write_buffer(&derived_color_buf, 0, bytemuck::cast_slice(&derived_color_staging));
+
         let pressure_compute = PressureComputeCtx::new(&device, &queue, &cells_buf);
         let thermal_compute = ThermalComputeCtx::new(&device, &queue, &cells_buf);
         let pressure_sources_compute = PressureSourcesCtx::new(&device, &queue, &cells_buf);
-        let motion_compute = MotionComputeCtx::new(&device, &queue, &cells_buf);
-        let render_compute = RenderComputeCtx::new(&device, &queue, &cells_buf, &sim_view);
+        let motion_compute = MotionComputeCtx::new(&device, &queue, &cells_buf, &derived_phys_buf);
+        let render_compute = RenderComputeCtx::new(&device, &queue, &cells_buf, &sim_view, &derived_color_buf);
         let clear_flags_compute = ClearFlagsCtx::new(&device, &queue, &cells_buf);
         let color_fires_compute = ColorFiresCtx::new(&device, &queue, &cells_buf);
         let flame_emit_compute = FlameTestEmissionCtx::new(&device, &queue, &cells_buf);
@@ -4047,6 +4111,10 @@ impl GpuState {
             sim_pipeline,
             display_uniform,
             cells_buf,
+            derived_phys_buf,
+            derived_color_buf,
+            derived_phys_staging,
+            derived_color_staging,
             pressure_compute,
             thermal_compute,
             pressure_sources_compute,
@@ -4286,6 +4354,17 @@ impl GpuState {
             // pass below reads/writes cells_buf directly — no per-cell
             // CPU stage loops anywhere.
             self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
+            // Sync Derived registry: CPU chemistry passes can register
+            // new compounds (FeCl, KCl, Al₂O₃, …); GPU motion + render
+            // need their physics + color. 8KB upload per frame; cheap.
+            crate::export_derived_to_gpu(
+                &mut self.derived_phys_staging,
+                &mut self.derived_color_staging,
+            );
+            self.queue.write_buffer(&self.derived_phys_buf, 0,
+                bytemuck::cast_slice(&self.derived_phys_staging));
+            self.queue.write_buffer(&self.derived_color_buf, 0,
+                bytemuck::cast_slice(&self.derived_color_staging));
             let amb = self.world.ambient_offset;
             self.thermal_compute.update_frame(&self.queue, self.frame_counter, amb);
             if run_ps {

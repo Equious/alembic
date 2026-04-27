@@ -396,6 +396,59 @@ pub fn lifecycle_props(id: u8) -> [u32; 4] {
     }
 }
 
+/// Capacity of the GPU-side Derived compound mirror (matches the
+/// CPU registry's u8-indexable cap of 256 entries).
+pub const DERIVED_GPU_CAPACITY: usize = 256;
+
+/// Export the Derived compound registry as a flat vec4<f32> array
+/// the GPU can use directly. Layout per entry (2 × vec4<f32>):
+///
+///   vec0: kind_id, density, viscosity, molar_mass
+///   vec1: r/255, g/255, b/255, 1.0
+///
+/// Unfilled slots default to (0, 20, 0, 0) physics + (0.6, 0.5, 0.55, 1)
+/// — the same fallback that CPU `derived_physics_of()` uses when an
+/// out-of-range id is queried.
+pub fn export_derived_to_gpu(out_phys: &mut [[f32; 4]], out_color: &mut [[f32; 4]]) {
+    let n = DERIVED_GPU_CAPACITY;
+    debug_assert_eq!(out_phys.len(), n);
+    debug_assert_eq!(out_color.len(), n);
+    // Default slot values (matches CPU fallback).
+    for i in 0..n {
+        out_phys[i] = [3.0, 20.0, 0.0, 0.0];          // Powder, density 20
+        out_color[i] = [160.0/255.0, 130.0/255.0, 140.0/255.0, 1.0];
+    }
+    DERIVED_COMPOUNDS.with(|r| {
+        let b = r.borrow();
+        for (i, c) in b.iter().enumerate().take(n) {
+            let kind_id = match c.physics.kind {
+                Kind::Empty => 0.0,
+                Kind::Solid => 1.0,
+                Kind::Gravel => 2.0,
+                Kind::Powder => 3.0,
+                Kind::Liquid => 4.0,
+                Kind::Gas => 5.0,
+                Kind::Fire => 6.0,
+            };
+            out_phys[i] = [
+                kind_id,
+                c.physics.density as f32,
+                c.physics.viscosity as f32,
+                c.physics.molar_mass,
+            ];
+            out_color[i] = [
+                c.color.0 as f32 / 255.0,
+                c.color.1 as f32 / 255.0,
+                c.color.2 as f32 / 255.0,
+                1.0,
+            ];
+        }
+    });
+}
+
+/// Derived element id sentinel — Element::Derived as u32.
+pub const DERIVED_EL_ID: u32 = Element::Derived as u32;
+
 /// Per-element flag: 1 if this element has a flame-test color
 /// (Cu, Na, K, Ca, Mg, B, Salt — see `flame_color`), 0 otherwise.
 /// Returned as a vec4<u32> for the standard packed-LUT layout.
