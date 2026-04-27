@@ -1356,26 +1356,37 @@ fn gas_dynamics(x: u32, parity: u32, dir_x: i32) {
         let k = cell_kind(c);
         if (k != KIND_GAS && k != KIND_FIRE) { y = y + 1; continue; }
 
-        // Try the allowed horizontal direction + both verticals.
-        // Vertical writes never race because each column is owned
-        // by one thread; horizontal writes don't race because all
-        // threads in this phase use the same direction (so two
-        // adjacent same-parity threads write to disjoint cells).
-        // The original 4-direction "empty expansion" semantics are
-        // preserved across the four sub-phases per frame.
+        // Try the allowed horizontal direction + both verticals in
+        // a uniformly-shuffled order. The disallowed horizontal
+        // direction never enters the trial set in this phase, so
+        // there's no slot-skip asymmetry: each of the 3 directions
+        // gets identical first-priority probability (1/3) and
+        // identical effective fire rate. Vertical writes are race-
+        // free (one thread per column); horizontal writes are
+        // race-free across phase parity (all threads in this
+        // phase write the same direction, so adjacent threads of
+        // the same x-parity can't collide on a shared target).
         let r = hash_u32_motion(i_here, u.frame);
-        let start = r & 3u;
+        // 6 permutations of {h, up, down} indexed by (r % 6).
+        // dir_id: 0 = allowed horizontal, 1 = up, 2 = down.
+        var perm0: u32 = 0u; var perm1: u32 = 1u; var perm2: u32 = 2u;
+        let dir_perm = r % 6u;
+        if (dir_perm == 1u)      { perm0 = 0u; perm1 = 2u; perm2 = 1u; }
+        else if (dir_perm == 2u) { perm0 = 1u; perm1 = 0u; perm2 = 2u; }
+        else if (dir_perm == 3u) { perm0 = 1u; perm1 = 2u; perm2 = 0u; }
+        else if (dir_perm == 4u) { perm0 = 2u; perm1 = 0u; perm2 = 1u; }
+        else if (dir_perm == 5u) { perm0 = 2u; perm1 = 1u; perm2 = 0u; }
         var moved = false;
-        for (var k4 = 0u; k4 < 4u && !moved; k4 = k4 + 1u) {
-            let pick = (start + k4) & 3u;
+        for (var k3 = 0u; k3 < 3u && !moved; k3 = k3 + 1u) {
+            var dir_id: u32 = 0u;
+            if (k3 == 0u) { dir_id = perm0; }
+            else if (k3 == 1u) { dir_id = perm1; }
+            else { dir_id = perm2; }
             var dx: i32 = 0;
             var dy: i32 = 0;
-            if (pick == 0u) { dx = -1; }
-            else if (pick == 1u) { dx = 1; }
-            else if (pick == 2u) { dy = -1; }
+            if (dir_id == 0u) { dx = dir_x; }
+            else if (dir_id == 1u) { dy = -1; }
             else { dy = 1; }
-            // Skip the disallowed horizontal direction this phase.
-            if (dx != 0 && dx != dir_x) { continue; }
             let nx = i32(x) + dx;
             let ny = y + dy;
             if (nx < 0 || nx >= w_i || ny < 0 || ny >= h_i) { continue; }
@@ -1384,7 +1395,7 @@ fn gas_dynamics(x: u32, parity: u32, dir_x: i32) {
             if (cell_kind(c_t) != KIND_EMPTY) { continue; }
             if (cell_updated(c_t) || cell_frozen(c_t)) { continue; }
             // 50% per-direction probability (CPU baseline).
-            let prob_bit = (r >> (8u + k4 * 2u)) & 1u;
+            let prob_bit = (r >> (8u + k3 * 2u)) & 1u;
             if (prob_bit == 0u) { continue; }
             cells[i_here] = mark_updated(c_t);
             cells[i_t]    = mark_updated(c);
