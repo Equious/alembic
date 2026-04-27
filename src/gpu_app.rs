@@ -1335,14 +1335,31 @@ fn gas_dynamics(x: u32, parity: u32) {
         let k = cell_kind(c);
         if (k != KIND_GAS && k != KIND_FIRE) { y = y + 1; continue; }
 
-        // Faithful port of update_gas's "empty expansion" — the
-        // primary drive of gas motion in CPU sim. Tries 4 cardinal
-        // directions in randomized order, 50% probability each;
-        // first successful swap with empty wins.
+        // Faithful port of update_gas's "empty expansion" — gas
+        // tries to swap with adjacent empty cells. Tries 3 directions
+        // per parity phase: vertical-up, vertical-down, and ONE
+        // horizontal direction tied to parity.
+        //
+        // Race-free horizontal: even-x parity (phase 5) only attempts
+        // RIGHT swaps; odd-x parity (phase 6) only attempts LEFT
+        // swaps. Without this restriction, even-x thread at x=0
+        // doing RIGHT and even-x thread at x=2 doing LEFT both
+        // write to cell (1,y) — both source cells get cleared, only
+        // one survives in the middle, so each race event LOSES a
+        // gas cell. That was the root cause of the long-standing
+        // "gases dissipate into nothing" bug. Vertical writes are
+        // race-free (each column is owned by one thread).
+        //
+        // Across the two parity phases per frame, gases still get
+        // both lateral directions (each cell gets right OR left in
+        // alternate frames depending on its parity), so the cloud
+        // disperses correctly — just one direction per phase.
         let r = hash_u32_motion(i_here, u.frame);
         let start = r & 3u;
         var moved = false;
-        // Unrolled 4-direction try with rotated start.
+        // Try 4 directions in randomized order, but skip the
+        // race-prone horizontal direction for this parity.
+        let allowed_h_dx: i32 = select(-1, 1, parity == 0u);
         for (var k4 = 0u; k4 < 4u && !moved; k4 = k4 + 1u) {
             let pick = (start + k4) & 3u;
             var dx: i32 = 0;
@@ -1351,6 +1368,8 @@ fn gas_dynamics(x: u32, parity: u32) {
             else if (pick == 1u) { dx = 1; }
             else if (pick == 2u) { dy = -1; }
             else { dy = 1; }
+            // Skip horizontal in the wrong direction for this phase.
+            if (dx != 0 && dx != allowed_h_dx) { continue; }
             let nx = i32(x) + dx;
             let ny = y + dy;
             if (nx < 0 || nx >= w_i || ny < 0 || ny >= h_i) { continue; }

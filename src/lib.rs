@@ -3486,6 +3486,13 @@ pub struct World {
     pub u_component_cx: Vec<i16>,
     pub u_component_cy: Vec<i16>,
     pub u_central_blast_fired: Vec<bool>,
+    /// Sparse mirror of `u_burst_committed` — the indices currently
+    /// flagged. `decay()` walks this Vec to clear flags on cells
+    /// that are no longer U, instead of scanning the full 1.08M-cell
+    /// grid. Kept in sync wherever `u_burst_committed[i]` flips.
+    pub u_burst_committed_set: Vec<usize>,
+    /// Sparse mirror of `u_central_blast_fired`. Same purpose.
+    pub u_central_blast_fired_set: Vec<usize>,
     /// True after `decay()` ran this frame and detected uranium.
     /// Used by the wgpu binary to gate the U-component-size upload
     /// to GPU + the criticality-multiplier branch in the shader.
@@ -3548,6 +3555,8 @@ impl World {
             u_component_cx: vec![0; W * H],
             u_component_cy: vec![0; W * H],
             u_central_blast_fired: vec![false; W * H],
+            u_burst_committed_set: Vec::new(),
+            u_central_blast_fired_set: Vec::new(),
             has_u_now: false,
             frame: 0,
             ambient_offset: 0,
@@ -4040,37 +4049,48 @@ impl World {
     }
 
     fn decay(&mut self, gpu_per_cell: bool) {
-        // Early-exit when there's no U in the world. Decay's heavy work
-        // (component flood-fill, critical-mass scans, per-cell radioactive
-        // ticks) is all gated on Element::U presence. Cheap O(W*H) scan
-        // up front saves the ~0.5–1.3ms steady cost when the world has no
-        // uranium at all (which is the common case unless someone's
-        // building a bomb).
-        // Detect any radioactive atom (U or Ra). The U-specific work
-        // (component flood-fill, criticality, burst commits, central
-        // blasts) is gated on U presence; the per-cell decay tick at
-        // the end of this function runs as long as ANY radioactive
-        // atom is present so Ra ages even without U in the scene.
-        let mut has_u = false;
-        let mut has_radioactive = false;
-        for c in self.cells.iter() {
-            if c.el == Element::U { has_u = true; has_radioactive = true; break; }
-            if c.el == Element::Ra { has_radioactive = true; }
-        }
+        // Cheap O(1) early-exit via the per-frame element-presence
+        // bitmap built in step_inner_full3. Without U or Ra in the
+        // world, decay has nothing to do — the previous full-grid
+        // scan here was the dominant fixed cost when uranium WAS
+        // present (since CPU still walks the world looking for the
+        // commit-flag stale-clear and the per-cell tail loop).
+        let has_u = self.present_elements[Element::U as usize];
+        let has_ra = self.present_elements[Element::Ra as usize];
         self.has_u_now = has_u;
-        if !has_radioactive { return; }
+        if !has_u && !has_ra { return; }
+        // Build the radioactive cell index list once. Subsequent
+        // passes (stale-flag clear, commitment marking, per-cell
+        // tail loop) iterate this list instead of the full grid,
+        // turning four 1.08M-cell scans into N-cell scans where N
+        // is the number of radioactive cells (typically a few
+        // thousand for a uranium pile, often zero for a bare-Ra
+        // scene). This is the fixed cost that was halving FPS the
+        // moment U entered the world even before criticality.
+        let mut rad_indices: Vec<usize> = Vec::with_capacity(8192);
+        for (i, c) in self.cells.iter().enumerate() {
+            if c.el == Element::U || c.el == Element::Ra {
+                rad_indices.push(i);
+            }
+        }
         if has_u { self.compute_u_components(); }
-        // Clear stale commit flags from previous frames: any cell that
-        // isn't currently U can't be mid-cascade, so its flag is
-        // garbage. Without this reset, a position that committed during
-        // the last detonation "remembers" it even after Pb → erase →
-        // new U paint, and detonates immediately regardless of mass.
-        for i in 0..self.cells.len() {
+        // Clear stale commit flags from previous frames. The flags
+        // are sparse (only ever set on U cells), and on transition
+        // U→Pb the cell index leaves rad_indices but its flag stays
+        // set. Track the prior set with a small index Vec so we
+        // only sweep cells that *had* a flag, not all 1.08M.
+        for &i in self.u_burst_committed_set.iter() {
             if self.cells[i].el != Element::U {
                 self.u_burst_committed[i] = false;
+            }
+        }
+        for &i in self.u_central_blast_fired_set.iter() {
+            if self.cells[i].el != Element::U {
                 self.u_central_blast_fired[i] = false;
             }
         }
+        self.u_burst_committed_set.retain(|&i| self.cells[i].el == Element::U);
+        self.u_central_blast_fired_set.retain(|&i| self.cells[i].el == Element::U);
         // Critical-mass commitment: any U component >= CRITICAL_MASS has
         // every one of its cells flagged for prompt-fission burst. Once
         // committed, the cascade continues through the entire original
@@ -4085,7 +4105,7 @@ impl World {
         // cell. Per-cell burst shockwaves below handle the distributed
         // cascade effect through the pile interior.
         let mut central_queue: Vec<usize> = Vec::with_capacity(1024);
-        for i in 0..self.cells.len() {
+        for &i in rad_indices.iter() {
             if self.cells[i].el != Element::U { continue; }
             if self.u_component_size[i] < CRITICAL_MASS { continue; }
             if self.u_central_blast_fired[i] { continue; }
@@ -4106,6 +4126,7 @@ impl World {
             central_queue.clear();
             central_queue.push(i);
             self.u_central_blast_fired[i] = true;
+            self.u_central_blast_fired_set.push(i);
             while let Some(ci) = central_queue.pop() {
                 let cix = (ci % W) as i32;
                 let ciy = (ci / W) as i32;
@@ -4117,18 +4138,20 @@ impl World {
                     if self.cells[ni].el != Element::U { continue; }
                     if self.u_central_blast_fired[ni] { continue; }
                     self.u_central_blast_fired[ni] = true;
+                    self.u_central_blast_fired_set.push(ni);
                     central_queue.push(ni);
                 }
             }
         }
-        for i in 0..self.cells.len() {
+        for &i in rad_indices.iter() {
             if self.cells[i].el != Element::U { continue; }
-            if self.u_component_size[i] >= CRITICAL_MASS {
+            if self.u_component_size[i] >= CRITICAL_MASS && !self.u_burst_committed[i] {
                 self.u_burst_committed[i] = true;
+                self.u_burst_committed_set.push(i);
             }
         }
         let ln2: f32 = 0.6931472;
-        for i in 0..self.cells.len() {
+        for &i in rad_indices.iter() {
             let c = self.cells[i];
             let Some(a) = atom_profile_for(c.el) else { continue; };
             if a.half_life_frames == 0 { continue; }
