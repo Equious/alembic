@@ -2693,7 +2693,7 @@ impl Element {
             Element::Cs => (230, 215, 150),
         }
     }
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Element::Empty    => "Erase",
             Element::Sand     => "Sand",

@@ -25,6 +25,17 @@ use winit::window::{Window, WindowId};
 
 use egui_wgpu::ScreenDescriptor;
 
+/// What a periodic-table click should set. Default: the paint brush
+/// element. Switched temporarily when the user clicks "Material:"
+/// inside a Prefab or Wire dropdown — the next pick goes to that
+/// tool's material instead.
+#[derive(Clone, Copy, PartialEq)]
+enum PtTargetKind {
+    Paint,
+    PrefabMaterial,
+    WireMaterial,
+}
+
 /// Perceptual brightness (0..255) — used to pick black vs white text
 /// when overlaying a label on an element-color tile.
 fn luminance(r: u8, g: u8, b: u8) -> u32 {
@@ -4338,6 +4349,33 @@ struct GpuState {
     /// Pipet target species filter (None = collect any).
     pipet_target: Option<(Element, u8)>,
 
+    // ---- Prefab tool state (sub-panel) ----
+    prefab_kind: crate::PrefabKind,
+    prefab_material: Element,
+    prefab_thickness: i32,
+    prefab_width: i32,
+    prefab_height: i32,
+    prefab_voltage: i32,
+    prefab_rotation: u8,
+
+    // ---- Wire tool state (sub-panel) ----
+    wire_material: Element,
+    wire_thickness: i32,
+    /// First-click endpoint for the two-click wire line. None when
+    /// awaiting the start click.
+    wire_start: Option<(i32, i32)>,
+
+    /// Where the next periodic-table pick goes (paint brush vs. a
+    /// tool's material slot). Reset to Paint after a pick.
+    pt_target_kind: PtTargetKind,
+
+    /// L mouse press THIS frame (transition up→down). Cleared at end
+    /// of render(). Used by Prefab one-shot place and Wire two-click
+    /// line endpoints — both want a single trigger per click rather
+    /// than the held-down `paint_down`.
+    paint_pressed_event: bool,
+    erase_pressed_event: bool,
+
     // ---- Input state ----
     /// Currently-selected element for the paint brush.
     selected: Element,
@@ -4769,6 +4807,19 @@ impl GpuState {
             wind: macroquad::math::Vec2::new(0.0, 0.0),
             pipet_bucket: Vec::with_capacity(2048),
             pipet_target: None,
+            prefab_kind: crate::PrefabKind::Box,
+            prefab_material: Element::Glass,
+            prefab_thickness: 10,
+            prefab_width: 145,
+            prefab_height: 200,
+            prefab_voltage: 100,
+            prefab_rotation: 0,
+            wire_material: Element::Cu,
+            wire_thickness: 2,
+            wire_start: None,
+            pt_target_kind: PtTargetKind::Paint,
+            paint_pressed_event: false,
+            erase_pressed_event: false,
         };
         state.camera_reset();
         state
@@ -4938,23 +4989,47 @@ impl GpuState {
                     );
                 }
             }
-            // Prefab and Wire need their own dropdowns + click-handling
-            // logic that hasn't been ported yet. Fall back to the Paint
-            // brush as a placeholder so the buttons aren't fully dead.
-            crate::ToolMode::Prefab | crate::ToolMode::Wire => {
-                if self.paint_down {
-                    let did = if self.selected == Element::Derived {
-                        self.selected_did
-                    } else { 0 };
-                    self.world.paint(
-                        gx, gy, self.brush_radius,
-                        self.selected, did, self.build_mode,
+            crate::ToolMode::Prefab => {
+                // L = one-shot place at cursor. R cycles rotation
+                // (matches macroquad's R-key + click-cancel behavior).
+                if self.paint_pressed_event {
+                    if self.prefab_kind == crate::PrefabKind::Battery {
+                        self.world.battery_voltage = self.prefab_voltage as f32;
+                    }
+                    self.world.place_prefab(
+                        gx, gy,
+                        self.prefab_kind,
+                        self.prefab_material,
+                        self.prefab_thickness,
+                        self.prefab_width,
+                        self.prefab_height,
+                        self.prefab_rotation,
                     );
                 }
-                if self.erase_down {
-                    self.world.paint(
-                        gx, gy, self.brush_radius, Element::Empty, 0, false,
-                    );
+                if self.erase_pressed_event {
+                    self.prefab_rotation = (self.prefab_rotation + 1) & 3;
+                }
+            }
+            crate::ToolMode::Wire => {
+                // Two-click line: 1st click sets start, 2nd click draws
+                // the line and resets. R cancels a pending start.
+                if self.paint_pressed_event {
+                    match self.wire_start {
+                        None => {
+                            self.wire_start = Some((gx, gy));
+                        }
+                        Some((sx, sy)) => {
+                            self.world.place_wire_line(
+                                sx, sy, gx, gy,
+                                self.wire_material,
+                                self.wire_thickness,
+                            );
+                            self.wire_start = None;
+                        }
+                    }
+                }
+                if self.erase_pressed_event {
+                    self.wire_start = None;
                 }
             }
         }
@@ -5039,20 +5114,32 @@ impl GpuState {
                     }
                 }
 
-                // Prefab + (eventually) its dropdown.
+                // Prefab button + dropdown (only shown when active).
                 if Self::tool_button(
                     ui, "Prefab", self.tool_mode == crate::ToolMode::Prefab,
                     btn_selected, btn_normal, btn_hover, btn_border, text_btn,
                 ) {
                     self.tool_mode = crate::ToolMode::Prefab;
                 }
+                if self.tool_mode == crate::ToolMode::Prefab {
+                    self.draw_prefab_dropdown(
+                        ui, btn_selected, btn_normal, btn_hover, btn_border,
+                        text_btn, section_header, dim_label, value_color,
+                    );
+                }
 
-                // Wire + (eventually) its dropdown.
+                // Wire button + dropdown.
                 if Self::tool_button(
                     ui, "Wire", self.tool_mode == crate::ToolMode::Wire,
                     btn_selected, btn_normal, btn_hover, btn_border, text_btn,
                 ) {
                     self.tool_mode = crate::ToolMode::Wire;
+                }
+                if self.tool_mode == crate::ToolMode::Wire {
+                    self.draw_wire_dropdown(
+                        ui, btn_normal, btn_hover, btn_border,
+                        text_btn, section_header, dim_label, value_color,
+                    );
                 }
 
                 // Extra gap before Build (matches macroquad +14px).
@@ -5260,6 +5347,194 @@ impl GpuState {
         }
     }
 
+    /// PREFAB sub-panel — kind selector (Beaker / Box / Batt) on one
+    /// row, then four hover-scroll rows (Thickness / Width / Height /
+    /// Voltage), then a material-picker button. Faithful port of the
+    /// macroquad `if tool_mode == ToolMode::Prefab { ... }` block.
+    fn draw_prefab_dropdown(
+        &mut self,
+        ui: &mut egui::Ui,
+        sel_color: egui::Color32,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text_btn: egui::Color32,
+        section_header: egui::Color32,
+        dim_label: egui::Color32,
+        value_color: egui::Color32,
+    ) {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("PREFAB").color(section_header).size(11.0),
+        );
+        ui.add_space(4.0);
+        // Kind selector — three side-by-side small buttons.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let total = ui.available_width();
+            let bw = (total - 8.0) / 3.0;
+            let kinds: [(&str, crate::PrefabKind); 3] = [
+                ("Beaker", crate::PrefabKind::Beaker),
+                ("Box", crate::PrefabKind::Box),
+                ("Batt", crate::PrefabKind::Battery),
+            ];
+            for (label, kind) in kinds {
+                if Self::small_button(
+                    ui, label, self.prefab_kind == kind,
+                    egui::vec2(bw, 26.0),
+                    sel_color, normal, hover, border, text_btn,
+                ) {
+                    self.prefab_kind = kind;
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        // Four scroll rows — Thickness, Width, Height, Voltage.
+        // Step matches the macroquad version's hover-scroll deltas.
+        let t_delta = Self::ambient_row(
+            ui, "Thickness",
+            &self.prefab_thickness.to_string(),
+            dim_label, value_color,
+        );
+        if t_delta > 0.5 {
+            self.prefab_thickness = (self.prefab_thickness + 1).min(50);
+        } else if t_delta < -0.5 {
+            self.prefab_thickness = (self.prefab_thickness - 1).max(1);
+        }
+        let w_delta = Self::ambient_row(
+            ui, "Width",
+            &self.prefab_width.to_string(),
+            dim_label, value_color,
+        );
+        if w_delta > 0.5 {
+            self.prefab_width = (self.prefab_width + 5).min(800);
+        } else if w_delta < -0.5 {
+            self.prefab_width = (self.prefab_width - 5).max(10);
+        }
+        let h_delta = Self::ambient_row(
+            ui, "Height",
+            &self.prefab_height.to_string(),
+            dim_label, value_color,
+        );
+        if h_delta > 0.5 {
+            self.prefab_height = (self.prefab_height + 5).min(800);
+        } else if h_delta < -0.5 {
+            self.prefab_height = (self.prefab_height - 5).max(10);
+        }
+        let v_delta = Self::ambient_row(
+            ui, "Voltage",
+            &format!("{} V", self.prefab_voltage),
+            dim_label, value_color,
+        );
+        if v_delta > 0.5 {
+            self.prefab_voltage = (self.prefab_voltage + 10).min(1000);
+        } else if v_delta < -0.5 {
+            self.prefab_voltage = (self.prefab_voltage - 10).max(1);
+        }
+
+        // Material picker — opens the periodic table to pick the
+        // prefab's frozen material. Stays selected after picking.
+        ui.add_space(6.0);
+        let mat_label = format!("Material: {}", self.prefab_material.name());
+        if Self::tool_button(
+            ui, &mat_label, false,
+            sel_color, normal, hover, border, text_btn,
+        ) {
+            self.pt_open = true;
+            self.pt_target_kind = PtTargetKind::PrefabMaterial;
+        }
+
+        ui.label(
+            egui::RichText::new(format!(
+                "click in sim to place   |   R rotates ({}°)",
+                90 * self.prefab_rotation as i32,
+            ))
+            .color(section_header).size(11.0),
+        );
+        ui.add_space(8.0);
+    }
+
+    /// WIRE sub-panel — material picker + thickness scroll + status.
+    fn draw_wire_dropdown(
+        &mut self,
+        ui: &mut egui::Ui,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text_btn: egui::Color32,
+        section_header: egui::Color32,
+        dim_label: egui::Color32,
+        value_color: egui::Color32,
+    ) {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("WIRE").color(section_header).size(11.0),
+        );
+        ui.add_space(4.0);
+
+        let mat_label = format!("Material: {}", self.wire_material.name());
+        if Self::tool_button(
+            ui, &mat_label, false,
+            egui::Color32::TRANSPARENT, normal, hover, border, text_btn,
+        ) {
+            self.pt_open = true;
+            self.pt_target_kind = PtTargetKind::WireMaterial;
+        }
+
+        let t_delta = Self::ambient_row(
+            ui, "Thickness",
+            &self.wire_thickness.to_string(),
+            dim_label, value_color,
+        );
+        if t_delta > 0.5 {
+            self.wire_thickness = (self.wire_thickness + 1).min(20);
+        } else if t_delta < -0.5 {
+            self.wire_thickness = (self.wire_thickness - 1).max(1);
+        }
+
+        ui.label(
+            egui::RichText::new(if self.wire_start.is_some() {
+                "L-click endpoint  •  R cancel"
+            } else {
+                "L-click start point"
+            })
+            .color(section_header).size(11.0),
+        );
+        ui.add_space(8.0);
+    }
+
+    /// Compact button used inside dropdowns where the standard 30px
+    /// tool-button height is too tall for a row of three.
+    fn small_button(
+        ui: &mut egui::Ui,
+        label: &str,
+        selected: bool,
+        size: egui::Vec2,
+        sel_color: egui::Color32,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text: egui::Color32,
+    ) -> bool {
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        let bg = if selected { sel_color }
+                 else if resp.hovered() { hover }
+                 else { normal };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, bg);
+        p.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, border),
+            egui::StrokeKind::Inside);
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            text,
+        );
+        resp.clicked()
+    }
+
     fn style_panel(
         ui: &mut egui::Ui,
         normal: egui::Color32,
@@ -5416,16 +5691,23 @@ impl GpuState {
                     by_pp.insert((*period, *group), (*el, *sym, *num));
                 }
                 let max_period = atoms.iter().map(|a| a.4).max().unwrap_or(7);
-                let mut picked = false;
+                // Highlight reflects whichever target the click is going
+                // to: paint brush vs prefab/wire material.
+                let current_for_hl = match self.pt_target_kind {
+                    PtTargetKind::Paint => self.selected,
+                    PtTargetKind::PrefabMaterial => self.prefab_material,
+                    PtTargetKind::WireMaterial => self.wire_material,
+                };
+                let mut picked: Option<Element> = None;
                 for period in 1..=max_period {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = pt_gap;
                         for group in 1..=18u8 {
                             if let Some(&(el, sym, num)) = by_pp.get(&(period, group)) {
-                                if Self::pt_atom_tile(
-                                    ui, el, sym, num, pt_tile, &mut self.selected,
+                                if let Some(p) = Self::pt_atom_tile(
+                                    ui, el, sym, num, pt_tile, current_for_hl,
                                 ) {
-                                    picked = true;
+                                    picked = Some(p);
                                 }
                             } else {
                                 let (rect, _) = ui.allocate_exact_size(
@@ -5450,8 +5732,8 @@ impl GpuState {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = pt_gap;
                     for &el in crate::ui_compound_palette() {
-                        if Self::pt_compound_tile(ui, el, pt_tile, &mut self.selected) {
-                            picked = true;
+                        if let Some(p) = Self::pt_compound_tile(ui, el, pt_tile, current_for_hl) {
+                            picked = Some(p);
                         }
                     }
                 });
@@ -5498,15 +5780,40 @@ impl GpuState {
                                 egui::Color32::WHITE,
                             );
                             if resp.clicked() {
+                                // Derived only makes sense as a paint
+                                // brush — prefab/wire materials must
+                                // be atoms or simple compounds, not
+                                // runtime-derived. Force back to Paint
+                                // if a Derived tile is clicked.
                                 self.selected = Element::Derived;
                                 self.selected_did = *did;
-                                picked = true;
+                                self.pt_target_kind = PtTargetKind::Paint;
+                                picked = Some(Element::Derived);
                             }
                         }
                     });
                 }
 
-                if picked {
+                if let Some(p) = picked {
+                    match self.pt_target_kind {
+                        PtTargetKind::Paint => {
+                            self.selected = p;
+                            if p != Element::Derived {
+                                self.selected_did = 0;
+                            }
+                        }
+                        PtTargetKind::PrefabMaterial => {
+                            if p != Element::Derived {
+                                self.prefab_material = p;
+                            }
+                        }
+                        PtTargetKind::WireMaterial => {
+                            if p != Element::Derived {
+                                self.wire_material = p;
+                            }
+                        }
+                    }
+                    self.pt_target_kind = PtTargetKind::Paint;
                     self.pt_open = false;
                 }
 
@@ -5525,8 +5832,8 @@ impl GpuState {
         sym: &'static str,
         num: u8,
         size: f32,
-        selected: &mut Element,
-    ) -> bool {
+        current: Element,
+    ) -> Option<Element> {
         let (r, g, b) = el.base_color();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(size, size),
@@ -5537,7 +5844,7 @@ impl GpuState {
         p.rect_stroke(rect, 2.0,
             egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 50)),
             egui::StrokeKind::Inside);
-        if *selected == el {
+        if current == el {
             p.rect_stroke(rect.expand(2.0), 3.0,
                 egui::Stroke::new(3.0, egui::Color32::GREEN),
                 egui::StrokeKind::Inside);
@@ -5564,18 +5871,17 @@ impl GpuState {
             egui::Color32::BLACK,
         );
         if resp.clicked() {
-            *selected = el;
-            return true;
+            return Some(el);
         }
-        false
+        None
     }
 
     fn pt_compound_tile(
         ui: &mut egui::Ui,
         el: Element,
         size: f32,
-        selected: &mut Element,
-    ) -> bool {
+        current: Element,
+    ) -> Option<Element> {
         let (r, g, b) = el.base_color();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(size, size),
@@ -5606,7 +5912,7 @@ impl GpuState {
         p.rect_stroke(rect, 2.0,
             egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 50)),
             egui::StrokeKind::Inside);
-        if *selected == el {
+        if current == el {
             p.rect_stroke(rect.expand(2.0), 3.0,
                 egui::Stroke::new(3.0, egui::Color32::GREEN),
                 egui::StrokeKind::Inside);
@@ -5617,10 +5923,9 @@ impl GpuState {
                 egui::StrokeKind::Inside);
         }
         if resp.clicked() {
-            *selected = el;
-            return true;
+            return Some(el);
         }
-        false
+        None
     }
 
     fn render(&mut self) {
@@ -5645,6 +5950,10 @@ impl GpuState {
             self.pending_clear = false;
         }
         self.apply_brush();
+        // Press-event flags fire exactly once per click; reset them as
+        // soon as the brush handler has had a chance to consume them.
+        self.paint_pressed_event = false;
+        self.erase_pressed_event = false;
 
         let t_sim_start = std::time::Instant::now();
         if !self.paused {
@@ -5997,8 +6306,18 @@ impl ApplicationHandler for App {
                 }
                 let pressed = mouse_state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => state.paint_down = pressed,
-                    MouseButton::Right => state.erase_down = pressed,
+                    MouseButton::Left => {
+                        if pressed && !state.paint_down {
+                            state.paint_pressed_event = true;
+                        }
+                        state.paint_down = pressed;
+                    }
+                    MouseButton::Right => {
+                        if pressed && !state.erase_down {
+                            state.erase_pressed_event = true;
+                        }
+                        state.erase_down = pressed;
+                    }
                     MouseButton::Middle => {
                         if pressed {
                             state.middle_drag_from = state.cursor_pos;
