@@ -16,6 +16,8 @@ bytemuck = { version = "1.16", features = ["derive"] }
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = { version = "0.31", default-features = false }
+# F2 screenshot — encode the captured surface to PNG.
+png = "0.17"
 
 [[bin]]
 name = "alembic"

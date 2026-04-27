@@ -4417,6 +4417,21 @@ struct GpuState {
     pending_clear_all: bool,
     /// Side panel hidden when false (U toggles).
     panel_visible: bool,
+    /// Set on F2; render() captures the swapchain image after egui
+    /// has been painted, encodes a timestamped PNG, and clears.
+    pending_screenshot: bool,
+    /// Latest screenshot status — shown briefly over the sim.
+    /// (frames-remaining, "saved <path>" or "error: ...").
+    screenshot_notice: Option<(u32, String)>,
+    /// Accumulated rewind delta from Shift+wheel while paused. Applied
+    /// at the top of render() via `world.seek(pending_seek)`, then
+    /// reset; the next read_back is also suppressed so the seek
+    /// snapshot survives.
+    pending_seek: i32,
+    /// True from the moment a seek lands until the user unpauses or
+    /// snapshots a fresh frame; suppresses motion read_back so the
+    /// rewound state isn't immediately overwritten.
+    rewind_active: bool,
     /// World-space cell coordinate at the center of the view.
     /// Default: (W/2, H/2) → sim is centered. Pan moves this around.
     cam_center_x: f32,
@@ -4528,7 +4543,8 @@ impl GpuState {
             .find(|f| f.is_srgb())
             .unwrap_or_else(|| surface_caps.formats[0]);
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -4813,6 +4829,10 @@ impl GpuState {
             pending_clear: false,
             pending_clear_all: false,
             panel_visible: true,
+            pending_screenshot: false,
+            screenshot_notice: None,
+            pending_seek: 0,
+            rewind_active: false,
             cam_center_x: W as f32 * 0.5,
             cam_center_y: H as f32 * 0.5,
             cam_scale: 1.0,
@@ -5093,6 +5113,25 @@ impl GpuState {
         // are active waves.
         self.draw_shockwave_overlay(ctx);
 
+        // Screenshot notice — floats near the top-left of the sim.
+        if let Some((_, msg)) = &self.screenshot_notice {
+            let msg = msg.clone();
+            let (rect, _) = self.sim_pixel_rect();
+            egui::Area::new(egui::Id::new("alembic-screenshot-notice"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(egui::pos2(rect.0 + 12.0, rect.1 + 12.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .color(egui::Color32::from_rgb(120, 230, 120))
+                            .size(16.0)
+                            .background_color(
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                            ),
+                    );
+                });
+        }
+
         if !self.panel_visible {
             // Panel hidden — only the periodic-table modal can still
             // appear (Tab is the universal toggle).
@@ -5133,11 +5172,16 @@ impl GpuState {
                         egui::RichText::new("TOOLS").color(section_header).size(11.0),
                     );
                     if self.paused {
+                        let tag = if self.world.rewind_offset > 0 {
+                            format!("PAUSED −{}", self.world.rewind_offset)
+                        } else {
+                            "PAUSED".to_string()
+                        };
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.label(
-                                    egui::RichText::new("PAUSED")
+                                    egui::RichText::new(tag)
                                         .color(egui::Color32::YELLOW)
                                         .size(11.0),
                                 );
@@ -5735,6 +5779,72 @@ impl GpuState {
         resp.clicked()
     }
 
+    /// Map the screenshot staging buffer, swizzle BGRA→RGBA if the
+    /// surface format demands it, and write a timestamped PNG into the
+    /// current working directory. Mirrors the macroquad F2 path.
+    fn write_screenshot(
+        &self,
+        staging: &wgpu::Buffer,
+        w: u32,
+        h: u32,
+        padded_bpr: u32,
+        fmt: wgpu::TextureFormat,
+    ) -> Result<String, String> {
+        // Block until the GPU finishes the copy and the buffer is mapped.
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::Maintain::Wait);
+
+        let data = slice.get_mapped_range();
+        let unpadded_bpr = (w as usize) * 4;
+        let mut rgba: Vec<u8> = Vec::with_capacity(unpadded_bpr * h as usize);
+        let bgra = matches!(
+            fmt,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        for y in 0..h as usize {
+            let row_start = y * padded_bpr as usize;
+            let row = &data[row_start..row_start + unpadded_bpr];
+            if bgra {
+                // BGRA → RGBA swizzle, drop alpha to 255 so the saved
+                // image is fully opaque (sim has alpha 1.0 already but
+                // let's be explicit).
+                for px in row.chunks_exact(4) {
+                    rgba.push(px[2]);
+                    rgba.push(px[1]);
+                    rgba.push(px[0]);
+                    rgba.push(255);
+                }
+            } else {
+                for px in row.chunks_exact(4) {
+                    rgba.push(px[0]);
+                    rgba.push(px[1]);
+                    rgba.push(px[2]);
+                    rgba.push(255);
+                }
+            }
+        }
+        drop(data);
+        staging.unmap();
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = format!("screenshot_{}.png", ts);
+        let file = std::fs::File::create(&path)
+            .map_err(|e| format!("create {}: {}", path, e))?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = png::Encoder::new(writer, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()
+            .map_err(|e| format!("png header: {}", e))?;
+        writer.write_image_data(&rgba)
+            .map_err(|e| format!("png write: {}", e))?;
+        Ok(path)
+    }
+
     /// Shockwave leading-edge overlay. Faithful port of the macroquad
     /// `for s in &world.shockwaves` block — bright rings whose alpha
     /// scales with remaining magnitude. Drawn as a transparent egui
@@ -6229,7 +6339,23 @@ impl GpuState {
         // CPU chemistry mutate world.cells. Then ONE upload pushes the
         // mutated cells back to cells_buf for the next GPU dispatch.
         let t_compute_start = std::time::Instant::now();
+        // Apply any queued time-scrub from Shift+wheel-while-paused
+        // BEFORE the read_back so the rewound state isn't immediately
+        // overwritten by the GPU's last motion result.
+        if self.pending_seek != 0 {
+            self.world.seek(self.pending_seek);
+            self.pending_seek = 0;
+            self.rewind_active = true;
+        }
         if !self.paused {
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+            self.motion_compute.read_back_prev_into(&mut self.world);
+            // Resuming clears the rewind flag — next sim step's
+            // snapshot will reset world.rewind_offset to 0.
+            self.rewind_active = false;
+        } else if !self.rewind_active {
+            // Plain pause (no rewind) — still pull last GPU frame so
+            // paint actions and the shockwave overlay use fresh state.
             let _ = self.device.poll(wgpu::Maintain::Wait);
             self.motion_compute.read_back_prev_into(&mut self.world);
         }
@@ -6298,25 +6424,24 @@ impl GpuState {
         let t_sim = t_sim_start.elapsed();
 
         let t_dispatch_start = std::time::Instant::now();
+        // Single zero-copy upload: world.cells (with this frame's
+        // chemistry/paint changes, or a seek-rewound snapshot when
+        // paused) → cells_buf. Always runs, so paint/seek/clear are
+        // visible while paused.
+        self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
+        // Sync Derived registry: CPU chemistry passes can register
+        // new compounds (FeCl, KCl, Al₂O₃, …); GPU motion + render
+        // need their physics + color. 8KB upload per frame; cheap.
+        crate::export_derived_to_gpu(
+            &mut self.derived_phys_staging,
+            &mut self.derived_color_staging,
+        );
+        self.queue.write_buffer(&self.derived_phys_buf, 0,
+            bytemuck::cast_slice(&self.derived_phys_staging));
+        self.queue.write_buffer(&self.derived_color_buf, 0,
+            bytemuck::cast_slice(&self.derived_color_staging));
         if !self.paused {
             let run_ps = self.frame_counter & 1 == 0;
-
-            // Single zero-copy upload: world.cells (with this frame's
-            // chemistry/paint changes) → cells_buf. Every GPU compute
-            // pass below reads/writes cells_buf directly — no per-cell
-            // CPU stage loops anywhere.
-            self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
-            // Sync Derived registry: CPU chemistry passes can register
-            // new compounds (FeCl, KCl, Al₂O₃, …); GPU motion + render
-            // need their physics + color. 8KB upload per frame; cheap.
-            crate::export_derived_to_gpu(
-                &mut self.derived_phys_staging,
-                &mut self.derived_color_staging,
-            );
-            self.queue.write_buffer(&self.derived_phys_buf, 0,
-                bytemuck::cast_slice(&self.derived_phys_staging));
-            self.queue.write_buffer(&self.derived_color_buf, 0,
-                bytemuck::cast_slice(&self.derived_color_staging));
             let amb = self.world.ambient_offset;
             self.thermal_compute.update_frame(&self.queue, self.frame_counter, amb);
             if run_ps {
@@ -6497,9 +6622,66 @@ impl GpuState {
         for id in &egui_full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+
+        // F2 capture — copy the now-painted swapchain image into a
+        // CPU-readable buffer BEFORE present(). Encoded to PNG below.
+        let screenshot_capture = if self.pending_screenshot {
+            self.pending_screenshot = false;
+            let w = self.surface_config.width;
+            let h = self.surface_config.height;
+            // Row pitch must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT (256).
+            let unpadded_bpr = w * 4;
+            let padded_bpr = (unpadded_bpr + 255) & !255;
+            let buffer_size = (padded_bpr as u64) * (h as u64);
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("alembic-screenshot-staging"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(h),
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            Some((staging, w, h, padded_bpr, self.surface_config.format))
+        } else {
+            None
+        };
+
         self.queue.submit(std::iter::once(encoder.finish()));
         self.window.pre_present_notify();
         frame.present();
+
+        if let Some((staging, w, h, bpr, fmt)) = screenshot_capture {
+            match self.write_screenshot(&staging, w, h, bpr, fmt) {
+                Ok(path) => {
+                    self.screenshot_notice = Some((120, format!("saved {}", path)));
+                }
+                Err(e) => {
+                    self.screenshot_notice = Some((180, format!("error: {}", e)));
+                }
+            }
+        }
+        if let Some((frames, _)) = &mut self.screenshot_notice {
+            if *frames == 0 {
+                self.screenshot_notice = None;
+            } else {
+                *frames -= 1;
+            }
+        }
         let t_render = t_render_start.elapsed();
 
         self.prof_sim_us     += t_sim.as_micros() as u64;
@@ -6655,12 +6837,13 @@ impl ApplicationHandler for App {
                     return;
                 }
                 // Plain wheel → brush radius. Ctrl+wheel → camera zoom
-                // anchored at the cursor (cell under the cursor stays
-                // under the cursor across the zoom).
+                // anchored at the cursor. Shift+wheel while paused
+                // scrubs through the rewind history.
                 let raw_y: f32 = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 30.0,
                 };
+                let shift_held = state.egui_ctx.input(|i| i.modifiers.shift);
                 if state.ctrl_held {
                     if let Some((px, py)) = state.cursor_pos {
                         let factor = if raw_y > 0.0 { 1.15 }
@@ -6668,6 +6851,12 @@ impl ApplicationHandler for App {
                                      else { 1.0 };
                         state.zoom_at(px as f32, py as f32, factor);
                     }
+                } else if shift_held && state.paused {
+                    // Time scrub. +y = scroll up = back in time.
+                    let dir = if raw_y > 0.0 { 1 }
+                              else if raw_y < 0.0 { -1 }
+                              else { 0 };
+                    state.pending_seek += dir;
                 } else {
                     let dir = if raw_y > 0.0 { 1 }
                               else if raw_y < 0.0 { -1 }
@@ -6745,6 +6934,12 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::KeyU => {
                             state.panel_visible = !state.panel_visible;
+                        }
+                        KeyCode::F2 => {
+                            // Captured AFTER egui is painted, so the
+                            // saved image includes the panel and any
+                            // open periodic-table modal.
+                            state.pending_screenshot = true;
                         }
                         KeyCode::KeyC => {
                             // C clears non-frozen; Shift+C clears
