@@ -9587,9 +9587,47 @@ impl GpuState {
             self.pending_seek = 0;
             self.rewind_active = true;
         }
+        // CPU-side readback is the FPS gate: device.poll(Wait) blocks
+        // until ~95 GPU dispatches drain. We only need fresh world.cells
+        // on the CPU when something actually consumes it this frame:
+        //   * paint (apply_brush mutates world.cells)
+        //   * compute_energized (uses cell.el to find BattPos/Neg)
+        //   * decay U-specific (uses cell.el to find U/Ra)
+        //   * snapshot for time-scrub (when paused / rewind pending)
+        //   * cell inspector (cursor hover tooltip)
+        // None of those triggering → skip the readback entirely. CPU
+        // step still runs but with last-readback's cells; that's stale
+        // by a few frames but the affected paths (present_elements
+        // scan, compute_energized) tolerate that.
+        let painting = self.paint_down || self.erase_down
+            || self.paint_pressed_event || self.erase_pressed_event;
+        let has_circuit = self.world
+            .present_elements[Element::BattPos as usize]
+            || self.world.present_elements[Element::BattNeg as usize];
+        let has_radioactive = self.world
+            .present_elements[Element::U as usize]
+            || self.world.present_elements[Element::Ra as usize];
+        // Cell inspector tooltip needs world.cells when the cursor is
+        // over the sim grid. Leave it loose: if the cursor is in the
+        // sim area, sync — keeps the tooltip readout accurate.
+        let inspector_hover = match self.cursor_pos {
+            Some((px, py)) => self.cursor_to_grid(px, py).is_some(),
+            None => false,
+        };
+        let needs_readback = painting || has_circuit || has_radioactive
+            || inspector_hover;
+
         if !self.paused {
-            let _ = self.device.poll(wgpu::Maintain::Wait);
-            self.motion_compute.read_back_prev_into(&mut self.world);
+            if needs_readback {
+                let _ = self.device.poll(wgpu::Maintain::Wait);
+                self.motion_compute.read_back_prev_into(&mut self.world);
+            } else {
+                // Drain finished map_async callbacks without blocking
+                // so the readback ring buffer can keep advancing in
+                // the background. Cell data isn't actually copied
+                // into world.cells this frame.
+                let _ = self.device.poll(wgpu::Maintain::Poll);
+            }
             // Resuming clears the rewind flag — next sim step's
             // snapshot will reset world.rewind_offset to 0.
             self.rewind_active = false;
@@ -9643,11 +9681,12 @@ impl GpuState {
         }
 
         let t_sim_start = std::time::Instant::now();
-        if !self.paused {
-            // GPU runs: pressure_sources, pressure, thermal_diffuse,
-            // motion, clear_flags, color_fires, flame_test_emission.
-            // CPU runs everything else (combustion in thermal_post,
-            // chem_reactions, etc.) — those will follow in later phases.
+        if !self.paused && needs_readback {
+            // Only run the CPU step when we actually pulled fresh
+            // cells back from GPU this frame. Skipping when nothing
+            // depends on world.cells avoids burning ~3-7ms on the
+            // present_elements scan + compute_energized + snapshot
+            // every frame in default scenes.
             let gpu_chem = crate::GpuChem {
                 clear_flags: true,
                 color_fires: true,
@@ -9679,11 +9718,14 @@ impl GpuState {
         let t_sim = t_sim_start.elapsed();
 
         let t_dispatch_start = std::time::Instant::now();
-        // Single zero-copy upload: world.cells (with this frame's
-        // chemistry/paint changes, or a seek-rewound snapshot when
-        // paused) → cells_buf. Always runs, so paint/seek/clear are
-        // visible while paused.
-        self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
+        // Single zero-copy upload: world.cells → cells_buf. Only runs
+        // when the CPU side actually had work (paint, electrical, or
+        // radioactive cells). Without this gate we'd CLOBBER the
+        // GPU's fresh state with stale CPU cells from the last
+        // readback — completely undoing the readback skip above.
+        if needs_readback {
+            self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
+        }
         // Sync Derived registry: CPU chemistry passes can register
         // new compounds (FeCl, KCl, Al₂O₃, …); GPU motion + render
         // need their physics + color. 8KB upload per frame; cheap.
