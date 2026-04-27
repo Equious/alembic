@@ -2727,14 +2727,21 @@ fn m_hash(a: u32, b: u32) -> u32 {
 }
 
 // One Margolus 2x2 pair-transfer in the wicking pass. Reads c_a/c_b
-// by reference, applies the gradient transfer, returns updated cells.
-fn try_wick(c_a: vec4<u32>, c_b: vec4<u32>) -> vec2<vec4<u32>> {
+// by value, applies the gradient transfer, returns updated cells.
+// WGSL only allows scalar types as vec generic params, so we use a
+// named struct for the (a, b) return pair.
+struct WickPair {
+    a: vec4<u32>,
+    b: vec4<u32>,
+}
+
+fn try_wick(c_a: vec4<u32>, c_b: vec4<u32>) -> WickPair {
     let el_a = m_el(c_a);
     let el_b = m_el(c_b);
     let sink_a = m_is_sink(el_a);
     let sink_b = m_is_sink(el_b);
     if (!sink_a || !sink_b) {
-        return vec2<vec4<u32>>(c_a, c_b);
+        return WickPair(c_a, c_b);
     }
     let m_a = m_moisture(c_a);
     let m_b = m_moisture(c_b);
@@ -2744,35 +2751,35 @@ fn try_wick(c_a: vec4<u32>, c_b: vec4<u32>) -> vec2<vec4<u32>> {
     let k_b = m_conductivity(el_b);
     let k = min(k_a, k_b);
     if (k <= 0.0) {
-        return vec2<vec4<u32>>(c_a, c_b);
+        return WickPair(c_a, c_b);
     }
     // Donor is whichever has more moisture (and the recipient
     // mustn't be past boiling — water doesn't migrate into a cell
     // that's actively evaporating).
     if (m_a > m_b) {
-        if (t_b > 100) { return vec2<vec4<u32>>(c_a, c_b); }
+        if (t_b > 100) { return WickPair(c_a, c_b); }
         let gradient = i32(m_a) - i32(m_b);
-        if (gradient <= 3) { return vec2<vec4<u32>>(c_a, c_b); }
+        if (gradient <= 3) { return WickPair(c_a, c_b); }
         let flow = max(round(k * f32(gradient)), 1.0);
         let amt = u32(min(min(flow, f32(m_a)), f32(255u - m_b)));
-        if (amt == 0u) { return vec2<vec4<u32>>(c_a, c_b); }
-        return vec2<vec4<u32>>(
+        if (amt == 0u) { return WickPair(c_a, c_b); }
+        return WickPair(
             m_set_moisture(c_a, m_a - amt),
             m_set_moisture(c_b, m_b + amt),
         );
     } else if (m_b > m_a) {
-        if (t_a > 100) { return vec2<vec4<u32>>(c_a, c_b); }
+        if (t_a > 100) { return WickPair(c_a, c_b); }
         let gradient = i32(m_b) - i32(m_a);
-        if (gradient <= 3) { return vec2<vec4<u32>>(c_a, c_b); }
+        if (gradient <= 3) { return WickPair(c_a, c_b); }
         let flow = max(round(k * f32(gradient)), 1.0);
         let amt = u32(min(min(flow, f32(m_b)), f32(255u - m_a)));
-        if (amt == 0u) { return vec2<vec4<u32>>(c_a, c_b); }
-        return vec2<vec4<u32>>(
+        if (amt == 0u) { return WickPair(c_a, c_b); }
+        return WickPair(
             m_set_moisture(c_a, m_a + amt),
             m_set_moisture(c_b, m_b - amt),
         );
     }
-    return vec2<vec4<u32>>(c_a, c_b);
+    return WickPair(c_a, c_b);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -2789,31 +2796,39 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (u.pass_id == 0u) {
             // Absorption: any 4-neighbor is_source → +5 moisture.
-            // Skip if not a sink or already saturated.
+            // Skip if not a sink or already saturated. Neighbors are
+            // unrolled — array<vecN<i32>, _> literals in let bindings
+            // hit a NVIDIA Vulkan validator bug on at least one driver.
             let mst = m_moisture(c);
             if (!m_is_sink(el) || mst >= 250u) { return; }
             let xi = i32(x);
             let yi = i32(y);
-            let neighbors = array<vec2<i32>, 4>(
-                vec2<i32>( 1,  0),
-                vec2<i32>(-1,  0),
-                vec2<i32>( 0,  1),
-                vec2<i32>( 0, -1),
-            );
-            for (var k: i32 = 0; k < 4; k = k + 1) {
-                let n = neighbors[k];
-                let nx = xi + n.x;
-                let ny = yi + n.y;
-                if (nx < 0 || nx >= i32(u.width) || ny < 0 || ny >= i32(u.height)) {
-                    continue;
-                }
-                let n_idx = u32(ny) * u.width + u32(nx);
-                let nc = cells[n_idx];
-                if (m_is_source(m_el(nc))) {
-                    let new_m = min(mst + 5u, 255u);
-                    cells[i] = m_set_moisture(c, new_m);
-                    return;
-                }
+            let wi = i32(u.width);
+            let hi = i32(u.height);
+            var found_source: bool = false;
+            // (1, 0)
+            if (xi + 1 < wi) {
+                let nc = cells[u32(yi) * u.width + u32(xi + 1)];
+                if (m_is_source(m_el(nc))) { found_source = true; }
+            }
+            // (-1, 0)
+            if (!found_source && xi - 1 >= 0) {
+                let nc = cells[u32(yi) * u.width + u32(xi - 1)];
+                if (m_is_source(m_el(nc))) { found_source = true; }
+            }
+            // (0, 1)
+            if (!found_source && yi + 1 < hi) {
+                let nc = cells[u32(yi + 1) * u.width + u32(xi)];
+                if (m_is_source(m_el(nc))) { found_source = true; }
+            }
+            // (0, -1)
+            if (!found_source && yi - 1 >= 0) {
+                let nc = cells[u32(yi - 1) * u.width + u32(xi)];
+                if (m_is_source(m_el(nc))) { found_source = true; }
+            }
+            if (found_source) {
+                let new_m = min(mst + 5u, 255u);
+                cells[i] = m_set_moisture(c, new_m);
             }
         } else {
             // Evaporate + passive drying.
@@ -2835,27 +2850,27 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
             // Passive drying — only at air-exposed faces, prob 1/400.
+            // Neighbors unrolled (NVIDIA Vulkan workaround).
             let xi = i32(x);
             let yi = i32(y);
+            let wi = i32(u.width);
+            let hi = i32(u.height);
             var exposed: bool = false;
-            let neighbors = array<vec2<i32>, 4>(
-                vec2<i32>( 1,  0),
-                vec2<i32>(-1,  0),
-                vec2<i32>( 0,  1),
-                vec2<i32>( 0, -1),
-            );
-            for (var k: i32 = 0; k < 4; k = k + 1) {
-                let n = neighbors[k];
-                let nx = xi + n.x;
-                let ny = yi + n.y;
-                if (nx < 0 || nx >= i32(u.width) || ny < 0 || ny >= i32(u.height)) {
-                    continue;
-                }
-                let n_idx = u32(ny) * u.width + u32(nx);
-                if (m_el(cells[n_idx]) == EL_EMPTY) {
-                    exposed = true;
-                    break;
-                }
+            if (xi + 1 < wi
+                && m_el(cells[u32(yi) * u.width + u32(xi + 1)]) == EL_EMPTY) {
+                exposed = true;
+            }
+            if (!exposed && xi - 1 >= 0
+                && m_el(cells[u32(yi) * u.width + u32(xi - 1)]) == EL_EMPTY) {
+                exposed = true;
+            }
+            if (!exposed && yi + 1 < hi
+                && m_el(cells[u32(yi + 1) * u.width + u32(xi)]) == EL_EMPTY) {
+                exposed = true;
+            }
+            if (!exposed && yi - 1 >= 0
+                && m_el(cells[u32(yi - 1) * u.width + u32(xi)]) == EL_EMPTY) {
+                exposed = true;
             }
             if (exposed && (r % 400u) < 1u) {
                 cells[i] = m_set_moisture(c, mst - 1u);
@@ -2883,13 +2898,13 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Try all 4 unique pairs in the block.
     let r0 = try_wick(c00, c10);
-    c00 = r0.x; c10 = r0.y;
+    c00 = r0.a; c10 = r0.b;
     let r1 = try_wick(c01, c11);
-    c01 = r1.x; c11 = r1.y;
+    c01 = r1.a; c11 = r1.b;
     let r2 = try_wick(c00, c01);
-    c00 = r2.x; c01 = r2.y;
+    c00 = r2.a; c01 = r2.b;
     let r3 = try_wick(c10, c11);
-    c10 = r3.x; c11 = r3.y;
+    c10 = r3.a; c11 = r3.b;
 
     cells[i00] = c00;
     cells[i10] = c10;
