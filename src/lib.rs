@@ -8766,12 +8766,15 @@ pub async fn run_game() {
             //     (set to black), so the cloud halo is the ONLY visible
             //     representation of gas. Without this, the bright atom
             //     pixel dominates whatever subtle cloud-tint we apply.
-            // (2) amplify density on composite (~6x) so even isolated
-            //     atoms produce a visible halo despite the heavy
-            //     attenuation of two-pass triangle blur.
+            // (2) amplify density on composite so even isolated atoms
+            //     produce a visible halo despite the heavy attenuation
+            //     of two-pass triangle blur.
             // Atom-level physics is unchanged — purely visual.
-            const GAS_BLUR_RADIUS: usize = 5;
-            const GAS_PER_ATOM: u8 = 220;
+            // Wider radius + higher per-atom contribution gives a
+            // beefier volumetric look; rayon-parallelized blur keeps
+            // the cost manageable.
+            const GAS_BLUR_RADIUS: usize = 8;
+            const GAS_PER_ATOM: u8 = 255;
             let n = W * H;
             let mut gas_r = vec![0u8; n];
             let mut gas_g = vec![0u8; n];
@@ -8794,76 +8797,90 @@ pub async fn run_game() {
                 bytes[i * 4 + 1] = 0;
                 bytes[i * 4 + 2] = 0;
             }
-            // Triangular kernel, radius 5 (11 taps).
-            let kw_g: [u16; 11] = [1, 2, 3, 4, 5, 6, 5, 4, 3, 2, 1];
-            let kw_g_sum: u16 = 36;
+            // Triangular kernel, radius 8 (17 taps). Wider than v0.1's
+            // radius-5 for beefier cloud halos.
+            let kw_g: [u16; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+            let kw_g_sum: u16 = 81;
             let kw_g_len = kw_g.len();
-            // Horizontal blur.
+            // Horizontal blur — parallelize over rows.
             let mut h_gr = vec![0u8; n];
             let mut h_gg = vec![0u8; n];
             let mut h_gb = vec![0u8; n];
             let mut h_gd = vec![0u8; n];
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    let mut sd: u32 = 0;
-                    for k in 0..kw_g_len {
-                        let kx = (x as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
-                            .clamp(0, W as i32 - 1) as usize;
-                        let idx = y * W + kx;
-                        let w = kw_g[k] as u32;
-                        sr += gas_r[idx] as u32 * w;
-                        sg += gas_g[idx] as u32 * w;
-                        sb += gas_b[idx] as u32 * w;
-                        sd += gas_d[idx] as u32 * w;
+            {
+                use rayon::prelude::*;
+                let zipped = h_gr.par_chunks_mut(W)
+                    .zip(h_gg.par_chunks_mut(W))
+                    .zip(h_gb.par_chunks_mut(W))
+                    .zip(h_gd.par_chunks_mut(W))
+                    .enumerate();
+                zipped.for_each(|(y, (((row_r, row_g), row_b), row_d))| {
+                    let row_off = y * W;
+                    for x in 0..W {
+                        let mut sr: u32 = 0;
+                        let mut sg: u32 = 0;
+                        let mut sb: u32 = 0;
+                        let mut sd: u32 = 0;
+                        for k in 0..kw_g_len {
+                            let kx = (x as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
+                                .clamp(0, W as i32 - 1) as usize;
+                            let idx = row_off + kx;
+                            let w = kw_g[k] as u32;
+                            sr += gas_r[idx] as u32 * w;
+                            sg += gas_g[idx] as u32 * w;
+                            sb += gas_b[idx] as u32 * w;
+                            sd += gas_d[idx] as u32 * w;
+                        }
+                        row_r[x] = (sr / kw_g_sum as u32) as u8;
+                        row_g[x] = (sg / kw_g_sum as u32) as u8;
+                        row_b[x] = (sb / kw_g_sum as u32) as u8;
+                        row_d[x] = (sd / kw_g_sum as u32) as u8;
                     }
-                    let i = y * W + x;
-                    h_gr[i] = (sr / kw_g_sum as u32) as u8;
-                    h_gg[i] = (sg / kw_g_sum as u32) as u8;
-                    h_gb[i] = (sb / kw_g_sum as u32) as u8;
-                    h_gd[i] = (sd / kw_g_sum as u32) as u8;
-                }
+                });
             }
             // Vertical blur + composite. Additively combines the local
             // blurred-gas-color (scaled by amplified density) onto the
-            // image bytes. Density is multiplied by ~6× to compensate
+            // image bytes. Density is multiplied by ~8× to compensate
             // for two-pass triangle-blur attenuation, so isolated
-            // atoms still produce a faint visible halo while clusters
+            // atoms still produce a visible halo while clusters
             // saturate to a dense fog.
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    let mut sd: u32 = 0;
-                    for k in 0..kw_g_len {
-                        let ky = (y as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
-                            .clamp(0, H as i32 - 1) as usize;
-                        let idx = ky * W + x;
-                        let w = kw_g[k] as u32;
-                        sr += h_gr[idx] as u32 * w;
-                        sg += h_gg[idx] as u32 * w;
-                        sb += h_gb[idx] as u32 * w;
-                        sd += h_gd[idx] as u32 * w;
+            // Parallelize over rows of the output image. Each row's
+            // vertical-blur reads spanning K columns from h_g* — disjoint
+            // writes per row → race-free under rayon.
+            {
+                use rayon::prelude::*;
+                bytes.par_chunks_mut(W * 4).enumerate().for_each(|(y, row_bytes)| {
+                    for x in 0..W {
+                        let mut sr: u32 = 0;
+                        let mut sg: u32 = 0;
+                        let mut sb: u32 = 0;
+                        let mut sd: u32 = 0;
+                        for k in 0..kw_g_len {
+                            let ky = (y as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
+                                .clamp(0, H as i32 - 1) as usize;
+                            let idx = ky * W + x;
+                            let w = kw_g[k] as u32;
+                            sr += h_gr[idx] as u32 * w;
+                            sg += h_gg[idx] as u32 * w;
+                            sb += h_gb[idx] as u32 * w;
+                            sd += h_gd[idx] as u32 * w;
+                        }
+                        let blur_r = (sr / kw_g_sum as u32) as u32;
+                        let blur_g = (sg / kw_g_sum as u32) as u32;
+                        let blur_b = (sb / kw_g_sum as u32) as u32;
+                        let blur_d = (sd / kw_g_sum as u32) as u32;
+                        if blur_d > 0 {
+                            let amped_d = (blur_d * 8).min(255);
+                            let cr = (blur_r * amped_d / 255) as u8;
+                            let cg = (blur_g * amped_d / 255) as u8;
+                            let cb = (blur_b * amped_d / 255) as u8;
+                            let base = x * 4;
+                            row_bytes[base]     = row_bytes[base].saturating_add(cr);
+                            row_bytes[base + 1] = row_bytes[base + 1].saturating_add(cg);
+                            row_bytes[base + 2] = row_bytes[base + 2].saturating_add(cb);
+                        }
                     }
-                    let blur_r = (sr / kw_g_sum as u32) as u32;
-                    let blur_g = (sg / kw_g_sum as u32) as u32;
-                    let blur_b = (sb / kw_g_sum as u32) as u32;
-                    let blur_d = (sd / kw_g_sum as u32) as u32;
-                    if blur_d > 0 {
-                        let amped_d = (blur_d * 6).min(255);
-                        let cr = (blur_r * amped_d / 255) as u8;
-                        let cg = (blur_g * amped_d / 255) as u8;
-                        let cb = (blur_b * amped_d / 255) as u8;
-                        let i = y * W + x;
-                        let base = i * 4;
-                        bytes[base]     = bytes[base].saturating_add(cr);
-                        bytes[base + 1] = bytes[base + 1].saturating_add(cg);
-                        bytes[base + 2] = bytes[base + 2].saturating_add(cb);
-                    }
-                }
+                });
             }
             // ---- Bloom post-process ----
             // Bloom contribution is driven by EMISSION (cell temperature
@@ -8875,91 +8892,119 @@ pub async fn run_game() {
             // emission intensity — so the bloom inherits the source
             // pixel's hue (yellow lava → yellow halo, white-hot Mg →
             // white halo, orange fire → orange halo) automatically.
-            const BLOOM_RADIUS: usize = 12;
+            // Bigger radius for a pronounced glow halo around hot/glowing
+            // cells. Combined with rayon-parallelized blur passes to keep
+            // the cost in budget even at this kernel size.
+            const BLOOM_RADIUS: usize = 18;
             let n = W * H;
             let mut bright_r = vec![0u8; n];
             let mut bright_g = vec![0u8; n];
             let mut bright_b = vec![0u8; n];
-            for i in 0..n {
-                let c = world.cells[i];
-                // Emission from temperature (linear ramp 500–2500°C).
-                // Above 2500°C saturates at 255. Below 500°C contributes
-                // nothing (typical room-temp materials don't emit).
-                let mut emission: u32 = if c.temp > 500 {
-                    (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
-                } else {
-                    0
-                };
-                // Fire and Lava are canonically luminous regardless of
-                // temp. Energized noble gases too — neon-tube glow.
-                if matches!(c.el, Element::Fire | Element::Lava) {
-                    emission = emission.max(200);
-                }
-                if world.energized[i] && c.el.electrical().glow_color.is_some() {
-                    emission = emission.max(160);
-                }
-                if emission == 0 { continue; }
-                let r = bytes[i * 4] as u32;
-                let g = bytes[i * 4 + 1] as u32;
-                let b = bytes[i * 4 + 2] as u32;
-                bright_r[i] = ((r * emission) / 255).min(255) as u8;
-                bright_g[i] = ((g * emission) / 255).min(255) as u8;
-                bright_b[i] = ((b * emission) / 255).min(255) as u8;
+            // Build the emission/bright buffer in parallel — purely
+            // per-cell read of world + bytes, disjoint per-index writes.
+            {
+                use rayon::prelude::*;
+                let cells = &world.cells;
+                let energized = &world.energized;
+                let bytes_ro: &[u8] = bytes;
+                bright_r.par_iter_mut()
+                    .zip(bright_g.par_iter_mut())
+                    .zip(bright_b.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(i, ((br, bg), bb))| {
+                        let c = cells[i];
+                        // Emission from temperature (linear ramp 500–
+                        // 2500°C). Above 2500°C saturates at 255. Below
+                        // 500°C contributes nothing.
+                        let mut emission: u32 = if c.temp > 500 {
+                            (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
+                        } else {
+                            0
+                        };
+                        // Fire and Lava are canonically luminous regardless
+                        // of temp. Energized noble gases — neon-tube glow.
+                        if matches!(c.el, Element::Fire | Element::Lava) {
+                            emission = emission.max(220);
+                        }
+                        if energized[i] && c.el.electrical().glow_color.is_some() {
+                            emission = emission.max(180);
+                        }
+                        if emission == 0 { return; }
+                        let r = bytes_ro[i * 4] as u32;
+                        let g = bytes_ro[i * 4 + 1] as u32;
+                        let b = bytes_ro[i * 4 + 2] as u32;
+                        *br = ((r * emission) / 255).min(255) as u8;
+                        *bg = ((g * emission) / 255).min(255) as u8;
+                        *bb = ((b * emission) / 255).min(255) as u8;
+                    });
             }
-            // 1D gaussian-ish kernel (radius 9, 19 weights, normalized).
-            // Triangular weights are visually fine and trivially fast.
-            // Wider kernel = larger halo with gentler falloff.
-            let kw: [u16; 19] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-            let kw_sum: u16 = 100;
-            // Horizontal blur into scratch buffers.
+            // 1D triangular kernel (radius 18, 37 taps). Visually fine
+            // and trivially fast; wider kernel = larger halo with
+            // gentler falloff.
+            let kw: [u16; 37] = [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+            ];
+            let kw_sum: u16 = 361;
+            let kw_len = kw.len();
+            // Horizontal blur into scratch buffers — parallel over rows.
             let mut h_r = vec![0u8; n];
             let mut h_g = vec![0u8; n];
             let mut h_b = vec![0u8; n];
-            let kw_len = kw.len();
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    for k in 0..kw_len {
-                        let kx = (x as i32 + k as i32 - BLOOM_RADIUS as i32)
-                            .clamp(0, W as i32 - 1) as usize;
-                        let idx = y * W + kx;
-                        let w = kw[k] as u32;
-                        sr += bright_r[idx] as u32 * w;
-                        sg += bright_g[idx] as u32 * w;
-                        sb += bright_b[idx] as u32 * w;
+            {
+                use rayon::prelude::*;
+                let zipped = h_r.par_chunks_mut(W)
+                    .zip(h_g.par_chunks_mut(W))
+                    .zip(h_b.par_chunks_mut(W))
+                    .enumerate();
+                zipped.for_each(|(y, ((row_r, row_g), row_b))| {
+                    let row_off = y * W;
+                    for x in 0..W {
+                        let mut sr: u32 = 0;
+                        let mut sg: u32 = 0;
+                        let mut sb: u32 = 0;
+                        for k in 0..kw_len {
+                            let kx = (x as i32 + k as i32 - BLOOM_RADIUS as i32)
+                                .clamp(0, W as i32 - 1) as usize;
+                            let idx = row_off + kx;
+                            let w = kw[k] as u32;
+                            sr += bright_r[idx] as u32 * w;
+                            sg += bright_g[idx] as u32 * w;
+                            sb += bright_b[idx] as u32 * w;
+                        }
+                        row_r[x] = (sr / kw_sum as u32) as u8;
+                        row_g[x] = (sg / kw_sum as u32) as u8;
+                        row_b[x] = (sb / kw_sum as u32) as u8;
                     }
-                    let i = y * W + x;
-                    h_r[i] = (sr / kw_sum as u32) as u8;
-                    h_g[i] = (sg / kw_sum as u32) as u8;
-                    h_b[i] = (sb / kw_sum as u32) as u8;
-                }
+                });
             }
-            // Vertical blur, additive composite onto image bytes.
-            for y in 0..H {
-                for x in 0..W {
-                    let mut sr: u32 = 0;
-                    let mut sg: u32 = 0;
-                    let mut sb: u32 = 0;
-                    for k in 0..kw_len {
-                        let ky = (y as i32 + k as i32 - BLOOM_RADIUS as i32)
-                            .clamp(0, H as i32 - 1) as usize;
-                        let idx = ky * W + x;
-                        let w = kw[k] as u32;
-                        sr += h_r[idx] as u32 * w;
-                        sg += h_g[idx] as u32 * w;
-                        sb += h_b[idx] as u32 * w;
+            // Vertical blur, additive composite onto image bytes —
+            // parallel over output rows.
+            {
+                use rayon::prelude::*;
+                bytes.par_chunks_mut(W * 4).enumerate().for_each(|(y, row_bytes)| {
+                    for x in 0..W {
+                        let mut sr: u32 = 0;
+                        let mut sg: u32 = 0;
+                        let mut sb: u32 = 0;
+                        for k in 0..kw_len {
+                            let ky = (y as i32 + k as i32 - BLOOM_RADIUS as i32)
+                                .clamp(0, H as i32 - 1) as usize;
+                            let idx = ky * W + x;
+                            let w = kw[k] as u32;
+                            sr += h_r[idx] as u32 * w;
+                            sg += h_g[idx] as u32 * w;
+                            sb += h_b[idx] as u32 * w;
+                        }
+                        let br = (sr / kw_sum as u32) as u8;
+                        let bg = (sg / kw_sum as u32) as u8;
+                        let bb = (sb / kw_sum as u32) as u8;
+                        let base = x * 4;
+                        row_bytes[base]     = row_bytes[base].saturating_add(br);
+                        row_bytes[base + 1] = row_bytes[base + 1].saturating_add(bg);
+                        row_bytes[base + 2] = row_bytes[base + 2].saturating_add(bb);
                     }
-                    let i = y * W + x;
-                    let br = (sr / kw_sum as u32) as u8;
-                    let bg = (sg / kw_sum as u32) as u8;
-                    let bb = (sb / kw_sum as u32) as u8;
-                    let base = i * 4;
-                    bytes[base]     = bytes[base].saturating_add(br);
-                    bytes[base + 1] = bytes[base + 1].saturating_add(bg);
-                    bytes[base + 2] = bytes[base + 2].saturating_add(bb);
-                }
+                });
             }
         }
         texture.update(&image);
