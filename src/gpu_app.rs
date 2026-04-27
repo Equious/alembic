@@ -230,9 +230,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (u.pass_id == 2u) {
         // Writeback: pressure_in holds the final diffused pressure.
-        // Clamp to i16, write back to bits 16-31 of cells[i].z while
-        // preserving moisture (bits 0-7) and burn (bits 8-15).
-        let final_p = clamp(pressure_in[i], -4000, 4000);
+        // Clamp to i16 range (matches CPU `pressure()` which casts
+        // i32 → i16, allowing pressure to grow up to 32767). The
+        // pressure_sources hydrostatic target separately caps at
+        // ±4000, but paint-stacked overpressure must be allowed
+        // through here so sealed containers can build to bursting.
+        let final_p = clamp(pressure_in[i], -32768, 32767);
         let raw = u32(final_p) & 0xFFFFu;
         let lo = cells[i].z & 0x0000FFFFu;
         cells[i].z = lo | (raw << 16u);
@@ -5361,6 +5364,195 @@ impl BurnCyclesCtx {
     }
 }
 
+const WALL_RUPTURE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+const FLAG_FROZEN: u32 = 0x02u;
+const BASE_THRESHOLD: i32 = 2500;
+const PER_LAYER: i32 = 350;
+const MAX_PROBE: u32 = 30u;
+
+fn wr_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn wr_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn wr_frozen(c: vec4<u32>) -> bool { return (wr_flag(c) & FLAG_FROZEN) != 0u; }
+fn wr_pressure(c: vec4<u32>) -> i32 {
+    let raw = (c.z >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn wr_clear_frozen(c: vec4<u32>) -> vec4<u32> {
+    let new_flag = wr_flag(c) & (~FLAG_FROZEN & 0xFFu);
+    let new_y = (c.y & 0xFFFF00FFu) | (new_flag << 8u);
+    return vec4<u32>(c.x, new_y, c.z, c.w);
+}
+
+// Faithful port of the frozen-wall rupture branch in
+// `World::update_cell` (lib.rs:7441). A frozen wall holds as a
+// single rigid unit until the pressure differential across its
+// innermost face exceeds BASE_THRESHOLD + PER_LAYER × (thickness − 1).
+// Then the entire same-element column unfreezes — pressure_shove +
+// motion handle the actual fling next frame.
+//
+// Only the innermost face cell of a wall sees a meaningful pressure
+// gap (deeper wall cells are sandwiched between zero-pressure
+// neighbors), so race-free even though every frozen cell runs this
+// check: redundant unfreeze writes carry the same value.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if (x >= i32(u.width) || y >= i32(u.height)) { return; }
+    let i = u32(y) * u.width + u32(x);
+    let c = cells[i];
+    if (!wr_frozen(c)) { return; }
+
+    let my_p = wr_pressure(c);
+    var max_gap: i32 = 0;
+    var max_np: i32 = -2147483648;
+    var blast_dx: i32 = 0;
+    var blast_dy: i32 = 0;
+    let dxs = array<i32, 4>(-1, 1, 0, 0);
+    let dys = array<i32, 4>(0, 0, -1, 1);
+    for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+        let dx = dxs[k];
+        let dy = dys[k];
+        let nx = x + dx;
+        let ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= i32(u.width) || ny >= i32(u.height)) { continue; }
+        let np = wr_pressure(cells[u32(ny) * u.width + u32(nx)]);
+        let gap = abs(my_p - np);
+        if (gap > max_gap) { max_gap = gap; }
+        if (np > max_np) {
+            max_np = np;
+            blast_dx = dx;
+            blast_dy = dy;
+        }
+    }
+    if (max_gap < BASE_THRESHOLD) { return; }
+
+    let push_x: i32 = -blast_dx;
+    let push_y: i32 = -blast_dy;
+    if (push_x == 0 && push_y == 0) { return; }
+
+    // Probe outward through same-element frozen cells.
+    let wall_el = wr_el(c);
+    var thickness: u32 = 1u;
+    var tx = x + push_x;
+    var ty = y + push_y;
+    loop {
+        if (thickness > MAX_PROBE) { break; }
+        if (tx < 0 || ty < 0 || tx >= i32(u.width) || ty >= i32(u.height)) { break; }
+        let ti = u32(ty) * u.width + u32(tx);
+        let tc = cells[ti];
+        if (!wr_frozen(tc)) { break; }
+        if (wr_el(tc) != wall_el) { break; }
+        thickness = thickness + 1u;
+        tx = tx + push_x;
+        ty = ty + push_y;
+    }
+    let effective_threshold = BASE_THRESHOLD + PER_LAYER * (i32(thickness) - 1);
+    if (max_gap < effective_threshold) { return; }
+
+    // Wall fails as a unit — unfreeze the entire column. pressure_shove
+    // and motion next frame handle the dispersion.
+    var ux = x;
+    var uy = y;
+    for (var t: u32 = 0u; t < thickness; t = t + 1u) {
+        let uidx = u32(uy) * u.width + u32(ux);
+        cells[uidx] = wr_clear_frozen(cells[uidx]);
+        ux = ux + push_x;
+        uy = uy + push_y;
+    }
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct WallRuptureUniforms {
+    width: u32,
+    height: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// GPU port of the frozen-wall rupture branch in
+/// `World::update_cell`. CPU motion is gated off when GPU motion
+/// runs; without this pass, sealed containers with high-pressure
+/// gas wouldn't burst (frozen walls would never unfreeze).
+struct WallRuptureCtx {
+    pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
+    uniform_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl WallRuptureCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let uniforms = WallRuptureUniforms {
+            width: W as u32, height: H as u32, _pad0: 0, _pad1: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-wallrupture-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-wallrupture-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-wallrupture-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-wallrupture-shader"),
+            source: wgpu::ShaderSource::Wgsl(WALL_RUPTURE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-wallrupture-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-wallrupture-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        WallRuptureCtx { pipeline, uniform_buf, bind_group }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-wallrupture-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 const PRESSURE_SHOVE_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -7907,6 +8099,11 @@ struct GpuState {
     /// Burn-cycle chemistries: thermite + magnesium_burn (per-cell
     /// burn-tick + Margolus ignition/consume).
     burn_compute: BurnCyclesCtx,
+    /// Frozen-wall rupture — unfreeze high-pressure-gradient walls
+    /// so a sealed container can burst when gas pressure builds
+    /// high enough. Runs before pressure_shove so the unfrozen
+    /// cells get flung outward the same frame.
+    wall_rupture_compute: WallRuptureCtx,
     /// Pressure-driven cell displacement (try_pressure_shove). Margolus
     /// 2x2 4-phase. Drives gas dispersion and water leveling.
     pshove_compute: PressureShoveCtx,
@@ -8386,6 +8583,7 @@ impl GpuState {
         let chem_compute = ChemReactionsCtx::new(&device, &queue, &cells_buf);
         let sup_chem_compute = SupportingChemCtx::new(&device, &queue, &cells_buf);
         let burn_compute = BurnCyclesCtx::new(&device, &queue, &cells_buf);
+        let wall_rupture_compute = WallRuptureCtx::new(&device, &queue, &cells_buf);
         let pshove_compute = PressureShoveCtx::new(&device, &queue, &cells_buf);
         let joule_compute = JouleHeatingCtx::new(&device, &queue, &cells_buf);
         let decay_compute = DecayCtx::new(&device, &queue, &cells_buf);
@@ -8453,6 +8651,7 @@ impl GpuState {
             chem_compute,
             sup_chem_compute,
             burn_compute,
+            wall_rupture_compute,
             pshove_compute,
             joule_compute,
             decay_compute,
@@ -10704,6 +10903,11 @@ impl GpuState {
             // 6. color_fires — Fire cells inherit flame color from any
             //    flame-coloring neighbor.
             self.color_fires_compute.encode(&mut encoder);
+            // 6a-rupture. Frozen-wall rupture: unfreeze any wall with
+            //     a pressure gap > 2500 + 350 × thickness. Must run
+            //     BEFORE pressure_shove so the same frame's shove can
+            //     fling the now-unfrozen cells.
+            self.wall_rupture_compute.encode(&mut encoder);
             // 6b. Pressure-shove. Runs BEFORE motion so cells displaced
             //     by pressure gradients don't get yanked by gravity in
             //     the same frame. Margolus 2x2 4-phase, race-free.
