@@ -1650,6 +1650,21 @@ impl MotionComputeCtx {
     fn advance_frame(&mut self) {
         self.write_idx = 1 - self.write_idx;
     }
+
+    /// Drain + unmap any ring buffers still marked has_data. Called
+    /// when readback resumes after a skip stretch — without this,
+    /// one slot in the ring stays mapped from the last active
+    /// session and motion's next write into it fails wgpu validation
+    /// ("buffer still mapped"). Caller is responsible for already
+    /// having waited for the queue to drain so unmap is safe.
+    fn ensure_ring_unmapped(&mut self) {
+        for i in 0..2 {
+            if self.has_data[i] {
+                self.readback_bufs[i].unmap();
+                self.has_data[i] = false;
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -10056,6 +10071,15 @@ impl GpuState {
                         crate::cells_copy_from_bytes(&mut self.world.cells, &data);
                     }
                     self.fresh_sync_buf.unmap();
+                    // The motion ring slept while needs_readback was
+                    // false. One of its buffers may still be mapped
+                    // from the prior active session; unmap them now
+                    // so the next motion encode (which writes into
+                    // wb[write_idx]) doesn't fault on a still-mapped
+                    // copy destination. The poll(WaitFor…) above
+                    // already drained the queue, so unmap is safe.
+                    let _ = self.device.poll(wgpu::Maintain::Wait);
+                    self.motion_compute.ensure_ring_unmapped();
                 } else {
                     // Steady-state readback path. The motion ring
                     // has been writing every frame because
