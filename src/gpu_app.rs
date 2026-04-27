@@ -4369,6 +4369,14 @@ struct GpuState {
     /// tool's material slot). Reset to Paint after a pick.
     pt_target_kind: PtTargetKind,
 
+    // ---- Pipet species cache (rebuilt every 15 frames) ----
+    species_cache: Vec<(Element, u8, usize)>,
+    species_cache_frame: u32,
+    /// Counts down — non-zero means "pipet bucket has different
+    /// species; can't switch filter mid-hold". Mirrors macroquad's
+    /// pipet_warning_frames.
+    pipet_warning_frames: u32,
+
     /// L mouse press THIS frame (transition up→down). Cleared at end
     /// of render(). Used by Prefab one-shot place and Wire two-click
     /// line endpoints — both want a single trigger per click rather
@@ -4401,6 +4409,10 @@ struct GpuState {
     /// before the CPU step so the clear actually sticks (otherwise
     /// motion's full-cells readback overwrites the cleared cells).
     pending_clear: bool,
+    /// Shift+C variant — also wipe frozen / build cells.
+    pending_clear_all: bool,
+    /// Side panel hidden when false (U toggles).
+    panel_visible: bool,
     /// World-space cell coordinate at the center of the view.
     /// Default: (W/2, H/2) → sim is centered. Pan moves this around.
     cam_center_x: f32,
@@ -4794,6 +4806,8 @@ impl GpuState {
             ctrl_held: false,
             middle_drag_from: None,
             pending_clear: false,
+            pending_clear_all: false,
+            panel_visible: true,
             cam_center_x: W as f32 * 0.5,
             cam_center_y: H as f32 * 0.5,
             cam_scale: 1.0,
@@ -4818,6 +4832,9 @@ impl GpuState {
             wire_thickness: 2,
             wire_start: None,
             pt_target_kind: PtTargetKind::Paint,
+            species_cache: Vec::new(),
+            species_cache_frame: 0,
+            pipet_warning_frames: 0,
             paint_pressed_event: false,
             erase_pressed_event: false,
         };
@@ -5066,6 +5083,18 @@ impl GpuState {
     /// layout in lib.rs. Same colors, same sections, same behavior.
     /// The periodic-table modal (Tab) is drawn separately on top.
     fn draw_ui(&mut self, ctx: &egui::Context) {
+        // Shockwave overlay first — egui background area sits above the
+        // sim and below the side panel chrome. Only draws when there
+        // are active waves.
+        self.draw_shockwave_overlay(ctx);
+
+        if !self.panel_visible {
+            // Panel hidden — only the periodic-table modal can still
+            // appear (Tab is the universal toggle).
+            if self.pt_open { self.draw_periodic_table(ctx); }
+            return;
+        }
+
         // Panel chrome — colors mirror panel_bg() and draw_panel_button.
         let panel_bg = egui::Color32::from_rgb(18, 18, 24);
         let btn_normal = egui::Color32::from_rgb(30, 30, 38);
@@ -5327,6 +5356,16 @@ impl GpuState {
                     self.wind = macroquad::math::Vec2::new(0.0, 0.0);
                 }
 
+                // ---- Pipet status panel (only when Pipet is active) ----
+                if self.tool_mode == crate::ToolMode::Pipet {
+                    ui.add_space(18.0);
+                    self.draw_pipet_status(
+                        ui,
+                        btn_selected, btn_normal, btn_hover, btn_border,
+                        text_btn, dim_label, value_color,
+                    );
+                }
+
                 // ---- Footnote (open periodic table) ----
                 ui.add_space(18.0);
                 ui.separator();
@@ -5504,6 +5543,142 @@ impl GpuState {
         ui.add_space(8.0);
     }
 
+    /// PIPET status panel — current target species, bucket count,
+    /// breakdown list, Clear button, and a "species in scene" filter
+    /// list. Faithful port of the macroquad Pipet sub-panel.
+    fn draw_pipet_status(
+        &mut self,
+        ui: &mut egui::Ui,
+        sel_color: egui::Color32,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text_btn: egui::Color32,
+        dim_label: egui::Color32,
+        value_color: egui::Color32,
+    ) {
+        const PIPET_CAPACITY: usize = 4000;
+        let bw = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(bw, 124.0),
+            egui::Sense::hover(),
+        );
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, egui::Color32::from_rgb(24, 28, 36));
+        p.rect_stroke(rect, 2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 72)),
+            egui::StrokeKind::Inside);
+        p.text(
+            egui::pos2(rect.left() + 10.0, rect.top() + 16.0),
+            egui::Align2::LEFT_TOP,
+            "TARGET",
+            egui::FontId::proportional(11.0),
+            dim_label,
+        );
+        let target_text = match self.pipet_target {
+            None => "any (unfiltered)".to_string(),
+            Some((el, did)) => if el == Element::Derived {
+                crate::derived_formula_of(did)
+            } else { el.name().to_string() },
+        };
+        p.text(
+            egui::pos2(rect.left() + 10.0, rect.top() + 32.0),
+            egui::Align2::LEFT_TOP,
+            &target_text,
+            egui::FontId::proportional(15.0),
+            value_color,
+        );
+        let count_text = format!("{} / {}", self.pipet_bucket.len(), PIPET_CAPACITY);
+        p.text(
+            egui::pos2(rect.left() + 10.0, rect.top() + 56.0),
+            egui::Align2::LEFT_TOP,
+            &count_text,
+            egui::FontId::proportional(13.0),
+            value_color,
+        );
+
+        // Breakdown list — mixed-bucket grab-all mode shows what's in
+        // the bucket, sorted descending by count.
+        if self.pipet_target.is_none() && !self.pipet_bucket.is_empty() {
+            let mut tally: Vec<((Element, u8), usize)> = Vec::with_capacity(16);
+            for c in &self.pipet_bucket {
+                let key = (c.el, c.derived_id);
+                if let Some(entry) = tally.iter_mut().find(|(k, _)| *k == key) {
+                    entry.1 += 1;
+                } else {
+                    tally.push((key, 1));
+                }
+            }
+            tally.sort_by(|a, b| b.1.cmp(&a.1));
+            let max_rows = 4usize;
+            let row_h = 14.0;
+            let mut row_y = rect.top() + 76.0;
+            for &(key, count) in tally.iter().take(max_rows) {
+                let name = if key.0 == Element::Derived {
+                    crate::derived_formula_of(key.1)
+                } else { key.0.name().to_string() };
+                let line = format!("{:>4} {}", count, name);
+                p.text(
+                    egui::pos2(rect.left() + 10.0, row_y),
+                    egui::Align2::LEFT_TOP,
+                    &line,
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::from_rgb(180, 180, 200),
+                );
+                row_y += row_h;
+            }
+        }
+
+        if self.pipet_warning_frames > 0 {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("bucket has different species — drop first")
+                    .color(egui::Color32::from_rgb(220, 160, 80)).size(11.0),
+            );
+        }
+
+        ui.add_space(6.0);
+        if Self::tool_button(
+            ui, "Clear pipet", false,
+            sel_color, normal, hover, border, text_btn,
+        ) {
+            self.pipet_bucket.clear();
+            self.pipet_target = None;
+        }
+
+        // Species filter list — clicking a row sets the pipet target.
+        if !self.species_cache.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("SPECIES IN SCENE").color(dim_label).size(11.0),
+            );
+            ui.add_space(4.0);
+            // Snapshot to avoid borrow conflicts inside the click handler.
+            let species_snapshot: Vec<(Element, u8, usize)> =
+                self.species_cache.iter().take(8).cloned().collect();
+            for (el, did, count) in species_snapshot {
+                let active = self.pipet_target == Some((el, did));
+                let name = if el == Element::Derived {
+                    crate::derived_formula_of(did)
+                } else { el.name().to_string() };
+                let label = format!("{}   ({})", name, count);
+                if Self::tool_button(
+                    ui, &label, active,
+                    sel_color, normal, hover, border, text_btn,
+                ) {
+                    let new_target = if active { None } else { Some((el, did)) };
+                    if new_target != self.pipet_target
+                        && !self.pipet_bucket.is_empty()
+                    {
+                        self.pipet_warning_frames = 120;
+                    } else {
+                        self.pipet_target = new_target;
+                    }
+                }
+            }
+        }
+    }
+
     /// Compact button used inside dropdowns where the standard 30px
     /// tool-button height is too tall for a row of three.
     fn small_button(
@@ -5533,6 +5708,39 @@ impl GpuState {
             text,
         );
         resp.clicked()
+    }
+
+    /// Shockwave leading-edge overlay. Faithful port of the macroquad
+    /// `for s in &world.shockwaves` block — bright rings whose alpha
+    /// scales with remaining magnitude. Drawn as a transparent egui
+    /// area above the sim and below the side panel.
+    fn draw_shockwave_overlay(&self, ctx: &egui::Context) {
+        if self.world.shockwaves.is_empty() { return; }
+        let (rect, scale) = self.sim_pixel_rect();
+        let id = egui::Id::new("alembic-shockwave-overlay");
+        egui::Area::new(id)
+            .order(egui::Order::Background)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let p = ui.painter();
+                for s in &self.world.shockwaves {
+                    let decay = 1.0 + s.radius / 6.0;
+                    let mag = s.yield_p / (decay * decay);
+                    if mag < 200.0 { continue; }
+                    let alpha = (mag / 40.0).clamp(20.0, 220.0) as u8;
+                    let cx = rect.0 + s.cx * scale + scale * 0.5;
+                    let cy = rect.1 + s.cy * scale + scale * 0.5;
+                    let r = s.radius * scale;
+                    p.circle_stroke(
+                        egui::pos2(cx, cy),
+                        r,
+                        egui::Stroke::new(
+                            (scale * 1.8).max(1.5),
+                            egui::Color32::from_rgba_unmultiplied(255, 230, 180, alpha),
+                        ),
+                    );
+                }
+            });
     }
 
     fn style_panel(
@@ -5699,16 +5907,17 @@ impl GpuState {
                     PtTargetKind::WireMaterial => self.wire_material,
                 };
                 let mut picked: Option<Element> = None;
+                let mut hovered: Option<(Element, u8)> = None;
                 for period in 1..=max_period {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = pt_gap;
                         for group in 1..=18u8 {
                             if let Some(&(el, sym, num)) = by_pp.get(&(period, group)) {
-                                if let Some(p) = Self::pt_atom_tile(
+                                let (clicked, hov) = Self::pt_atom_tile(
                                     ui, el, sym, num, pt_tile, current_for_hl,
-                                ) {
-                                    picked = Some(p);
-                                }
+                                );
+                                if let Some(p) = clicked { picked = Some(p); }
+                                if hov { hovered = Some((el, 0)); }
                             } else {
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(pt_tile, pt_tile),
@@ -5732,9 +5941,9 @@ impl GpuState {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = pt_gap;
                     for &el in crate::ui_compound_palette() {
-                        if let Some(p) = Self::pt_compound_tile(ui, el, pt_tile, current_for_hl) {
-                            picked = Some(p);
-                        }
+                        let (clicked, hov) = Self::pt_compound_tile(ui, el, pt_tile, current_for_hl);
+                        if let Some(p) = clicked { picked = Some(p); }
+                        if hov { hovered = Some((el, 0)); }
                     }
                 });
 
@@ -5779,6 +5988,9 @@ impl GpuState {
                                 egui::FontId::proportional(11.0),
                                 egui::Color32::WHITE,
                             );
+                            if resp.hovered() {
+                                hovered = Some((Element::Derived, *did));
+                            }
                             if resp.clicked() {
                                 // Derived only makes sense as a paint
                                 // brush — prefab/wire materials must
@@ -5792,6 +6004,60 @@ impl GpuState {
                             }
                         }
                     });
+                }
+
+                // Detail panel — info about the hovered tile (or the
+                // currently-selected element if nothing's hovered).
+                ui.add_space(12.0);
+                let detail_target = hovered.or_else(|| {
+                    if self.selected == Element::Derived {
+                        Some((Element::Derived, self.selected_did))
+                    } else {
+                        Some((self.selected, 0))
+                    }
+                });
+                if let Some((el, did)) = detail_target {
+                    let (title, subtitle, body) = crate::ui_element_detail(el, did);
+                    let panel_w = ui.available_width();
+                    let lines = body.len() as f32;
+                    let panel_h = 28.0 + 22.0 + 16.0 + lines * 18.0 + 12.0;
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(panel_w, panel_h),
+                        egui::Sense::hover(),
+                    );
+                    let p = ui.painter();
+                    p.rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 18, 26));
+                    p.rect_stroke(rect, 2.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 76)),
+                        egui::StrokeKind::Inside);
+                    let px = rect.left() + 14.0;
+                    let mut py = rect.top() + 8.0;
+                    p.text(
+                        egui::pos2(px, py),
+                        egui::Align2::LEFT_TOP,
+                        &title,
+                        egui::FontId::proportional(20.0),
+                        egui::Color32::WHITE,
+                    );
+                    py += 28.0;
+                    p.text(
+                        egui::pos2(px, py),
+                        egui::Align2::LEFT_TOP,
+                        &subtitle,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::LIGHT_GRAY,
+                    );
+                    py += 22.0;
+                    for line in &body {
+                        p.text(
+                            egui::pos2(px, py),
+                            egui::Align2::LEFT_TOP,
+                            line,
+                            egui::FontId::proportional(13.0),
+                            egui::Color32::from_rgb(190, 190, 205),
+                        );
+                        py += 18.0;
+                    }
                 }
 
                 if let Some(p) = picked {
@@ -5826,6 +6092,7 @@ impl GpuState {
             });
     }
 
+    /// Returns (clicked, hovered).
     fn pt_atom_tile(
         ui: &mut egui::Ui,
         el: Element,
@@ -5833,7 +6100,7 @@ impl GpuState {
         num: u8,
         size: f32,
         current: Element,
-    ) -> Option<Element> {
+    ) -> (Option<Element>, bool) {
         let (r, g, b) = el.base_color();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(size, size),
@@ -5870,18 +6137,20 @@ impl GpuState {
             egui::FontId::proportional(18.0),
             egui::Color32::BLACK,
         );
+        let hovered = resp.hovered();
         if resp.clicked() {
-            return Some(el);
+            return (Some(el), hovered);
         }
-        None
+        (None, hovered)
     }
 
+    /// Returns (clicked, hovered).
     fn pt_compound_tile(
         ui: &mut egui::Ui,
         el: Element,
         size: f32,
         current: Element,
-    ) -> Option<Element> {
+    ) -> (Option<Element>, bool) {
         let (r, g, b) = el.base_color();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(size, size),
@@ -5922,10 +6191,11 @@ impl GpuState {
                 egui::Stroke::new(3.0, egui::Color32::YELLOW),
                 egui::StrokeKind::Inside);
         }
+        let hovered = resp.hovered();
         if resp.clicked() {
-            return Some(el);
+            return (Some(el), hovered);
         }
-        None
+        (None, hovered)
     }
 
     fn render(&mut self) {
@@ -5941,19 +6211,45 @@ impl GpuState {
         let t_compute_readback = t_compute_start.elapsed();
 
         // Pending C-key clear runs AFTER readback so it sticks.
+        // Shift+C also wipes frozen / build cells (matches macroquad).
         if self.pending_clear {
+            let wipe_frozen = self.pending_clear_all;
             for c in self.world.cells.iter_mut() {
-                if !c.is_frozen() {
+                if wipe_frozen || !c.is_frozen() {
                     *c = crate::Cell::EMPTY;
                 }
             }
             self.pending_clear = false;
+            self.pending_clear_all = false;
         }
         self.apply_brush();
         // Press-event flags fire exactly once per click; reset them as
         // soon as the brush handler has had a chance to consume them.
         self.paint_pressed_event = false;
         self.erase_pressed_event = false;
+        if self.pipet_warning_frames > 0 {
+            self.pipet_warning_frames -= 1;
+        }
+        // Refresh the species cache every 15 frames — same cadence as
+        // the macroquad version.
+        self.species_cache_frame = self.species_cache_frame.wrapping_add(1);
+        if self.species_cache_frame % 15 == 0 {
+            self.species_cache.clear();
+            for c in &self.world.cells {
+                if c.el == Element::Empty { continue; }
+                if c.is_frozen() { continue; }
+                if matches!(c.el, Element::BattPos | Element::BattNeg) { continue; }
+                let key = (c.el, c.derived_id);
+                if let Some(entry) = self.species_cache.iter_mut()
+                    .find(|(el, did, _)| (*el, *did) == key)
+                {
+                    entry.2 += 1;
+                } else {
+                    self.species_cache.push((c.el, c.derived_id, 1));
+                }
+            }
+            self.species_cache.sort_by(|a, b| b.2.cmp(&a.2));
+        }
 
         let t_sim_start = std::time::Instant::now();
         if !self.paused {
@@ -6368,42 +6664,68 @@ impl ApplicationHandler for App {
                         state.selected = el;
                         return;
                     }
-                    // Arrow keys / WASD pan the camera by ~12% of the
-                    // visible window each press. Sensitive to zoom —
-                    // smaller cells = bigger jumps, since you cover
-                    // more world per keypress at lower zoom.
+                    // Arrow keys pan the camera by ~12% of the visible
+                    // window each press. WASD letter aliases were
+                    // dropped to free those keys for tool toggles
+                    // (matches the macroquad keybind set).
                     let pan_step_px = 0.12;
                     let win_w = state.surface_config.width as f32;
                     let win_h = state.surface_config.height as f32;
+                    let shift_held = state.egui_ctx.input(|i| i.modifiers.shift);
                     match code {
                         KeyCode::Space => state.paused = !state.paused,
                         KeyCode::Backspace => state.camera_reset(),
-                        KeyCode::ArrowLeft | KeyCode::KeyA => {
+                        KeyCode::ArrowLeft => {
                             state.pan_pixels(win_w * pan_step_px, 0.0);
                         }
-                        KeyCode::ArrowRight | KeyCode::KeyD => {
+                        KeyCode::ArrowRight => {
                             state.pan_pixels(-win_w * pan_step_px, 0.0);
                         }
-                        KeyCode::ArrowUp | KeyCode::KeyW => {
+                        KeyCode::ArrowUp => {
                             state.pan_pixels(0.0, win_h * pan_step_px);
                         }
-                        KeyCode::ArrowDown | KeyCode::KeyS => {
+                        KeyCode::ArrowDown => {
                             state.pan_pixels(0.0, -win_h * pan_step_px);
                         }
+                        // ---- Tool toggles (matches macroquad lib.rs) ----
+                        KeyCode::KeyB => state.build_mode = !state.build_mode,
+                        KeyCode::KeyH => {
+                            state.tool_mode = if state.tool_mode == crate::ToolMode::Heat
+                                { crate::ToolMode::Paint } else { crate::ToolMode::Heat };
+                        }
+                        KeyCode::KeyV => {
+                            state.tool_mode = if state.tool_mode == crate::ToolMode::Vacuum
+                                { crate::ToolMode::Paint } else { crate::ToolMode::Vacuum };
+                        }
+                        KeyCode::KeyF => {
+                            state.tool_mode = if state.tool_mode == crate::ToolMode::Prefab
+                                { crate::ToolMode::Paint } else { crate::ToolMode::Prefab };
+                        }
+                        KeyCode::KeyW => {
+                            state.tool_mode = if state.tool_mode == crate::ToolMode::Wire
+                                { crate::ToolMode::Paint } else { crate::ToolMode::Wire };
+                            state.wire_start = None;
+                        }
+                        KeyCode::KeyP | KeyCode::KeyM => {
+                            state.tool_mode = if state.tool_mode == crate::ToolMode::Pipet
+                                { crate::ToolMode::Paint } else { crate::ToolMode::Pipet };
+                        }
+                        KeyCode::KeyR => {
+                            // R cycles prefab rotation only when Prefab
+                            // is the active tool.
+                            if state.tool_mode == crate::ToolMode::Prefab {
+                                state.prefab_rotation = (state.prefab_rotation + 1) & 3;
+                            }
+                        }
+                        KeyCode::KeyU => {
+                            state.panel_visible = !state.panel_visible;
+                        }
                         KeyCode::KeyC => {
-                            // Defer the actual clear until render() so it
-                            // happens AFTER motion readback (which would
-                            // otherwise resurrect the cleared cells).
+                            // C clears non-frozen; Shift+C clears
+                            // EVERYTHING including frozen walls.
                             state.pending_clear = true;
-                        }
-                        KeyCode::Tab => {
-                            state.pt_open = !state.pt_open;
-                        }
-                        KeyCode::Escape => {
-                            if state.pt_open {
-                                state.pt_open = false;
-                            } else {
-                                event_loop.exit();
+                            if shift_held {
+                                state.pending_clear_all = true;
                             }
                         }
                         _ => {}

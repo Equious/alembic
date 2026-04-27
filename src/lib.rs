@@ -2015,6 +2015,133 @@ pub fn ui_element_name(el: Element) -> &'static str {
     }
 }
 
+/// Detail-panel lines for an atom or compound — used by the periodic
+/// table modal's hover info. Returns (title, subtitle, body_lines).
+/// Mirrors the macroquad detail panel's content.
+pub fn ui_element_detail(el: Element, did: u8) -> (String, String, Vec<String>) {
+    // Atoms — full physics block.
+    if let Some(a) = atom_profile_for(el) {
+        let title = format!("{} ({})    #{}", a.name, a.symbol, a.number);
+        let cat_name = match a.category {
+            AtomCategory::Hydrogen => "Hydrogen (unique)",
+            AtomCategory::AlkaliMetal => "Alkali Metal",
+            AtomCategory::AlkalineEarth => "Alkaline Earth Metal",
+            AtomCategory::TransitionMetal => "Transition Metal",
+            AtomCategory::PostTransition => "Post-Transition Metal",
+            AtomCategory::Metalloid => "Metalloid",
+            AtomCategory::Nonmetal => "Nonmetal",
+            AtomCategory::Halogen => "Halogen",
+            AtomCategory::NobleGas => "Noble Gas",
+            AtomCategory::Lanthanide => "Lanthanide",
+            AtomCategory::Actinide => "Actinide",
+        };
+        let stp = match a.stp_state {
+            AtomState::Solid => "Solid",
+            AtomState::Liquid => "Liquid",
+            AtomState::Gas => "Gas",
+        };
+        let subtitle = format!(
+            "period {}    group {}    |    {}    |    {} at STP",
+            a.period, a.group, cat_name, stp,
+        );
+        let mut body = Vec::new();
+        if a.implemented {
+            body.push(format!(
+                "mass {:.3} amu  |  melt {}°C  |  boil {}°C  |  density {:.3} g/cm³",
+                a.atomic_mass, a.melting_point, a.boiling_point, a.density_stp,
+            ));
+            body.push(format!(
+                "electronegativity {:.2}  |  {} valence e⁻",
+                a.electronegativity, a.valence_electrons,
+            ));
+            if a.half_life_frames > 0 {
+                body.push(format!(
+                    "radioactive — half-life {} frames → {}",
+                    a.half_life_frames, a.decay_product.name(),
+                ));
+            }
+        } else {
+            body.push(format!(
+                "mass {:.3} amu  |  {} valence e⁻  |  (other properties not yet entered)",
+                a.atomic_mass, a.valence_electrons,
+            ));
+        }
+        return (title, subtitle, body);
+    }
+
+    // Derived compound — show formula and physics from registry.
+    if el == Element::Derived {
+        let formula = derived_formula_of(did);
+        let title = format!("{} (derived)", formula);
+        return DERIVED_COMPOUNDS.with(|r| {
+            let reg = r.borrow();
+            if let Some(c) = reg.get(did as usize) {
+                let kind_name = match c.physics.kind {
+                    Kind::Empty  => "empty",
+                    Kind::Solid  => "solid",
+                    Kind::Gravel => "gravel",
+                    Kind::Powder => "powder",
+                    Kind::Liquid => "liquid",
+                    Kind::Gas    => "gas",
+                    Kind::Fire   => "fire",
+                };
+                let body = vec![
+                    format!(
+                        "{}  |  density {}  |  viscosity {}  |  mass {:.1} g/mol",
+                        kind_name, c.physics.density, c.physics.viscosity, c.physics.molar_mass,
+                    ),
+                    format!("registry id #{}", did),
+                ];
+                (title, "runtime-derived compound".to_string(), body)
+            } else {
+                (title, "(unregistered)".to_string(), Vec::new())
+            }
+        });
+    }
+
+    // Bespoke compound — use existing physics/thermal/moisture/pressure/electrical tables.
+    let phys = el.physics();
+    let therm = el.thermal();
+    let kind_name = match phys.kind {
+        Kind::Empty  => "empty",
+        Kind::Solid  => "solid",
+        Kind::Gravel => "gravel",
+        Kind::Powder => "powder",
+        Kind::Liquid => "liquid",
+        Kind::Gas    => "gas",
+        Kind::Fire   => "fire",
+    };
+    let title = format!("{}    (compound)", el.name());
+    let mass_frag = if phys.molar_mass > 0.0 {
+        format!("  |  mass {:.1} g/mol", phys.molar_mass)
+    } else { String::new() };
+    let visc_frag = if phys.viscosity > 0 {
+        format!("  |  viscosity {}", phys.viscosity)
+    } else { String::new() };
+    let subtitle = format!(
+        "{}  |  density {}{}{}",
+        kind_name, phys.density, visc_frag, mass_frag,
+    );
+    let mut body = Vec::new();
+    if let Some(p) = therm.freeze_below {
+        body.push(format!("freeze → {} below {}°C", p.target.name(), p.threshold));
+    }
+    if let Some(p) = therm.melt_above {
+        body.push(format!("melt → {} at {}°C", p.target.name(), p.threshold));
+    }
+    if let Some(p) = therm.boil_above {
+        body.push(format!("boil → {} at {}°C", p.target.name(), p.threshold));
+    }
+    if let Some(p) = therm.condense_below {
+        body.push(format!("condense → {} below {}°C", p.target.name(), p.threshold));
+    }
+    if let Some(ig) = therm.ignite_above {
+        let bt = therm.burn_temp.unwrap_or(0);
+        body.push(format!("ignite at {}°C  (burns at {}°C)", ig, bt));
+    }
+    (title, subtitle, body)
+}
+
 /// Snapshot the registered Derived compound ids and their formulas
 /// for palette rendering.
 pub fn ui_derived_palette() -> Vec<(u8, String, [u8; 3])> {
@@ -2218,7 +2345,7 @@ fn derived_color_of(idx: u8) -> (u8, u8, u8) {
     })
 }
 
-fn derived_formula_of(idx: u8) -> String {
+pub fn derived_formula_of(idx: u8) -> String {
     DERIVED_COMPOUNDS.with(|r| {
         r.borrow().get(idx as usize)
             .map(|c| c.formula.clone())
