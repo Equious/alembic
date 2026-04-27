@@ -2015,6 +2015,50 @@ pub fn ui_element_name(el: Element) -> &'static str {
     }
 }
 
+/// Cell-inspector text — element + phase + temperature + pressure +
+/// conductivity + (voltage if energized) + (moisture if non-zero) +
+/// (solute if non-zero). Faithful port of the macroquad cursor-hover
+/// inspector text builder.
+pub fn ui_cell_inspector_text(world: &World, gx: i32, gy: i32) -> String {
+    if gx < 0 || gx >= W as i32 || gy < 0 || gy >= H as i32 {
+        return String::new();
+    }
+    let idx = gy as usize * W + gx as usize;
+    let cell = world.cells[idx];
+    let phase_suffix = match cell.phase() {
+        PHASE_SOLID => " (solid)",
+        PHASE_LIQUID => " (liquid)",
+        PHASE_GAS => " (gas)",
+        _ => "",
+    };
+    let display_name: String = if cell.el == Element::Derived {
+        derived_formula_of(cell.derived_id)
+    } else {
+        cell.el.name().to_string()
+    };
+    let mut info = format!(
+        "{}{}  T{:+}°  P{:+}",
+        display_name, phase_suffix, cell.temp, cell.pressure,
+    );
+    let cond = cell.conductivity();
+    info.push_str(&format!("  σ{:.2}", cond));
+    if world.energized.get(idx).copied().unwrap_or(false) && world.active_emf > 0.0 {
+        info.push_str(&format!("  ⚡{:.0}V", world.active_emf));
+    }
+    if cell.moisture > 0 {
+        info.push_str(&format!("  m{}", cell.moisture));
+    }
+    if cell.solute_amt > 0 {
+        let label = if cell.solute_el == Element::Derived {
+            derived_formula_of(cell.solute_derived_id)
+        } else {
+            cell.solute_el.name().to_string()
+        };
+        info.push_str(&format!("  {} {}", label, cell.solute_amt));
+    }
+    info
+}
+
 /// Detail-panel lines for an atom or compound — used by the periodic
 /// table modal's hover info. Returns (title, subtitle, body_lines).
 /// Mirrors the macroquad detail panel's content.

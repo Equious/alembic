@@ -5113,6 +5113,13 @@ impl GpuState {
         // are active waves.
         self.draw_shockwave_overlay(ctx);
 
+        // Cell inspector — small text tooltip showing element + temp +
+        // pressure + conductivity for the cell under the cursor. Only
+        // when the cursor is over the sim and not over the panel.
+        if !ctx.is_pointer_over_area() {
+            self.draw_cell_inspector(ctx);
+        }
+
         // Screenshot notice — floats near the top-left of the sim.
         if let Some((_, msg)) = &self.screenshot_notice {
             let msg = msg.clone();
@@ -5192,25 +5199,33 @@ impl GpuState {
                 ui.add_space(8.0);
 
                 // Tool buttons (Paint / Heat / Vacuum / Pipet) at fixed 30px
-                // height, full width minus margins.
-                let tools: [(&str, crate::ToolMode); 4] = [
-                    ("Paint", crate::ToolMode::Paint),
-                    ("Heat", crate::ToolMode::Heat),
-                    ("Vacuum", crate::ToolMode::Vacuum),
-                    ("Pipet", crate::ToolMode::Pipet),
+                // height, full width minus margins. Tooltips give users
+                // a quick reminder of what each tool does + its hotkey.
+                let tools: [(&str, crate::ToolMode, &str); 4] = [
+                    ("Paint",  crate::ToolMode::Paint,
+                        "Paint cells with the selected element. L = paint, R = erase."),
+                    ("Heat",   crate::ToolMode::Heat,
+                        "L = warm cells, R = cool cells (5°C/frame). Hotkey: H"),
+                    ("Vacuum", crate::ToolMode::Vacuum,
+                        "L-hold sucks gases toward the brush via injected negative pressure. Hotkey: V"),
+                    ("Pipet",  crate::ToolMode::Pipet,
+                        "L collects cells into the bucket, R releases them. Click a Species row to filter. Hotkey: P / M"),
                 ];
-                for (label, mode) in tools {
-                    if Self::tool_button(ui, label, self.tool_mode == mode,
-                        btn_selected, btn_normal, btn_hover, btn_border, text_btn) {
-                        self.tool_mode = mode;
-                    }
+                for (label, mode, tip) in tools {
+                    let resp = Self::tool_button_resp(ui, label, self.tool_mode == mode,
+                        btn_selected, btn_normal, btn_hover, btn_border, text_btn);
+                    let resp = resp.on_hover_text(tip);
+                    if resp.clicked() { self.tool_mode = mode; }
                 }
 
                 // Prefab button + dropdown (only shown when active).
-                if Self::tool_button(
+                let prefab_resp = Self::tool_button_resp(
                     ui, "Prefab", self.tool_mode == crate::ToolMode::Prefab,
                     btn_selected, btn_normal, btn_hover, btn_border, text_btn,
-                ) {
+                ).on_hover_text(
+                    "Place pre-built structures (Beaker / Box / Battery). L places, R rotates. Hotkey: F"
+                );
+                if prefab_resp.clicked() {
                     self.tool_mode = crate::ToolMode::Prefab;
                 }
                 if self.tool_mode == crate::ToolMode::Prefab {
@@ -5221,10 +5236,13 @@ impl GpuState {
                 }
 
                 // Wire button + dropdown.
-                if Self::tool_button(
+                let wire_resp = Self::tool_button_resp(
                     ui, "Wire", self.tool_mode == crate::ToolMode::Wire,
                     btn_selected, btn_normal, btn_hover, btn_border, text_btn,
-                ) {
+                ).on_hover_text(
+                    "Two-click line drawing. 1st L sets the start, 2nd L draws the wire. R cancels. Hotkey: W"
+                );
+                if wire_resp.clicked() {
                     self.tool_mode = crate::ToolMode::Wire;
                 }
                 if self.tool_mode == crate::ToolMode::Wire {
@@ -5237,10 +5255,13 @@ impl GpuState {
                 // Extra gap before Build (matches macroquad +14px).
                 ui.add_space(14.0);
                 let build_label = if self.build_mode { "Build: ON" } else { "Build: OFF" };
-                if Self::tool_button(
+                let build_resp = Self::tool_button_resp(
                     ui, build_label, self.build_mode,
                     btn_selected, btn_normal, btn_hover, btn_border, text_btn,
-                ) {
+                ).on_hover_text(
+                    "When ON, painted cells become rigid (frozen) — useful for chambers and fixtures. Hotkey: B"
+                );
+                if build_resp.clicked() {
                     self.build_mode = !self.build_mode;
                 }
 
@@ -5420,6 +5441,16 @@ impl GpuState {
                     );
                 }
 
+                // ---- Species in scene — always visible. Clicking a
+                // row sets the pipet target AND switches to Pipet,
+                // matching the macroquad "list is always visible"
+                // behavior.
+                self.draw_species_list(
+                    ui,
+                    btn_selected, btn_normal, btn_hover, btn_border,
+                    text_btn, dim_label,
+                );
+
                 // ---- Footnote (open periodic table) ----
                 ui.add_space(18.0);
                 ui.separator();
@@ -5492,6 +5523,18 @@ impl GpuState {
                     egui::vec2(bw, 26.0),
                     sel_color, normal, hover, border, text_btn,
                 ) {
+                    // Switching TO Battery from any other kind nudges
+                    // the dimensions + material to the canonical
+                    // small-cell defaults (faithful port of the
+                    // macroquad prefab Batt button handler).
+                    if kind == crate::PrefabKind::Battery
+                        && self.prefab_kind != crate::PrefabKind::Battery
+                    {
+                        self.prefab_material = Element::Quartz;
+                        self.prefab_thickness = 10;
+                        self.prefab_width = 30;
+                        self.prefab_height = 40;
+                    }
                     self.prefab_kind = kind;
                 }
             }
@@ -5714,35 +5757,50 @@ impl GpuState {
             self.pipet_bucket.clear();
             self.pipet_target = None;
         }
+    }
 
-        // Species filter list — clicking a row sets the pipet target.
-        if !self.species_cache.is_empty() {
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("SPECIES IN SCENE").color(dim_label).size(11.0),
-            );
-            ui.add_space(4.0);
-            // Snapshot to avoid borrow conflicts inside the click handler.
-            let species_snapshot: Vec<(Element, u8, usize)> =
-                self.species_cache.iter().take(8).cloned().collect();
-            for (el, did, count) in species_snapshot {
-                let active = self.pipet_target == Some((el, did));
-                let name = if el == Element::Derived {
-                    crate::derived_formula_of(did)
-                } else { el.name().to_string() };
-                let label = format!("{}   ({})", name, count);
-                if Self::tool_button(
-                    ui, &label, active,
-                    sel_color, normal, hover, border, text_btn,
-                ) {
-                    let new_target = if active { None } else { Some((el, did)) };
-                    if new_target != self.pipet_target
-                        && !self.pipet_bucket.is_empty()
-                    {
-                        self.pipet_warning_frames = 120;
-                    } else {
-                        self.pipet_target = new_target;
-                    }
+    /// Species-in-scene list — always visible regardless of tool mode
+    /// (matches macroquad: clicking a row sets the pipet target AND
+    /// switches to the Pipet tool).
+    fn draw_species_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        sel_color: egui::Color32,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text_btn: egui::Color32,
+        dim_label: egui::Color32,
+    ) {
+        if self.species_cache.is_empty() { return; }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("SPECIES IN SCENE").color(dim_label).size(11.0),
+        );
+        ui.add_space(4.0);
+        let species_snapshot: Vec<(Element, u8, usize)> =
+            self.species_cache.iter().take(8).cloned().collect();
+        for (el, did, count) in species_snapshot {
+            let active = self.pipet_target == Some((el, did));
+            let name = if el == Element::Derived {
+                crate::derived_formula_of(did)
+            } else { el.name().to_string() };
+            let label = format!("{}   ({})", name, count);
+            if Self::tool_button(
+                ui, &label, active,
+                sel_color, normal, hover, border, text_btn,
+            ) {
+                // Click → switch to Pipet AND set/toggle the target.
+                // If the bucket already holds a different species,
+                // warn instead of clobbering (macroquad semantics).
+                let new_target = if active { None } else { Some((el, did)) };
+                if new_target != self.pipet_target
+                    && !self.pipet_bucket.is_empty()
+                {
+                    self.pipet_warning_frames = 120;
+                } else {
+                    self.pipet_target = new_target;
+                    self.tool_mode = crate::ToolMode::Pipet;
                 }
             }
         }
@@ -5845,19 +5903,70 @@ impl GpuState {
         Ok(path)
     }
 
-    /// Shockwave leading-edge overlay. Faithful port of the macroquad
-    /// `for s in &world.shockwaves` block — bright rings whose alpha
-    /// scales with remaining magnitude. Drawn as a transparent egui
-    /// area above the sim and below the side panel.
+    /// Cell inspector — small black tooltip showing the element +
+    /// state of the cell directly under the cursor. Mirrors the
+    /// macroquad inspector. Floats near the cursor, flips to the other
+    /// side when near the screen edge.
+    fn draw_cell_inspector(&self, ctx: &egui::Context) {
+        let Some((px, py)) = self.cursor_pos else { return; };
+        let Some((gx, gy)) = self.cursor_to_grid(px, py) else { return; };
+        let info = crate::ui_cell_inspector_text(&self.world, gx, gy);
+        if info.is_empty() { return; }
+        let win_w = self.surface_config.width as f32;
+        let win_h = self.surface_config.height as f32;
+        let (_, scale) = self.sim_pixel_rect();
+        let brush_px = self.brush_radius as f32 * scale;
+        let offset = (brush_px + 10.0).max(12.0);
+        // Approximate text width — we'll tighten with egui's own font
+        // measurements after positioning.
+        let approx_w = info.len() as f32 * 7.5 + 6.0;
+        let mut tx = px as f32 + offset;
+        let mut ty = py as f32 - 18.0;
+        if tx + approx_w > win_w { tx = px as f32 - offset - approx_w; }
+        if ty < 0.0 { ty = py as f32 + offset; }
+        if ty + 22.0 > win_h { ty = win_h - 22.0; }
+        egui::Area::new(egui::Id::new("alembic-cell-inspector"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::pos2(tx, ty))
+            .interactable(false)
+            .show(ctx, |ui| {
+                let p = ui.painter();
+                let font = egui::FontId::proportional(14.0);
+                let galley = ui.fonts(|f| f.layout_no_wrap(
+                    info.clone(), font.clone(), egui::Color32::WHITE,
+                ));
+                let bg_rect = egui::Rect::from_min_size(
+                    egui::pos2(tx - 3.0, ty - 2.0),
+                    egui::vec2(galley.size().x + 6.0, galley.size().y + 4.0),
+                );
+                p.rect_filled(bg_rect, 2.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220));
+                p.galley(egui::pos2(tx, ty), galley, egui::Color32::WHITE);
+            });
+    }
+
+    /// Shockwave + phantom-placement overlay. Faithful port of:
+    ///   * `for s in &world.shockwaves` — bright rings whose alpha
+    ///     scales with remaining magnitude
+    ///   * Wire ghost preview — line from wire_start to cursor + tip
+    ///     dot in wire_material's base color
+    ///   * Prefab ghost preview — outlined footprint at the cursor,
+    ///     with red/blue battery terminal bands when kind == Battery
+    /// Drawn as a transparent egui Background area above the sim and
+    /// below the side panel chrome.
     fn draw_shockwave_overlay(&self, ctx: &egui::Context) {
-        if self.world.shockwaves.is_empty() { return; }
         let (rect, scale) = self.sim_pixel_rect();
+        let cursor_grid = self.cursor_pos.and_then(|(x, y)| self.cursor_to_grid(x, y));
+        let need_overlay = !self.world.shockwaves.is_empty()
+            || cursor_grid.is_some();
+        if !need_overlay { return; }
         let id = egui::Id::new("alembic-shockwave-overlay");
         egui::Area::new(id)
             .order(egui::Order::Background)
             .fixed_pos(egui::pos2(0.0, 0.0))
             .show(ctx, |ui| {
                 let p = ui.painter();
+                // Shockwaves first.
                 for s in &self.world.shockwaves {
                     let decay = 1.0 + s.radius / 6.0;
                     let mag = s.yield_p / (decay * decay);
@@ -5874,6 +5983,111 @@ impl GpuState {
                             egui::Color32::from_rgba_unmultiplied(255, 230, 180, alpha),
                         ),
                     );
+                }
+
+                // Phantom placement preview.
+                let Some((gx, gy)) = cursor_grid else { return; };
+                let cx = rect.0 + gx as f32 * scale + scale * 0.5;
+                let cy = rect.1 + gy as f32 * scale + scale * 0.5;
+                match self.tool_mode {
+                    crate::ToolMode::Wire => {
+                        let (rr, gg, bb) = self.wire_material.base_color();
+                        let accent = egui::Color32::from_rgba_unmultiplied(rr, gg, bb, 220);
+                        if let Some((sx, sy)) = self.wire_start {
+                            let sx_s = rect.0 + sx as f32 * scale + scale * 0.5;
+                            let sy_s = rect.1 + sy as f32 * scale + scale * 0.5;
+                            let thick = (self.wire_thickness as f32 * 2.0 * scale).max(2.0);
+                            p.line_segment(
+                                [egui::pos2(sx_s, sy_s), egui::pos2(cx, cy)],
+                                egui::Stroke::new(thick, accent),
+                            );
+                            p.circle_filled(
+                                egui::pos2(sx_s, sy_s),
+                                thick * 0.5 + 1.0,
+                                accent,
+                            );
+                        }
+                        p.circle_filled(
+                            egui::pos2(cx, cy),
+                            (self.wire_thickness as f32 * scale).max(2.0),
+                            accent,
+                        );
+                    }
+                    crate::ToolMode::Prefab => {
+                        let rot = self.prefab_rotation & 3;
+                        let sideways = rot == 1 || rot == 3;
+                        let (pw, ph) = if sideways {
+                            (self.prefab_height as f32, self.prefab_width as f32)
+                        } else {
+                            (self.prefab_width as f32, self.prefab_height as f32)
+                        };
+                        let px0 = rect.0 + (gx as f32 - pw * 0.5) * scale;
+                        let py0 = rect.1 + (gy as f32 - ph * 0.5) * scale;
+                        let frame_rect = egui::Rect::from_min_size(
+                            egui::pos2(px0, py0),
+                            egui::vec2(pw * scale, ph * scale),
+                        );
+                        p.rect_stroke(
+                            frame_rect, 0.0,
+                            egui::Stroke::new(
+                                1.5,
+                                egui::Color32::from_rgba_unmultiplied(230, 200, 120, 220),
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        // Battery terminal preview — red/blue end bands
+                        // rotating with the prefab, matching the
+                        // macroquad battery preview.
+                        if self.prefab_kind == crate::PrefabKind::Battery
+                            && self.prefab_thickness > 0
+                        {
+                            let band = self.prefab_thickness as f32 * scale;
+                            let pw_s = pw * scale;
+                            let ph_s = ph * scale;
+                            let pos_color =
+                                egui::Color32::from_rgba_unmultiplied(170, 50, 50, 100);
+                            let neg_color =
+                                egui::Color32::from_rgba_unmultiplied(40, 70, 130, 100);
+                            let (pos_r, neg_r) = match rot {
+                                0 => (
+                                    (px0, py0, pw_s, band),
+                                    (px0, py0 + ph_s - band, pw_s, band),
+                                ),
+                                1 => (
+                                    (px0 + pw_s - band, py0, band, ph_s),
+                                    (px0, py0, band, ph_s),
+                                ),
+                                2 => (
+                                    (px0, py0 + ph_s - band, pw_s, band),
+                                    (px0, py0, pw_s, band),
+                                ),
+                                _ => (
+                                    (px0, py0, band, ph_s),
+                                    (px0 + pw_s - band, py0, band, ph_s),
+                                ),
+                            };
+                            p.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(pos_r.0, pos_r.1),
+                                    egui::vec2(pos_r.2, pos_r.3),
+                                ),
+                                0.0, pos_color,
+                            );
+                            p.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(neg_r.0, neg_r.1),
+                                    egui::vec2(neg_r.2, neg_r.3),
+                                ),
+                                0.0, neg_color,
+                            );
+                        }
+                    }
+                    _ => {
+                        // Paint/Heat/Vacuum/Pipet — draw the brush
+                        // outline. Cursor circle is already rendered
+                        // by the sim shader, so this is a no-op for
+                        // now (preserves the existing behavior).
+                    }
                 }
             });
     }
@@ -5898,8 +6112,9 @@ impl GpuState {
 
     /// Draws a fixed-width tool button matching draw_panel_button:
     /// 30px tall, full panel width, 1px border, label centered, three
-    /// states (normal / hovered / selected).
-    fn tool_button(
+    /// states (normal / hovered / selected). Returns the egui Response
+    /// so the caller can attach a hover tooltip.
+    fn tool_button_resp(
         ui: &mut egui::Ui,
         label: &str,
         selected: bool,
@@ -5908,7 +6123,7 @@ impl GpuState {
         hover: egui::Color32,
         border: egui::Color32,
         text: egui::Color32,
-    ) -> bool {
+    ) -> egui::Response {
         let bw = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(bw, 30.0),
@@ -5928,9 +6143,24 @@ impl GpuState {
             egui::FontId::proportional(14.0),
             text,
         );
-        // Manual gap between buttons (6px in macroquad).
         ui.add_space(6.0);
-        resp.clicked()
+        resp
+    }
+
+    /// Convenience wrapper preserving the old call shape — most call
+    /// sites don't need a tooltip and just want a click bool.
+    fn tool_button(
+        ui: &mut egui::Ui,
+        label: &str,
+        selected: bool,
+        sel_color: egui::Color32,
+        normal: egui::Color32,
+        hover: egui::Color32,
+        border: egui::Color32,
+        text: egui::Color32,
+    ) -> bool {
+        Self::tool_button_resp(ui, label, selected, sel_color, normal, hover, border, text)
+            .clicked()
     }
 
     /// One ambient row (Temp / O₂ / Grav) — label left, value right,
@@ -5974,8 +6204,12 @@ impl GpuState {
             val_color,
         );
         ui.add_space(5.0);
+        // raw_scroll_delta is the per-frame raw wheel value (not the
+        // multi-frame smoothed version). One mouse-wheel click = one
+        // delta = one step. smooth_scroll_delta would spread a single
+        // click across several frames and fire the step repeatedly.
         if resp.hovered() {
-            ui.input(|i| i.smooth_scroll_delta.y)
+            ui.input(|i| i.raw_scroll_delta.y)
         } else {
             0.0
         }
@@ -6154,8 +6388,10 @@ impl GpuState {
                 if let Some((el, did)) = detail_target {
                     let (title, subtitle, body) = crate::ui_element_detail(el, did);
                     let panel_w = ui.available_width();
-                    let lines = body.len() as f32;
-                    let panel_h = 28.0 + 22.0 + 16.0 + lines * 18.0 + 12.0;
+                    // Fixed height so the modal doesn't reflow as the
+                    // hovered tile changes. Macroquad reserves
+                    // PT_DETAIL_PANEL_H = 180.0 for this.
+                    let panel_h = 180.0;
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(panel_w, panel_h),
                         egui::Sense::hover(),
@@ -6202,6 +6438,10 @@ impl GpuState {
                             if p != Element::Derived {
                                 self.selected_did = 0;
                             }
+                            // Tab-driven picks always kick back to
+                            // Paint mode — the user almost always
+                            // wants to paint what they just picked.
+                            self.tool_mode = crate::ToolMode::Paint;
                         }
                         PtTargetKind::PrefabMaterial => {
                             if p != Element::Derived {
