@@ -9600,49 +9600,19 @@ impl GpuState {
             self.pending_seek = 0;
             self.rewind_active = true;
         }
-        // CPU-side readback is the FPS gate: device.poll(Wait) blocks
-        // until ~95 GPU dispatches drain. We only need fresh world.cells
-        // on the CPU when something actually consumes it this frame:
-        //   * paint (apply_brush mutates world.cells)
-        //   * compute_energized (uses cell.el to find BattPos/Neg)
-        //   * decay U-specific (uses cell.el to find U/Ra)
-        //   * snapshot for time-scrub (when paused / rewind pending)
-        //   * cell inspector (cursor hover tooltip)
-        // None of those triggering → skip the readback entirely. CPU
-        // step still runs but with last-readback's cells; that's stale
-        // by a few frames but the affected paths (present_elements
-        // scan, compute_energized) tolerate that.
-        let painting = self.paint_down || self.erase_down
-            || self.paint_pressed_event || self.erase_pressed_event;
-        let has_circuit = self.world
-            .present_elements[Element::BattPos as usize]
-            || self.world.present_elements[Element::BattNeg as usize];
-        let has_radioactive = self.world
-            .present_elements[Element::U as usize]
-            || self.world.present_elements[Element::Ra as usize];
-        // Cell inspector tooltip needs world.cells when the cursor is
-        // over the sim grid. Leave it loose: if the cursor is in the
-        // sim area, sync — keeps the tooltip readout accurate.
-        let inspector_hover = match self.cursor_pos {
-            Some((px, py)) => self.cursor_to_grid(px, py).is_some(),
-            None => false,
-        };
-        let needs_readback = painting || has_circuit || has_radioactive
-            || inspector_hover;
-
+        // Reverted the conditional-readback optimization: skipping
+        // copies/readbacks left the ring buffer with stale frames-old
+        // data, so when CPU work resumed (paint / inspector / circuit)
+        // the upload of that stale world.cells clobbered the GPU's
+        // freshly-advanced cells_buf — visually rewinding the sim to
+        // the moment the last full sync ran. The proper fix is a GPU
+        // paint compute kernel + cells_buf-as-source-of-truth model
+        // (paint mutates GPU directly, CPU mirror is read-only). Until
+        // that lands, every running frame syncs.
+        let needs_readback = true;
         if !self.paused {
-            if needs_readback {
-                let _ = self.device.poll(wgpu::Maintain::Wait);
-                self.motion_compute.read_back_prev_into(&mut self.world);
-            } else {
-                // Drain finished map_async callbacks without blocking
-                // so the readback ring buffer can keep advancing in
-                // the background. Cell data isn't actually copied
-                // into world.cells this frame.
-                let _ = self.device.poll(wgpu::Maintain::Poll);
-            }
-            // Resuming clears the rewind flag — next sim step's
-            // snapshot will reset world.rewind_offset to 0.
+            let _ = self.device.poll(wgpu::Maintain::Wait);
+            self.motion_compute.read_back_prev_into(&mut self.world);
             self.rewind_active = false;
         } else if !self.rewind_active {
             // Plain pause (no rewind) — still pull last GPU frame so
