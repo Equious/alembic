@@ -4698,6 +4698,8 @@ pub struct GpuChem {
     pub base_neutralization: bool,
     pub halogen_displacement: bool,
     pub hg_amalgamation: bool,
+    pub thermite: bool,
+    pub magnesium_burn: bool,
 }
 
 impl World {
@@ -4808,8 +4810,12 @@ impl World {
         if !gpu_chem.tree_support {
             self.tree_support_check(); mark!("tree_support");
         }
-        self.thermite();             mark!("thermite");
-        self.magnesium_burn();       mark!("mg_burn");
+        if !gpu_chem.thermite {
+            self.thermite();         mark!("thermite");
+        }
+        if !gpu_chem.magnesium_burn {
+            self.magnesium_burn();   mark!("mg_burn");
+        }
         if !gpu_chem.glass_etching {
             self.glass_etching();    mark!("glass_etch");
         }

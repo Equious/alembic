@@ -4583,6 +4583,519 @@ impl SupportingChemCtx {
     }
 }
 
+const BURN_CYCLES_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0 = thermite per-cell, 1 = mg per-cell,
+                             // 2..5 = thermite Margolus ignite phases,
+                             // 6..9 = mg+CO2 Margolus consume phases
+    frame: u32,
+    ambient_oxygen: f32,
+    al2o3_did: u32,          // pre-registered Al+O derived id
+    mgo_did: u32,            // pre-registered Mg+O derived id
+    _pad0: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+const FLAG_UPDATED: u32 = 0x01u;
+const FLAG_FROZEN:  u32 = 0x02u;
+const PHASE_MASK:   u32 = 0x0Cu;
+
+const EL_EMPTY: u32 = 0u;
+const EL_FIRE:  u32 = 5u;
+const EL_CO2:   u32 = 6u;
+const EL_C:     u32 = 20u;
+const EL_O:     u32 = 22u;
+const EL_AL:    u32 = 27u;
+const EL_MG:    u32 = 26u;
+const EL_FE:    u32 = 34u;
+const EL_RUST:  u32 = 39u;
+const EL_DERIVED: u32 = 41u;
+
+const THERM_BURN_DURATION: u32 = 30u;
+const THERM_BURN_TEMP:     i32 = 2500;
+const THERM_FINAL_TEMP:    i32 = 1700;
+const THERM_IGNITION:      i32 = 600;
+
+const MG_BURN_DURATION: u32 = 50u;
+const MG_BURN_TEMP:     i32 = 3000;
+const MG_FINAL_TEMP:    i32 = 1700;
+const MG_IGNITION:      i32 = 470;
+
+fn bc_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn bc_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn bc_updated(c: vec4<u32>) -> bool { return (bc_flag(c) & FLAG_UPDATED) != 0u; }
+fn bc_burn(c: vec4<u32>) -> u32 { return (c.z >> 8u) & 0xFFu; }
+fn bc_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn bc_set_burn(c: vec4<u32>, b: u32) -> vec4<u32> {
+    let z = c.z & 0xFFFF00FFu;
+    return vec4<u32>(c.x, c.y, z | ((b & 0xFFu) << 8u), c.w);
+}
+fn bc_set_temp(c: vec4<u32>, t: i32) -> vec4<u32> {
+    let clamped = clamp(t, -273, 5000);
+    let raw = u32(clamped) & 0xFFFFu;
+    let lo_y = c.y & 0xFFFFu;
+    return vec4<u32>(c.x, lo_y | (raw << 16u), c.z, c.w);
+}
+fn bc_mark_updated(c: vec4<u32>) -> vec4<u32> {
+    return vec4<u32>(c.x, c.y | (FLAG_UPDATED << 8u), c.z, c.w);
+}
+fn bc_make_cell(el: u32, did: u32, temp: i32, burn: u32) -> vec4<u32> {
+    let clamped = clamp(temp, -273, 5000);
+    let traw = u32(clamped) & 0xFFFFu;
+    let x = (el & 0xFFu) | ((did & 0xFFu) << 8u);
+    let y = (FLAG_UPDATED << 8u) | (traw << 16u);
+    let z = (burn & 0xFFu) << 8u;
+    return vec4<u32>(x, y, z, 0u);
+}
+fn bc_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// PASS 0 — per-cell thermite burn-tick. For each Rust/Al cell with
+// burn > 0: decrement burn. When burn hits 0, transmute (Rust→Fe at
+// 1700°C, Al→Al₂O₃ at 1700°C). Heat broadcast to neighbors is NOT
+// ported (multi-cell write race) — thermal_diffuse spreads heat
+// naturally, just slower propagation than the macroquad cascade.
+fn pass_thermite_tick(x: u32, y: u32) {
+    let i = y * u.width + x;
+    var c = cells[i];
+    if (bc_updated(c)) { return; }
+    let el = bc_el(c);
+    let burn = bc_burn(c);
+    if (burn == 0u) { return; }
+    if (el != EL_RUST && el != EL_AL) { return; }
+    let new_burn = burn - 1u;
+    if (new_burn == 0u) {
+        if (el == EL_RUST) {
+            cells[i] = bc_make_cell(EL_FE, 0u, THERM_FINAL_TEMP, 0u);
+        } else {
+            // Al → Al₂O₃ slag (derived).
+            if (u.al2o3_did != 0xFFu) {
+                cells[i] = bc_make_cell(EL_DERIVED, u.al2o3_did, THERM_FINAL_TEMP, 0u);
+            } else {
+                // Defensive: registry full, just put burn=0.
+                c = bc_set_burn(c, 0u);
+                c = bc_mark_updated(c);
+                cells[i] = c;
+            }
+        }
+    } else {
+        c = bc_set_burn(c, new_burn);
+        c = bc_set_temp(c, THERM_BURN_TEMP);
+        c = bc_mark_updated(c);
+        cells[i] = c;
+    }
+}
+
+// PASS 1 — per-cell magnesium burn-tick + ignition.
+fn pass_mg_tick(x: u32, y: u32) {
+    let i = y * u.width + x;
+    var c = cells[i];
+    if (bc_updated(c)) { return; }
+    let el = bc_el(c);
+    if (el != EL_MG) { return; }
+    let burn = bc_burn(c);
+    if (burn > 0u) {
+        let new_burn = burn - 1u;
+        if (new_burn == 0u) {
+            if (u.mgo_did != 0xFFu) {
+                cells[i] = bc_make_cell(EL_DERIVED, u.mgo_did, MG_FINAL_TEMP, 0u);
+            } else {
+                c = bc_set_burn(c, 0u);
+                c = bc_mark_updated(c);
+                cells[i] = c;
+            }
+        } else {
+            c = bc_set_burn(c, new_burn);
+            c = bc_set_temp(c, MG_BURN_TEMP);
+            c = bc_mark_updated(c);
+            cells[i] = c;
+        }
+        return;
+    }
+    // Try to ignite. Need temp >= 470°C and an oxidizer in 4-neighbor:
+    // O cell, CO2 cell, or Empty + ambient_oxygen > 0.05.
+    let temp = bc_temp(c);
+    if (temp < MG_IGNITION) { return; }
+    let xi = i32(x);
+    let yi = i32(y);
+    let wi = i32(u.width);
+    let hi = i32(u.height);
+    var has_oxidizer = false;
+    if (xi + 1 < wi) {
+        let nc = cells[u32(yi) * u.width + u32(xi + 1)];
+        let ne = bc_el(nc);
+        if (ne == EL_O || ne == EL_CO2 || (ne == EL_EMPTY && u.ambient_oxygen > 0.05)) {
+            has_oxidizer = true;
+        }
+    }
+    if (!has_oxidizer && xi - 1 >= 0) {
+        let nc = cells[u32(yi) * u.width + u32(xi - 1)];
+        let ne = bc_el(nc);
+        if (ne == EL_O || ne == EL_CO2 || (ne == EL_EMPTY && u.ambient_oxygen > 0.05)) {
+            has_oxidizer = true;
+        }
+    }
+    if (!has_oxidizer && yi + 1 < hi) {
+        let nc = cells[u32(yi + 1) * u.width + u32(xi)];
+        let ne = bc_el(nc);
+        if (ne == EL_O || ne == EL_CO2 || (ne == EL_EMPTY && u.ambient_oxygen > 0.05)) {
+            has_oxidizer = true;
+        }
+    }
+    if (!has_oxidizer && yi - 1 >= 0) {
+        let nc = cells[u32(yi - 1) * u.width + u32(xi)];
+        let ne = bc_el(nc);
+        if (ne == EL_O || ne == EL_CO2 || (ne == EL_EMPTY && u.ambient_oxygen > 0.05)) {
+            has_oxidizer = true;
+        }
+    }
+    if (!has_oxidizer) { return; }
+    c = bc_set_burn(c, MG_BURN_DURATION);
+    c = bc_set_temp(c, MG_BURN_TEMP);
+    c = bc_mark_updated(c);
+    cells[i] = c;
+}
+
+// Margolus 2x2 4-phase: pair-ignite Rust + Al when at least one is
+// at IGNITION temp and the other isn't already burning. Both cells
+// gain burn = BURN_DURATION at BURN_TEMP.
+fn try_thermite_ignite(c_a: vec4<u32>, c_b: vec4<u32>) -> vec2<u32> {
+    // Returns 0 = no fire, else a packed bitfield: low bit = fired.
+    if (bc_updated(c_a) || bc_updated(c_b)) { return vec2<u32>(0u, 0u); }
+    let el_a = bc_el(c_a);
+    let el_b = bc_el(c_b);
+    let bn_a = bc_burn(c_a);
+    let bn_b = bc_burn(c_b);
+    var rust_idx: u32 = 2u; // 0=a, 1=b, 2=none
+    var al_idx: u32 = 2u;
+    if (el_a == EL_RUST && el_b == EL_AL) { rust_idx = 0u; al_idx = 1u; }
+    else if (el_b == EL_RUST && el_a == EL_AL) { rust_idx = 1u; al_idx = 0u; }
+    else { return vec2<u32>(0u, 0u); }
+    // Already burning?
+    if (rust_idx == 0u && (bn_a > 0u || bn_b > 0u)) { return vec2<u32>(0u, 0u); }
+    if (rust_idx == 1u && (bn_a > 0u || bn_b > 0u)) { return vec2<u32>(0u, 0u); }
+    let temp_rust = select(bc_temp(c_b), bc_temp(c_a), rust_idx == 0u);
+    if (temp_rust < THERM_IGNITION) { return vec2<u32>(0u, 0u); }
+    return vec2<u32>(1u, rust_idx);
+}
+
+// Margolus 2x2 4-phase: Mg burning + adjacent CO2 → Mg keeps burning,
+// CO2 becomes Empty (75%) or C (25%). 80% chance per pair attempt.
+fn try_mg_co2(c_a: vec4<u32>, c_b: vec4<u32>, seed: u32) -> vec2<u32> {
+    if (bc_updated(c_a) || bc_updated(c_b)) { return vec2<u32>(0u, 0u); }
+    let el_a = bc_el(c_a);
+    let el_b = bc_el(c_b);
+    let bn_a = bc_burn(c_a);
+    let bn_b = bc_burn(c_b);
+    // Need one Mg burning + the other CO2.
+    var mg_is_a: bool;
+    if (el_a == EL_MG && bn_a > 0u && el_b == EL_CO2) { mg_is_a = true; }
+    else if (el_b == EL_MG && bn_b > 0u && el_a == EL_CO2) { mg_is_a = false; }
+    else { return vec2<u32>(0u, 0u); }
+    let r = bc_hash(seed, u.frame);
+    if ((r & 0xFFu) > 204u) { return vec2<u32>(0u, 0u); } // ~80%
+    return vec2<u32>(1u, select(0u, 1u, mg_is_a));
+}
+
+// Build the post-Mg+CO2 product cell. 5% chance C soot at burn temp,
+// otherwise Empty (gas dispersal model).
+fn mg_co2_product(seed: u32) -> vec4<u32> {
+    let r = bc_hash(seed, u.frame ^ 0xA5A5A5A5u);
+    if ((r & 0xFFu) < 13u) {
+        return bc_make_cell(EL_C, 0u, MG_BURN_TEMP, 0u);
+    }
+    return vec4<u32>(0u, 0u, 0u, 0u);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (u.pass_id == 0u || u.pass_id == 1u) {
+        // Per-cell pass.
+        let x = gid.x;
+        let y = gid.y;
+        if (x >= u.width || y >= u.height) { return; }
+        if (u.pass_id == 0u) { pass_thermite_tick(x, y); }
+        else { pass_mg_tick(x, y); }
+        return;
+    }
+    // Margolus 2x2 — pass_id 2..5 = thermite ignite, 6..9 = Mg+CO2.
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+    let block_seed = by * u.width + bx;
+
+    if (u.pass_id >= 2u && u.pass_id <= 5u) {
+        // THERMITE IGNITE — try all 6 unique pairs in the block
+        // (4 cardinals + 2 diagonals).
+        var fired = false;
+        // c00 ↔ c10
+        if (!fired) {
+            let r = try_thermite_ignite(c00, c10);
+            if (r.x != 0u) {
+                c00 = bc_set_burn(bc_set_temp(c00, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c00 = bc_mark_updated(c00);
+                c10 = bc_set_burn(bc_set_temp(c10, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c10 = bc_mark_updated(c10);
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_thermite_ignite(c01, c11);
+            if (r.x != 0u) {
+                c01 = bc_set_burn(bc_set_temp(c01, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c01 = bc_mark_updated(c01);
+                c11 = bc_set_burn(bc_set_temp(c11, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c11 = bc_mark_updated(c11);
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_thermite_ignite(c00, c01);
+            if (r.x != 0u) {
+                c00 = bc_set_burn(bc_set_temp(c00, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c00 = bc_mark_updated(c00);
+                c01 = bc_set_burn(bc_set_temp(c01, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c01 = bc_mark_updated(c01);
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_thermite_ignite(c10, c11);
+            if (r.x != 0u) {
+                c10 = bc_set_burn(bc_set_temp(c10, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c10 = bc_mark_updated(c10);
+                c11 = bc_set_burn(bc_set_temp(c11, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c11 = bc_mark_updated(c11);
+                fired = true;
+            }
+        }
+        // Diagonals.
+        if (!fired) {
+            let r = try_thermite_ignite(c00, c11);
+            if (r.x != 0u) {
+                c00 = bc_set_burn(bc_set_temp(c00, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c00 = bc_mark_updated(c00);
+                c11 = bc_set_burn(bc_set_temp(c11, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c11 = bc_mark_updated(c11);
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_thermite_ignite(c10, c01);
+            if (r.x != 0u) {
+                c10 = bc_set_burn(bc_set_temp(c10, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c10 = bc_mark_updated(c10);
+                c01 = bc_set_burn(bc_set_temp(c01, THERM_BURN_TEMP), THERM_BURN_DURATION);
+                c01 = bc_mark_updated(c01);
+            }
+        }
+    } else {
+        // MG + CO2 consume.
+        var fired = false;
+        if (!fired) {
+            let r = try_mg_co2(c00, c10, block_seed);
+            if (r.x != 0u) {
+                let prod = mg_co2_product(block_seed);
+                if (r.y == 0u) { c10 = prod; } else { c00 = prod; }
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_mg_co2(c01, c11, block_seed ^ 0xA5A5A5A5u);
+            if (r.x != 0u) {
+                let prod = mg_co2_product(block_seed ^ 0xA5A5A5A5u);
+                if (r.y == 0u) { c11 = prod; } else { c01 = prod; }
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_mg_co2(c00, c01, block_seed ^ 0x5A5A5A5Au);
+            if (r.x != 0u) {
+                let prod = mg_co2_product(block_seed ^ 0x5A5A5A5Au);
+                if (r.y == 0u) { c01 = prod; } else { c00 = prod; }
+                fired = true;
+            }
+        }
+        if (!fired) {
+            let r = try_mg_co2(c10, c11, block_seed ^ 0xC3C3C3C3u);
+            if (r.x != 0u) {
+                let prod = mg_co2_product(block_seed ^ 0xC3C3C3C3u);
+                if (r.y == 0u) { c11 = prod; } else { c10 = prod; }
+            }
+        }
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BurnCyclesUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+    ambient_oxygen: f32,
+    al2o3_did: u32,
+    mgo_did: u32,
+    _pad0: u32,
+}
+
+/// GPU port of the bespoke burn-cycle chemistries — thermite and
+/// magnesium_burn. One shader, multiple pass_ids:
+///   * 0 — per-cell thermite burn-tick (decrement / transmute)
+///   * 1 — per-cell mg burn-tick + ignition (with O/CO2/ambient check)
+///   * 2..5 — Margolus 2x2 thermite Rust+Al pair ignition
+///   * 6..9 — Margolus 2x2 Mg(burning) + CO2 consume → Empty / C
+///
+/// Heat broadcast (multi-cell write) and the radius-2..5 inhalation
+/// search aren't ported — too racy for direct GPU dispatch. Thermal
+/// diffusion handles slow propagation in their place.
+struct BurnCyclesCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 10],
+    pass_bind_groups: [wgpu::BindGroup; 10],
+}
+
+impl BurnCyclesCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let al2o3_did = crate::register_compound(crate::Element::Al, crate::Element::O)
+            .unwrap_or(0xFF) as u32;
+        let mgo_did = crate::register_compound(crate::Element::Mg, crate::Element::O)
+            .unwrap_or(0xFF) as u32;
+
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = BurnCyclesUniforms {
+                width: W as u32, height: H as u32,
+                pass_id, frame: 0,
+                ambient_oxygen: 0.21,
+                al2o3_did, mgo_did, _pad0: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let mut bufs: Vec<wgpu::Buffer> = Vec::with_capacity(10);
+        for i in 0..10u32 {
+            bufs.push(mk_uniform(&format!("alembic-burn-u-{}", i), i));
+        }
+        let pass_uniform_bufs: [wgpu::Buffer; 10] = bufs.try_into().map_err(|_| ()).unwrap();
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-burn-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let mut groups: Vec<wgpu::BindGroup> = Vec::with_capacity(10);
+        for i in 0..10 {
+            groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("alembic-burn-bind"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                ],
+            }));
+        }
+        let pass_bind_groups: [wgpu::BindGroup; 10] = groups.try_into().map_err(|_| ()).unwrap();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-burn-shader"),
+            source: wgpu::ShaderSource::Wgsl(BURN_CYCLES_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-burn-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-burn-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        BurnCyclesCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        frame: u32,
+        ambient_oxygen: f32,
+    ) {
+        for buf in &self.pass_uniform_bufs {
+            queue.write_buffer(buf, 12, bytemuck::cast_slice(&[frame]));
+            queue.write_buffer(buf, 16, bytemuck::cast_slice(&[ambient_oxygen]));
+        }
+        let wg_x_cell = (W as u32 + 7) / 8;
+        let wg_y_cell = (H as u32 + 7) / 8;
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x_mar = (blocks_x + 7) / 8;
+        let wg_y_mar = (blocks_y + 7) / 8;
+        // Order: per-cell ticks first (transmute already-burning cells),
+        // then Margolus ignite/consume passes. Matches macroquad
+        // structure where the burn-continue branch runs before the
+        // ignite branch within each cell's iteration.
+        let order: [(usize, u32, u32); 10] = [
+            (0, wg_x_cell, wg_y_cell),  // thermite per-cell
+            (1, wg_x_cell, wg_y_cell),  // mg per-cell
+            (2, wg_x_mar, wg_y_mar),    // thermite Margolus phase 0
+            (3, wg_x_mar, wg_y_mar),
+            (4, wg_x_mar, wg_y_mar),
+            (5, wg_x_mar, wg_y_mar),
+            (6, wg_x_mar, wg_y_mar),    // mg+co2 Margolus phase 0
+            (7, wg_x_mar, wg_y_mar),
+            (8, wg_x_mar, wg_y_mar),
+            (9, wg_x_mar, wg_y_mar),
+        ];
+        for (idx, gx, gy) in order {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-burn-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[idx], &[]);
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -5912,6 +6425,9 @@ struct GpuState {
     /// Supporting chemistry passes — acid_displacement,
     /// base_neutralization, alloy_formation, alloy_acid_leach.
     sup_chem_compute: SupportingChemCtx,
+    /// Burn-cycle chemistries: thermite + magnesium_burn (per-cell
+    /// burn-tick + Margolus ignition/consume).
+    burn_compute: BurnCyclesCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -6358,6 +6874,7 @@ impl GpuState {
         let moisture_compute = MoistureCtx::new(&device, &queue, &cells_buf);
         let chem_compute = ChemReactionsCtx::new(&device, &queue, &cells_buf);
         let sup_chem_compute = SupportingChemCtx::new(&device, &queue, &cells_buf);
+        let burn_compute = BurnCyclesCtx::new(&device, &queue, &cells_buf);
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -6413,6 +6930,7 @@ impl GpuState {
             moisture_compute,
             chem_compute,
             sup_chem_compute,
+            burn_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -8327,6 +8845,8 @@ impl GpuState {
                 base_neutralization: true,
                 halogen_displacement: true,
                 hg_amalgamation: true,
+                thermite: true,
+                magnesium_burn: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
@@ -8415,10 +8935,16 @@ impl GpuState {
             );
             // 4i. supporting chemistry — acid_displacement +
             //     base_neutralization + alloy_formation +
-            //     alloy_acid_leach. Margolus 2x2 × 4 modes; uses the
+            //     alloy_acid_leach + halogen_displacement +
+            //     hg_amalgamation. Margolus 2x2 × 6 modes; uses the
             //     compound_meta LUT for acid/basic/alloy flags.
             self.sup_chem_compute.encode(
                 &mut encoder, &self.queue, self.frame_counter,
+            );
+            // 4j. burn cycles — thermite + magnesium_burn.
+            self.burn_compute.encode(
+                &mut encoder, &self.queue, self.frame_counter,
+                self.world.ambient_oxygen,
             );
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
