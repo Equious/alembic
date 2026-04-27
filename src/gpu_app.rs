@@ -1322,7 +1322,28 @@ fn hash_u32_motion(a: u32, b: u32) -> u32 {
     return h;
 }
 
-fn gas_dynamics(x: u32, parity: u32) {
+// Gas motion is split into 4 sub-phases to keep per-thread writes
+// non-overlapping. Each phase runs over one (x-parity, horizontal-
+// direction) pair plus vertical (vertical writes never cross
+// columns and are always safe). Within a phase, threads are spaced
+// 2 columns apart and write to one shared horizontal target column
+// — but since all threads in the phase write the SAME direction,
+// each odd column is the target of exactly one even-x thread (and
+// vice versa). Faithful per-cell behavior is preserved across
+// phases: a gas cell that doesn't move in its first phase gets
+// another shot in the next phase with the opposite horizontal
+// direction.
+//
+// Phases:
+//   5: even-x, RIGHT only
+//   6: odd-x,  RIGHT only
+//   7: even-x, LEFT only
+//   8: odd-x,  LEFT only
+//
+// Frame-parity flip below alternates which direction goes first
+// (phase 5/6 vs 7/8) so neither RIGHT nor LEFT gets a permanent
+// "first dibs" bias on multi-direction-eligible cells.
+fn gas_dynamics(x: u32, parity: u32, dir_x: i32) {
     if ((x & 1u) != parity) { return; }
     let w_i = i32(u.width);
     let h_i = i32(u.height);
@@ -1335,31 +1356,16 @@ fn gas_dynamics(x: u32, parity: u32) {
         let k = cell_kind(c);
         if (k != KIND_GAS && k != KIND_FIRE) { y = y + 1; continue; }
 
-        // Faithful port of update_gas's "empty expansion" — gas
-        // tries to swap with adjacent empty cells. Tries 3 directions
-        // per parity phase: vertical-up, vertical-down, and ONE
-        // horizontal direction tied to parity.
-        //
-        // Race-free horizontal: even-x parity (phase 5) only attempts
-        // RIGHT swaps; odd-x parity (phase 6) only attempts LEFT
-        // swaps. Without this restriction, even-x thread at x=0
-        // doing RIGHT and even-x thread at x=2 doing LEFT both
-        // write to cell (1,y) — both source cells get cleared, only
-        // one survives in the middle, so each race event LOSES a
-        // gas cell. That was the root cause of the long-standing
-        // "gases dissipate into nothing" bug. Vertical writes are
-        // race-free (each column is owned by one thread).
-        //
-        // Across the two parity phases per frame, gases still get
-        // both lateral directions (each cell gets right OR left in
-        // alternate frames depending on its parity), so the cloud
-        // disperses correctly — just one direction per phase.
+        // Try the allowed horizontal direction + both verticals.
+        // Vertical writes never race because each column is owned
+        // by one thread; horizontal writes don't race because all
+        // threads in this phase use the same direction (so two
+        // adjacent same-parity threads write to disjoint cells).
+        // The original 4-direction "empty expansion" semantics are
+        // preserved across the four sub-phases per frame.
         let r = hash_u32_motion(i_here, u.frame);
         let start = r & 3u;
         var moved = false;
-        // Try 4 directions in randomized order, but skip the
-        // race-prone horizontal direction for this parity.
-        let allowed_h_dx: i32 = select(-1, 1, parity == 0u);
         for (var k4 = 0u; k4 < 4u && !moved; k4 = k4 + 1u) {
             let pick = (start + k4) & 3u;
             var dx: i32 = 0;
@@ -1368,8 +1374,8 @@ fn gas_dynamics(x: u32, parity: u32) {
             else if (pick == 1u) { dx = 1; }
             else if (pick == 2u) { dy = -1; }
             else { dy = 1; }
-            // Skip horizontal in the wrong direction for this phase.
-            if (dx != 0 && dx != allowed_h_dx) { continue; }
+            // Skip the disallowed horizontal direction this phase.
+            if (dx != 0 && dx != dir_x) { continue; }
             let nx = i32(x) + dx;
             let ny = y + dy;
             if (nx < 0 || nx >= w_i || ny < 0 || ny >= h_i) { continue; }
@@ -1436,13 +1442,25 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (x >= u.width) { return; }
         diagonal_slide(x, 1u);
     } else if (u.pass_id == 5u) {
+        // even-x, RIGHT
         let x = gid.x;
         if (x >= u.width) { return; }
-        gas_dynamics(x, 0u);
+        gas_dynamics(x, 0u, 1);
     } else if (u.pass_id == 6u) {
+        // odd-x, RIGHT
         let x = gid.x;
         if (x >= u.width) { return; }
-        gas_dynamics(x, 1u);
+        gas_dynamics(x, 1u, 1);
+    } else if (u.pass_id == 7u) {
+        // even-x, LEFT
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        gas_dynamics(x, 0u, -1);
+    } else if (u.pass_id == 8u) {
+        // odd-x, LEFT
+        let x = gid.x;
+        if (x >= u.width) { return; }
+        gas_dynamics(x, 1u, -1);
     }
 }
 "#;
@@ -1469,11 +1487,11 @@ struct MotionUniforms {
 /// every dispatch see the same value).
 struct MotionComputeCtx {
     pipeline: wgpu::ComputePipeline,
-    pass_uniform_bufs: [wgpu::Buffer; 7],
+    pass_uniform_bufs: [wgpu::Buffer; 9],
     #[allow(dead_code)]
     motion_props_buf: wgpu::Buffer,
     readback_bufs: [wgpu::Buffer; 2],
-    pass_bind_groups: [wgpu::BindGroup; 7],
+    pass_bind_groups: [wgpu::BindGroup; 9],
     write_idx: usize,
     has_data: [bool; 2],
 }
@@ -1509,14 +1527,16 @@ impl MotionComputeCtx {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        let pass_uniform_bufs: [wgpu::Buffer; 7] = [
+        let pass_uniform_bufs: [wgpu::Buffer; 9] = [
             mk_pass_uniform(0, "alembic-motion-uniforms-vfall"),
             mk_pass_uniform(1, "alembic-motion-uniforms-lspread-even"),
             mk_pass_uniform(2, "alembic-motion-uniforms-lspread-odd"),
             mk_pass_uniform(3, "alembic-motion-uniforms-dslide-even"),
             mk_pass_uniform(4, "alembic-motion-uniforms-dslide-odd"),
-            mk_pass_uniform(5, "alembic-motion-uniforms-gdrift-even"),
-            mk_pass_uniform(6, "alembic-motion-uniforms-gdrift-odd"),
+            mk_pass_uniform(5, "alembic-motion-uniforms-gdrift-even-r"),
+            mk_pass_uniform(6, "alembic-motion-uniforms-gdrift-odd-r"),
+            mk_pass_uniform(7, "alembic-motion-uniforms-gdrift-even-l"),
+            mk_pass_uniform(8, "alembic-motion-uniforms-gdrift-odd-l"),
         ];
         let _ = queue;
 
@@ -1564,9 +1584,9 @@ impl MotionComputeCtx {
                 wgpu::BindGroupEntry { binding: 3, resource: derived_phys_buf.as_entire_binding() },
             ],
         });
-        let pass_bind_groups: [wgpu::BindGroup; 7] = [
+        let pass_bind_groups: [wgpu::BindGroup; 9] = [
             mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3),
-            mk_bind(4), mk_bind(5), mk_bind(6),
+            mk_bind(4), mk_bind(5), mk_bind(6), mk_bind(7), mk_bind(8),
         ];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-motion-shader"),
@@ -1611,19 +1631,34 @@ impl MotionComputeCtx {
         let cell_count = W * H;
         let frame_arr = [frame];
         let frame_bytes = bytemuck::cast_slice(&frame_arr);
-        for i in 0..7 {
+        for i in 0..9 {
             queue.write_buffer(&self.pass_uniform_bufs[i], 12, frame_bytes);
         }
         let wg_col = (W as u32 + 63) / 64;
         let wg_row = (H as u32 + 63) / 64;
+        // Alternate which lateral direction goes first per frame so
+        // gases don't accumulate a permanent bias on
+        // multi-direction-eligible cells (the first phase that
+        // actually moves a cell wins; mark_updated locks subsequent
+        // phases out for the rest of the frame).
+        let lr_first = (frame & 1) == 0;
+        let (g_a, g_b, g_c, g_d) = if lr_first {
+            // RIGHT first, then LEFT.
+            (5usize, 6usize, 7usize, 8usize)
+        } else {
+            // LEFT first, then RIGHT.
+            (7usize, 8usize, 5usize, 6usize)
+        };
         let labels_dispatches = [
             ("alembic-motion-vfall",         wg_col, 0usize),
             ("alembic-motion-lspread-even",  wg_row, 1usize),
             ("alembic-motion-lspread-odd",   wg_row, 2usize),
             ("alembic-motion-dslide-even",   wg_col, 3usize),
             ("alembic-motion-dslide-odd",    wg_col, 4usize),
-            ("alembic-motion-gdrift-even",   wg_col, 5usize),
-            ("alembic-motion-gdrift-odd",    wg_col, 6usize),
+            ("alembic-motion-gdrift-a",      wg_col, g_a),
+            ("alembic-motion-gdrift-b",      wg_col, g_b),
+            ("alembic-motion-gdrift-c",      wg_col, g_c),
+            ("alembic-motion-gdrift-d",      wg_col, g_d),
         ];
         for (label, wg, idx) in labels_dispatches {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -10461,6 +10496,32 @@ impl GpuState {
         // the macroquad version.
         self.species_cache_frame = self.species_cache_frame.wrapping_add(1);
         if self.species_cache_frame % 15 == 0 {
+            // Ensure world.cells reflects current GPU state. In Paint
+            // mode without circuit/metal/radioactive, the regular
+            // readback path is gated off — without this one-shot
+            // sync, species_cache would forever reflect startup state
+            // (so spawning a noble gas would never appear in the
+            // species list). Cost: one 17 MB readback every 15
+            // frames ≈ 1.1 MB/frame averaged.
+            if !needs_readback {
+                let mut sync_enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("alembic-species-sync-encoder"),
+                });
+                let cell_bytes = (W * H * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
+                sync_enc.copy_buffer_to_buffer(
+                    &self.cells_buf, 0, &self.fresh_sync_buf, 0, cell_bytes,
+                );
+                let sub = self.queue.submit(std::iter::once(sync_enc.finish()));
+                self.fresh_sync_buf
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, |_| {});
+                let _ = self.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sub));
+                {
+                    let data = self.fresh_sync_buf.slice(..).get_mapped_range();
+                    crate::cells_copy_from_bytes(&mut self.world.cells, &data);
+                }
+                self.fresh_sync_buf.unmap();
+            }
             self.species_cache.clear();
             for c in &self.world.cells {
                 if c.el == Element::Empty { continue; }
