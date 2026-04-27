@@ -5021,12 +5021,16 @@ impl GpuState {
                 }
             }
             crate::ToolMode::Heat => {
-                // L = warm, R = cool. 5°C per frame default.
+                // L = warm, R = cool. Shift held → 5× the rate so you
+                // can quickly preheat / snap-cool a target. Same step
+                // curve as the macroquad Heat tool.
+                let shift = self.egui_ctx.input(|i| i.modifiers.shift);
+                let base: i16 = if shift { 25 } else { 5 };
                 if self.paint_down {
-                    self.world.apply_heat(gx, gy, self.brush_radius, 5);
+                    self.world.apply_heat(gx, gy, self.brush_radius, base);
                 }
                 if self.erase_down {
-                    self.world.apply_heat(gx, gy, self.brush_radius, -5);
+                    self.world.apply_heat(gx, gy, self.brush_radius, -base);
                 }
                 self.last_seed_cell = None;
             }
@@ -5189,10 +5193,34 @@ impl GpuState {
                     }),
             )
             .show(ctx, |ui| {
-                // Override default egui button styling so our buttons
-                // look like draw_panel_button: solid fill, 1px border,
-                // 14pt centered label.
                 Self::style_panel(ui, btn_normal, btn_hover, btn_border);
+
+                // Reserve a fixed bottom strip for the FPS readout so
+                // the species list / dropdowns can never push it off
+                // the panel. Render FPS first via TopBottomPanel, then
+                // the main content in the remaining space.
+                egui::TopBottomPanel::bottom("alembic-fps-strip")
+                    .show_separator_line(false)
+                    .frame(egui::Frame::default().fill(panel_bg))
+                    .show_inside(ui, |ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{} fps", self.last_fps))
+                                        .color(egui::Color32::from_rgb(140, 140, 160))
+                                        .size(12.0),
+                                );
+                            },
+                        );
+                    });
+
+                // Main scrollable content.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                Self::style_panel(ui, btn_normal, btn_hover, btn_border);
+                ui.set_width(ui.available_width());
 
                 // ---- TOOLS section + PAUSED indicator ----
                 ui.horizontal(|ui| {
@@ -5484,21 +5512,7 @@ impl GpuState {
                     egui::RichText::new("Space pause  |  C clear  |  U hide panel")
                         .color(dim_label).size(11.0),
                 );
-
-                // FPS readout at the very bottom — right-aligned with
-                // a small margin so digit-width changes don't reflow
-                // anything above. Mirrors the macroquad bottom FPS.
-                ui.with_layout(
-                    egui::Layout::bottom_up(egui::Align::Max),
-                    |ui| {
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!("{} fps", self.last_fps))
-                                .color(egui::Color32::from_rgb(140, 140, 160))
-                                .size(12.0),
-                        );
-                    },
-                );
+                    }); // ScrollArea
             });
 
         // Periodic-table modal overlay.
@@ -5544,17 +5558,28 @@ impl GpuState {
                     egui::vec2(bw, 26.0),
                     sel_color, normal, hover, border, text_btn,
                 ) {
-                    // Switching TO Battery from any other kind nudges
-                    // the dimensions + material to the canonical
-                    // small-cell defaults (faithful port of the
-                    // macroquad prefab Batt button handler).
-                    if kind == crate::PrefabKind::Battery
-                        && self.prefab_kind != crate::PrefabKind::Battery
-                    {
-                        self.prefab_material = Element::Quartz;
-                        self.prefab_thickness = 10;
-                        self.prefab_width = 30;
-                        self.prefab_height = 40;
+                    // Each kind has its own canonical default dimensions:
+                    //   * Beaker / Box — 145 × 200, glass walls, 10 thick
+                    //   * Battery      — 30 × 40,   quartz casing, 10
+                    // Switching kinds resets to that kind's defaults so
+                    // a Battery-sized box doesn't carry over after the
+                    // user picks Beaker again.
+                    let switching = self.prefab_kind != kind;
+                    if switching {
+                        match kind {
+                            crate::PrefabKind::Beaker | crate::PrefabKind::Box => {
+                                self.prefab_material = Element::Glass;
+                                self.prefab_thickness = 10;
+                                self.prefab_width = 145;
+                                self.prefab_height = 200;
+                            }
+                            crate::PrefabKind::Battery => {
+                                self.prefab_material = Element::Quartz;
+                                self.prefab_thickness = 10;
+                                self.prefab_width = 30;
+                                self.prefab_height = 40;
+                            }
+                        }
                     }
                     self.prefab_kind = kind;
                 }
@@ -5799,8 +5824,10 @@ impl GpuState {
             egui::RichText::new("SPECIES IN SCENE").color(dim_label).size(11.0),
         );
         ui.add_space(4.0);
+        // Top 5 most-populated species — keeps the panel within
+        // a reasonable total height so the FPS row stays visible.
         let species_snapshot: Vec<(Element, u8, usize)> =
-            self.species_cache.iter().take(8).cloned().collect();
+            self.species_cache.iter().take(5).cloned().collect();
         for (el, did, count) in species_snapshot {
             let active = self.pipet_target == Some((el, did));
             let name = if el == Element::Derived {
@@ -5982,11 +6009,21 @@ impl GpuState {
             || cursor_grid.is_some();
         if !need_overlay { return; }
         let id = egui::Id::new("alembic-shockwave-overlay");
+        // Compute the visible sim rect on screen — clip everything
+        // we paint here to it so big nuclear shockwaves don't bleed
+        // over the side panel chrome.
+        let panel_w = if self.panel_visible { 240.0 } else { 0.0 };
+        let win_w = self.surface_config.width as f32;
+        let win_h = self.surface_config.height as f32;
+        let visible_sim = egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(win_w - panel_w, win_h),
+        );
         egui::Area::new(id)
             .order(egui::Order::Background)
             .fixed_pos(egui::pos2(0.0, 0.0))
             .show(ctx, |ui| {
-                let p = ui.painter();
+                let p = ui.painter().with_clip_rect(visible_sim);
                 // Shockwaves first.
                 for s in &self.world.shockwaves {
                     let decay = 1.0 + s.radius / 6.0;

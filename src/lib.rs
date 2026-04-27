@@ -3170,7 +3170,12 @@ impl World {
     // annulus between old_r and new_r: rupture frozen walls, fling loose
     // matter, inject gas pressure. Retires waves once they're too weak.
     fn tick_shockwaves(&mut self) {
-        const SPEED: f32 = 5.0;          // cells per frame
+        // 10 cells/frame keeps a 1200×900 detonation visibly racing
+        // outward at lower frame rates (the wgpu binary tends to run
+        // at 30-50 fps because lots of CPU chemistry is still active).
+        // Macroquad ran at 60+ so the original 5.0 looked snappy
+        // there but feels sluggish under the new harness.
+        const SPEED: f32 = 10.0;         // cells per frame
         const FALLOFF_R0: f32 = 6.0;     // where magnitude falls to 1/4
         const MIN_MAG: f32 = 200.0;      // retire below this
         const MAX_RADIUS: f32 = 50000.0;
