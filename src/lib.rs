@@ -4534,10 +4534,14 @@ pub struct GpuChem {
     /// thermal_post on CPU will skip its moisture sections so the
     /// two passes don't double-fire.
     pub moisture: bool,
-    /// Emergent chemistry framework on GPU — chemical_reactions and
-    /// the four supporting passes (acid_displacement, alloy_formation,
-    /// alloy_acid_leach, base_neutralization).
+    /// Emergent chemistry framework — `chemical_reactions` only. The
+    /// four supporting passes have their own flags below since they
+    /// run their own per-pass CPU loops with bespoke product rules.
     pub chemical_reactions: bool,
+    pub acid_displacement: bool,
+    pub alloy_formation: bool,
+    pub alloy_acid_leach: bool,
+    pub base_neutralization: bool,
 }
 
 impl World {
@@ -4671,9 +4675,17 @@ impl World {
         }
         if !gpu_chem.chemical_reactions {
             self.chemical_reactions();   mark!("chem_reactions");
+        }
+        if !gpu_chem.acid_displacement {
             self.acid_displacement();    mark!("acid_disp");
+        }
+        if !gpu_chem.alloy_acid_leach {
             self.alloy_acid_leach();     mark!("alloy_leach");
+        }
+        if !gpu_chem.base_neutralization {
             self.base_neutralization();  mark!("base_neutral");
+        }
+        if !gpu_chem.alloy_formation {
             self.alloy_formation();      mark!("alloy_form");
         }
         if !gpu_chem.dissolve {

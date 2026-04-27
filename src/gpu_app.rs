@@ -7600,6 +7600,14 @@ impl GpuState {
                 glass_etching: true,
                 moisture: true,
                 chemical_reactions: true,
+                // Bespoke supporting passes still on CPU until their
+                // compound-constituent lookups land on GPU. They have
+                // presence early-outs so per-frame cost is minimal
+                // when their inputs aren't in the world.
+                acid_displacement: false,
+                alloy_formation: false,
+                alloy_acid_leach: false,
+                base_neutralization: false,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
