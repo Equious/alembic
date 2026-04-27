@@ -588,6 +588,24 @@ pub fn moisture_phase_props(id: u8) -> [f32; 4] {
     [wet_thr, wet_el, dry_thr, dry_el]
 }
 
+/// Per-element electrical profile for the GPU joule_heating /
+/// electrolysis passes. Layout: `[conductivity, is_glow_gas, _, _]`.
+/// is_glow_gas is 1.0 for any element with a glow_color (noble gases
+/// in tubes — Ne / Ar / He / Xe etc.) so joule_heating can damp their
+/// self-heating to 10% (so neon signs glow without melting their own
+/// glass).
+pub fn ui_electrical_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0.0; 4]; }
+    let e = &ELECTRICAL[i];
+    [
+        e.conductivity,
+        if e.glow_color.is_some() { 1.0 } else { 0.0 },
+        0.0,
+        0.0,
+    ]
+}
+
 /// Per-element generic phase-transition data for the GPU thermal_post
 /// shader. Layout: `[melting_point, boiling_point, stp_state, has_rule]`.
 /// stp_state is 0=Solid / 1=Liquid / 2=Gas. has_rule = 1.0 when the
@@ -4786,6 +4804,7 @@ pub struct GpuChem {
     pub hg_amalgamation: bool,
     pub thermite: bool,
     pub magnesium_burn: bool,
+    pub joule_heating: bool,
 }
 
 impl World {
@@ -4890,7 +4909,9 @@ impl World {
         }
         mark!("wind");
         self.compute_energized();    mark!("energized");
-        self.joule_heating();        mark!("joule");
+        if !gpu_chem.joule_heating {
+            self.joule_heating();    mark!("joule");
+        }
         self.electrolysis();         mark!("electrolysis");
         self.decay();                mark!("decay");
         if !gpu_chem.tree_support {

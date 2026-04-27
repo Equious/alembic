@@ -5648,6 +5648,215 @@ impl PressureShoveCtx {
     }
 }
 
+const JOULE_HEATING_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    active_emf: f32,
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element electrical profile: x = conductivity, y = is_glow_gas.
+@group(0) @binding(2) var<uniform> elec: array<vec4<f32>, 96>;
+// Bit-packed energized mask: 32 bools per u32, indexed by linear cell idx.
+@group(0) @binding(3) var<storage, read> energized: array<u32>;
+
+fn jh_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn jh_solute_el(c: vec4<u32>) -> u32 { return c.w & 0xFFu; }
+fn jh_solute_amt(c: vec4<u32>) -> u32 { return (c.w >> 8u) & 0xFFu; }
+fn jh_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn jh_set_temp(c: vec4<u32>, t: i32) -> vec4<u32> {
+    let clamped = clamp(t, -273, 5000);
+    let raw = u32(clamped) & 0xFFFFu;
+    let lo_y = c.y & 0xFFFFu;
+    return vec4<u32>(c.x, lo_y | (raw << 16u), c.z, c.w);
+}
+
+fn jh_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+fn is_energized(i: u32) -> bool {
+    let word = energized[i / 32u];
+    return (word & (1u << (i & 31u))) != 0u;
+}
+
+// Faithful port of `World::joule_heating` (lib.rs:4173). Per-cell:
+//   * skip if not energized
+//   * compute effective conductivity (water + solute boost)
+//   * resistance = max(1 - conductivity, 0)
+//   * factor = 0.1 for glow-gas cells, 1.0 otherwise
+//   * delta = v² × resistance × K × factor (K = 5e-5)
+//   * stochastic-round to integer temp (so small deltas accumulate
+//     statistically rather than getting truncated to zero)
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (u.active_emf <= 0.0) { return; }
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    if (!is_energized(i)) { return; }
+    var c = cells[i];
+    let el = jh_el(c);
+    let prof = elec[el];
+    var cond = prof.x;
+    // Water + solute boost — Cell::conductivity() returns
+    // base + (solute_amt / 255) * 0.6 for water with solute.
+    if (el == 2u && jh_solute_amt(c) > 0u) {
+        cond = cond + (f32(jh_solute_amt(c)) / 255.0) * 0.6;
+    }
+    let resistance = max(1.0 - cond, 0.0);
+    let factor = select(1.0, 0.1, prof.y > 0.5);
+    let v2 = u.active_emf * u.active_emf;
+    let delta = v2 * resistance * 0.00005 * factor;
+    if (delta < 0.01) { return; }
+    let temp_f = f32(jh_temp(c)) + delta;
+    let floor_v = floor(temp_f);
+    let frac = temp_f - floor_v;
+    let r = jh_hash(i, u.frame);
+    let roll = f32(r & 0xFFFFu) / 65536.0;
+    let stepped = select(floor_v, floor_v + 1.0, roll < frac);
+    cells[i] = jh_set_temp(c, i32(clamp(stepped, -273.0, 5000.0)));
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct JouleHeatingUniforms {
+    width: u32,
+    height: u32,
+    active_emf: f32,
+    frame: u32,
+}
+
+/// GPU port of `World::joule_heating`. Per-cell pass that reads an
+/// uploaded bit-packed `energized` mask and the per-element electrical
+/// profile, computing v² × resistance heat injection per frame. The
+/// `compute_energized` flood-fill stays on CPU (complex iterative
+/// graph search with galvanic detection); the produced mask + emf
+/// are uploaded each frame as a small storage buffer + uniform.
+struct JouleHeatingCtx {
+    pipeline: wgpu::ComputePipeline,
+    uniform_buf: wgpu::Buffer,
+    energized_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl JouleHeatingCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mut elec_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            elec_data[i] = crate::ui_electrical_props(i as u8);
+        }
+        let elec_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-joule-elec-lut"),
+            contents: bytemuck::cast_slice(&elec_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let uniforms = JouleHeatingUniforms {
+            width: W as u32, height: H as u32, active_emf: 0.0, frame: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-joule-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        // Bit-packed energized mask: 32 bools per u32. W*H bits = (W*H+31)/32 u32 entries.
+        let bits = ((W * H) + 31) / 32;
+        let energized_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-joule-energized-buf"),
+            size: (bits * std::mem::size_of::<u32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-joule-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-joule-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: elec_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: energized_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-joule-shader"),
+            source: wgpu::ShaderSource::Wgsl(JOULE_HEATING_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-joule-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-joule-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let _ = elec_buf;
+        JouleHeatingCtx { pipeline, uniform_buf, energized_buf, bind_group }
+    }
+
+    /// Pack an energized: &[bool] mask into the bit-packed u32 buffer
+    /// shape the shader expects. Called from the per-frame upload.
+    fn upload(
+        &self,
+        queue: &wgpu::Queue,
+        energized: &[bool],
+        active_emf: f32,
+        frame: u32,
+    ) {
+        // Pack the bool slice into u32 words.
+        let n_words = (energized.len() + 31) / 32;
+        let mut words: Vec<u32> = vec![0u32; n_words];
+        for (i, &on) in energized.iter().enumerate() {
+            if on { words[i / 32] |= 1u32 << (i & 31); }
+        }
+        queue.write_buffer(&self.energized_buf, 0, bytemuck::cast_slice(&words));
+        queue.write_buffer(&self.uniform_buf, 8, bytemuck::cast_slice(&[active_emf]));
+        queue.write_buffer(&self.uniform_buf, 12, bytemuck::cast_slice(&[frame]));
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-joule-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -7021,6 +7230,10 @@ struct GpuState {
     /// Pressure-driven cell displacement (try_pressure_shove). Margolus
     /// 2x2 4-phase. Drives gas dispersion and water leveling.
     pshove_compute: PressureShoveCtx,
+    /// Joule heating — per-cell v² × resistance over the uploaded
+    /// `energized` mask. compute_energized still runs on CPU and
+    /// uploads the mask each frame.
+    joule_compute: JouleHeatingCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -7469,6 +7682,7 @@ impl GpuState {
         let sup_chem_compute = SupportingChemCtx::new(&device, &queue, &cells_buf);
         let burn_compute = BurnCyclesCtx::new(&device, &queue, &cells_buf);
         let pshove_compute = PressureShoveCtx::new(&device, &queue, &cells_buf);
+        let joule_compute = JouleHeatingCtx::new(&device, &queue, &cells_buf);
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -7526,6 +7740,7 @@ impl GpuState {
             sup_chem_compute,
             burn_compute,
             pshove_compute,
+            joule_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -9457,6 +9672,7 @@ impl GpuState {
                 hg_amalgamation: true,
                 thermite: true,
                 magnesium_burn: true,
+                joule_heating: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
@@ -9567,6 +9783,15 @@ impl GpuState {
             //     by pressure gradients don't get yanked by gravity in
             //     the same frame. Margolus 2x2 4-phase, race-free.
             self.pshove_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 6c. Joule heating. Per-cell v² × resistance over the
+            //     CPU-computed energized mask (uploaded above).
+            self.joule_compute.upload(
+                &self.queue,
+                &self.world.energized,
+                self.world.active_emf,
+                self.frame_counter,
+            );
+            self.joule_compute.encode(&mut encoder);
             // 7. Motion: 5 passes (vfall, lspread-even/odd, dslide-even/odd).
             self.motion_compute.encode(&mut encoder, &self.queue, self.frame_counter, &self.cells_buf);
             self.queue.submit(std::iter::once(encoder.finish()));
