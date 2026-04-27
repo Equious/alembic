@@ -6717,7 +6717,7 @@ impl GpuState {
                 reactions: true,
                 glass_etching: true,
             };
-            self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
+            self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
         let t_sim = t_sim_start.elapsed();
 
@@ -7238,6 +7238,19 @@ impl ApplicationHandler for App {
                             // saved image includes the panel and any
                             // open periodic-table modal.
                             state.pending_screenshot = true;
+                        }
+                        KeyCode::KeyX => {
+                            // Stir — random pairwise swaps among non-
+                            // frozen cells inside the brush disk. One
+                            // press fully randomizes the disk (used
+                            // for thermite / gunpowder mixing demos).
+                            if let Some((px, py)) = state.cursor_pos {
+                                if let Some((gx, gy)) =
+                                    state.cursor_to_grid(px, py)
+                                {
+                                    state.world.stir(gx, gy, state.brush_radius);
+                                }
+                            }
                         }
                         KeyCode::KeyC => {
                             // C clears non-frozen; Shift+C clears

@@ -7705,7 +7705,7 @@ impl World {
     // Frozen cells (built walls) are excluded so structures don't
     // get scrambled. Cell counts and properties are preserved by
     // construction (swap, not regenerate).
-    fn stir(&mut self, cx: i32, cy: i32, radius: i32) {
+    pub fn stir(&mut self, cx: i32, cy: i32, radius: i32) {
         let r2 = radius * radius;
         let mut indices: Vec<usize> = Vec::new();
         for dy in -radius..=radius {
