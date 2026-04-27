@@ -2693,6 +2693,12 @@ struct Uniforms {
 // Per-element moisture data: x=is_source, y=is_sink, z=conductivity,
 // w=default_moisture. is_source/is_sink encoded as 0.0 / 1.0.
 @group(0) @binding(2) var<uniform> moisture_lut: array<vec4<f32>, 96>;
+// Per-element wet/dry phase-change data:
+//   x = wet_above_threshold (255 = none)
+//   y = wet_above_target_el
+//   z = dry_below_threshold  (255 = none)
+//   w = dry_below_target_el
+@group(0) @binding(3) var<uniform> moisture_phase_lut: array<vec4<f32>, 96>;
 
 const EL_EMPTY: u32 = 0u;
 const EL_WATER: u32 = 2u;
@@ -2784,6 +2790,45 @@ fn try_wick(c_a: vec4<u32>, c_b: vec4<u32>) -> WickPair {
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (u.pass_id == 6u) {
+        // ---- Phase conversion: sand→mud (saturation) and mud→sand
+        //      (desiccation) — runs LAST so wicking has had a chance
+        //      to redistribute moisture this frame.
+        let x = gid.x;
+        let y = gid.y;
+        if (x >= u.width || y >= u.height) { return; }
+        let i = y * u.width + x;
+        let c = cells[i];
+        let el = m_el(c);
+        if (el == EL_EMPTY) { return; }
+        let phase_lu = moisture_phase_lut[el];
+        let mst = m_moisture(c);
+        // Saturation: moisture > wet_threshold → wet_target.
+        let wet_thr = u32(phase_lu.x);
+        let wet_target = u32(phase_lu.y);
+        if (wet_thr < 255u && mst > wet_thr) {
+            let temp = m_temp(c);
+            // New cell carries over the moisture so the converted
+            // mud doesn't immediately re-dry below dry_below.
+            let new_x = (wet_target & 0xFFu);
+            let traw = u32(clamp(temp, -273, 5000)) & 0xFFFFu;
+            let new_y = traw << 16u;
+            let new_z = (mst & 0xFFu);
+            cells[i] = vec4<u32>(new_x, new_y, new_z, 0u);
+            return;
+        }
+        // Desiccation: moisture < dry_threshold → dry_target.
+        let dry_thr = u32(phase_lu.z);
+        let dry_target = u32(phase_lu.w);
+        if (dry_thr < 255u && mst < dry_thr) {
+            let temp = m_temp(c);
+            let new_x = (dry_target & 0xFFu);
+            let traw = u32(clamp(temp, -273, 5000)) & 0xFFFFu;
+            let new_y = traw << 16u;
+            cells[i] = vec4<u32>(new_x, new_y, 0u, 0u);
+        }
+        return;
+    }
     if (u.pass_id <= 1u) {
         // ---- Per-cell passes (absorption / evaporate+dry) ----
         let x = gid.x;
@@ -2928,8 +2973,8 @@ struct MoistureUniforms {
 /// per frame: 1 absorption + 4 wicking + 1 evaporate/dry.
 struct MoistureCtx {
     pipeline: wgpu::ComputePipeline,
-    pass_uniform_bufs: [wgpu::Buffer; 6],
-    pass_bind_groups: [wgpu::BindGroup; 6],
+    pass_uniform_bufs: [wgpu::Buffer; 7],
+    pass_bind_groups: [wgpu::BindGroup; 7],
 }
 
 impl MoistureCtx {
@@ -2943,6 +2988,15 @@ impl MoistureCtx {
             contents: bytemuck::cast_slice(&props_data),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let mut phase_data: Vec<[f32; 4]> = vec![[255.0, 0.0, 255.0, 0.0]; 96];
+        for i in 0..96 {
+            phase_data[i] = crate::moisture_phase_props(i as u8);
+        }
+        let phase_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-moisture-phase-lut"),
+            contents: bytemuck::cast_slice(&phase_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let mk_uniform = |label: &str, pass_id: u32| {
             let u = MoistureUniforms { width: W as u32, height: H as u32, pass_id, frame: 0 };
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2951,14 +3005,15 @@ impl MoistureCtx {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        // 0 absorb, 1 evaporate+dry, 2-5 wicking phases.
-        let pass_uniform_bufs: [wgpu::Buffer; 6] = [
+        // 0 absorb, 1 evaporate+dry, 2-5 wicking phases, 6 wet/dry phase.
+        let pass_uniform_bufs: [wgpu::Buffer; 7] = [
             mk_uniform("alembic-moisture-u-absorb", 0),
             mk_uniform("alembic-moisture-u-evap",   1),
             mk_uniform("alembic-moisture-u-wick0",  2),
             mk_uniform("alembic-moisture-u-wick1",  3),
             mk_uniform("alembic-moisture-u-wick2",  4),
             mk_uniform("alembic-moisture-u-wick3",  5),
+            mk_uniform("alembic-moisture-u-phase",  6),
         ];
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("alembic-moisture-bgl"),
@@ -2975,6 +3030,10 @@ impl MoistureCtx {
                     binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
             ],
         });
         let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2984,10 +3043,11 @@ impl MoistureCtx {
                 wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: lut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: phase_lut_buf.as_entire_binding() },
             ],
         });
-        let pass_bind_groups: [wgpu::BindGroup; 6] = [
-            mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3), mk_bind(4), mk_bind(5),
+        let pass_bind_groups: [wgpu::BindGroup; 7] = [
+            mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3), mk_bind(4), mk_bind(5), mk_bind(6),
         ];
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-moisture-shader"),
@@ -3006,16 +3066,16 @@ impl MoistureCtx {
             compilation_options: Default::default(),
             cache: None,
         });
-        // lut_buf retained via the bind groups; binding 2 holds the
-        // strong ref for the lifetime of the ctx.
+        // lut_buf / phase_lut_buf retained via the bind groups.
         let _ = lut_buf;
+        let _ = phase_lut_buf;
         MoistureCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
     }
 
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
         let arr = [frame];
         let bytes: &[u8] = bytemuck::cast_slice(&arr);
-        for i in 0..6 {
+        for i in 0..7 {
             queue.write_buffer(&self.pass_uniform_bufs[i], 12, bytes);
         }
         let wg_x_cell = (W as u32 + 7) / 8;
@@ -3024,14 +3084,16 @@ impl MoistureCtx {
         let blocks_y = (H as u32 + 1) / 2;
         let wg_x_mar = (blocks_x + 7) / 8;
         let wg_y_mar = (blocks_y + 7) / 8;
-        // Order: absorption → wicking (4 phases) → evaporate+dry.
-        let order: [(usize, u32, u32); 6] = [
+        // Order: absorption → wicking (4 phases) → evaporate+dry →
+        // wet/dry phase conversion (sand→mud / mud→sand).
+        let order: [(usize, u32, u32); 7] = [
             (0, wg_x_cell, wg_y_cell),
             (2, wg_x_mar,  wg_y_mar),
             (3, wg_x_mar,  wg_y_mar),
             (4, wg_x_mar,  wg_y_mar),
             (5, wg_x_mar,  wg_y_mar),
             (1, wg_x_cell, wg_y_cell),
+            (6, wg_x_cell, wg_y_cell),
         ];
         for (idx, gx, gy) in order {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3483,11 +3545,40 @@ fn try_react(
     out.a_out = c_a;
     out.b_out = c_b;
 
-    let el_a = cr_el(c_a);
-    let el_b = cr_el(c_b);
+    if (cr_updated(c_a) || cr_updated(c_b)) { return out; }
+
+    var el_a = cr_el(c_a);
+    var el_b = cr_el(c_b);
+    if (el_a == el_b) { return out; }
+
+    // Virtual-O fallback: when one cell is Empty and we have ambient
+    // oxygen, treat the Empty as Element::O (id 22) with probability
+    // u.ambient_oxygen. Reaction proceeds against the virtual O atom
+    // but the Empty cell stays empty (atmospheric reservoir, no
+    // actual product materialized there). Faithful port of the
+    // virtual_o branch in lib.rs:5418.
+    var virtual_o_a: bool = false;
+    var virtual_o_b: bool = false;
+    if (el_a == 0u && el_b != 0u && u.ambient_oxygen > 0.0) {
+        let r = cr_hash(rng_seed, u.frame ^ 0xCAFE0001u);
+        let frac = f32(r & 0xFFFFu) / 65536.0;
+        if (frac < u.ambient_oxygen) {
+            el_a = 22u;
+            virtual_o_a = true;
+        }
+    }
+    if (el_b == 0u && el_a != 0u && u.ambient_oxygen > 0.0 && !virtual_o_a) {
+        let r = cr_hash(rng_seed, u.frame ^ 0xCAFE0002u);
+        let frac = f32(r & 0xFFFFu) / 65536.0;
+        if (frac < u.ambient_oxygen) {
+            el_b = 22u;
+            virtual_o_b = true;
+        }
+    }
+    // After possibly substituting virtual-O, an actually-empty pair
+    // still bails out. Same with same-element after substitution.
     if (el_a == 0u || el_b == 0u) { return out; }
     if (el_a == el_b) { return out; }
-    if (cr_updated(c_a) || cr_updated(c_b)) { return out; }
 
     let prof_a = chem_lut[el_a];
     let prof_b = chem_lut[el_b];
@@ -3580,6 +3671,8 @@ fn try_react(
     if (delta_e >= 2.8 && donor_e < 1.0 && product_kind == 6u) {
         rate = max(rate, 0.85);
     }
+    // Virtual-O path: 0.1× to model tenuous atmospheric contact.
+    if (virtual_o_a || virtual_o_b) { rate = rate * 0.1; }
     rate = clamp(rate, 0.0, 1.0);
 
     // RNG gate.
@@ -3624,6 +3717,11 @@ fn try_react(
         a_new = make_cell(product_el, product_did, t_a + delta_temp);
         b_new = make_cell(product_el, product_did, t_b + delta_temp);
     }
+
+    // Virtual-O path: leave the originally-empty cell empty (no
+    // product materialized in the atmospheric reservoir slot).
+    if (virtual_o_a) { a_new = c_a; }
+    if (virtual_o_b) { b_new = c_b; }
 
     out.fired = 1u;
     out.a_out = a_new;
@@ -8054,9 +8152,17 @@ impl GpuState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let path = format!("screenshot_{}.png", ts);
-        let file = std::fs::File::create(&path)
-            .map_err(|e| format!("create {}: {}", path, e))?;
+        // Anchor screenshots to the current working directory and
+        // canonicalize so the saved-notice prints the full absolute
+        // path. On Windows in particular, `cargo run` and double-
+        // launched binaries can have very different cwds, so a bare
+        // "screenshot_X.png" was effectively scattered everywhere.
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("cwd: {}", e))?;
+        let path_buf = cwd.join(format!("screenshot_{}.png", ts));
+        let file = std::fs::File::create(&path_buf)
+            .map_err(|e| format!("create {}: {}", path_buf.display(), e))?;
+        let path = path_buf.display().to_string();
         let writer = std::io::BufWriter::new(file);
         let mut encoder = png::Encoder::new(writer, w, h);
         encoder.set_color(png::ColorType::Rgba);
@@ -8492,7 +8598,14 @@ impl GpuState {
                 });
 
                 // Derived row.
-                let derived = crate::ui_derived_palette();
+                // Only show derived compounds with cells in the scene
+                // (plus the macroquad default HCl + AuCl tiles).
+                let present_dids: Vec<u8> = self.species_cache
+                    .iter()
+                    .filter(|(el, _, _)| *el == Element::Derived)
+                    .map(|(_, did, _)| *did)
+                    .collect();
+                let derived = crate::ui_derived_palette(&present_dids);
                 if !derived.is_empty() {
                     ui.add_space(8.0);
                     ui.label(

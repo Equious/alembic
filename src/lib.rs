@@ -569,6 +569,25 @@ pub fn moisture_props(id: u8) -> [f32; 4] {
     ]
 }
 
+/// Per-element wet/dry phase-change data — drives sand→mud (saturation)
+/// and mud→sand (desiccation) once moisture crosses the per-element
+/// threshold. Layout: `[wet_thr, wet_target_el, dry_thr, dry_target_el]`.
+/// 255.0 = "no phase rule" for either threshold.
+pub fn moisture_phase_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [255.0, 0.0, 255.0, 0.0]; }
+    let m = &MOISTURE[i];
+    let (wet_thr, wet_el) = match m.wet_above {
+        Some((thr, el)) => (thr as f32, el as u8 as f32),
+        None => (255.0, 0.0),
+    };
+    let (dry_thr, dry_el) = match m.dry_below {
+        Some((thr, el)) => (thr as f32, el as u8 as f32),
+        None => (255.0, 0.0),
+    };
+    [wet_thr, wet_el, dry_thr, dry_el]
+}
+
 pub fn motion_props(id: u8) -> [f32; 4] {
     let i = id as usize;
     if i >= ELEMENT_COUNT { return [0.0; 4]; }
@@ -2494,16 +2513,40 @@ pub fn ui_element_detail(el: Element, did: u8) -> (String, String, Vec<String>) 
     (title, subtitle, body)
 }
 
-/// Snapshot the registered Derived compound ids and their formulas
-/// for palette rendering.
-pub fn ui_derived_palette() -> Vec<(u8, String, [u8; 3])> {
-    let mut out = Vec::new();
-    DERIVED_COMPOUNDS.with(|r| {
-        let reg = r.borrow();
-        for (i, c) in reg.iter().enumerate() {
-            out.push((i as u8, c.formula.clone(), [c.color.0, c.color.1, c.color.2]));
-        }
-    });
+/// Snapshot of the derived compounds the periodic-table modal should
+/// display. Mirrors the macroquad behavior: by default, only HCl + AuCl
+/// (the two pre-registered demonstration compounds) plus any compounds
+/// the user has actually created in the scene this frame. Avoids
+/// dumping the full atom-pair pre-registration table in the UI.
+pub fn ui_derived_palette(present_dids: &[u8]) -> Vec<(u8, String, [u8; 3])> {
+    let mut out: Vec<(u8, String, [u8; 3])> = Vec::new();
+    let mut seen: [bool; 256] = [false; 256];
+
+    let mut push_did = |out: &mut Vec<(u8, String, [u8; 3])>,
+                        seen: &mut [bool; 256],
+                        did: u8| {
+        if seen[did as usize] { return; }
+        seen[did as usize] = true;
+        DERIVED_COMPOUNDS.with(|r| {
+            let reg = r.borrow();
+            if let Some(c) = reg.get(did as usize) {
+                out.push((did, c.formula.clone(), [c.color.0, c.color.1, c.color.2]));
+            }
+        });
+    };
+
+    // Default tiles — match macroquad's `derived_palette: [hcl_id, aucl_id]`.
+    if let Some(id) = derive_or_lookup(Element::H, Element::Cl) {
+        push_did(&mut out, &mut seen, id);
+    }
+    if let Some(id) = derive_or_lookup(Element::Au, Element::Cl) {
+        push_did(&mut out, &mut seen, id);
+    }
+    // Anything currently in the scene gets a tile too, so newly-formed
+    // compounds (FeCl, MgO, AlCl₃, …) appear as the user makes them.
+    for &did in present_dids {
+        push_did(&mut out, &mut seen, did);
+    }
     out
 }
 
