@@ -3871,6 +3871,617 @@ impl ChemReactionsCtx {
     }
 }
 
+const SUPPORTING_CHEM_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0..3 = Margolus phase, then mode comes from binding-group
+    mode: u32,               // 0=acid_disp, 1=base_neutral, 2=alloy_form, 3=alloy_leach
+    frame: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element chemistry profile: x=EN, y=valence, z=mass, w=has_chem.
+@group(0) @binding(2) var<uniform> chem_lut: array<vec4<f32>, 96>;
+// Atom×atom derived-id LUT (96×96 byte table, vec4 packed).
+@group(0) @binding(3) var<uniform> atom_pair_did: array<vec4<u32>, 576>;
+// Atom×atom alloy-id LUT (96×96 byte table, vec4 packed).
+@group(0) @binding(4) var<uniform> atom_pair_alloy: array<vec4<u32>, 576>;
+// Per-derived-compound metadata. See ui_compound_meta_lut for layout.
+@group(0) @binding(5) var<uniform> compound_meta: array<vec4<u32>, 256>;
+
+const FLAG_UPDATED: u32 = 0x01u;
+const PHASE_MASK:   u32 = 0x0Cu;
+const PHASE_LIQUID: u32 = 2u;
+
+const EL_EMPTY:   u32 = 0u;
+const EL_WATER:   u32 = 2u;
+const EL_H:       u32 = 18u;
+const EL_DERIVED: u32 = 41u;
+
+fn sc_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn sc_did(c: vec4<u32>) -> u32 { return (c.x >> 8u) & 0xFFu; }
+fn sc_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn sc_updated(c: vec4<u32>) -> bool { return (sc_flag(c) & FLAG_UPDATED) != 0u; }
+fn sc_phase(c: vec4<u32>) -> u32 { return (sc_flag(c) & PHASE_MASK) >> 2u; }
+fn sc_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+
+fn sc_get_did(a: u32, b: u32) -> u32 {
+    let i = a * 96u + b;
+    let q = atom_pair_did[i / 16u];
+    let lane = (i / 4u) % 4u;
+    let byte_in_lane = i % 4u;
+    return (q[lane] >> (byte_in_lane * 8u)) & 0xFFu;
+}
+
+fn sc_get_alloy(a: u32, b: u32) -> u32 {
+    let i = a * 96u + b;
+    let q = atom_pair_alloy[i / 16u];
+    let lane = (i / 4u) % 4u;
+    let byte_in_lane = i % 4u;
+    return (q[lane] >> (byte_in_lane * 8u)) & 0xFFu;
+}
+
+fn sc_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Compound metadata accessors.
+fn cm_a_el(did: u32) -> u32 { return compound_meta[did].x & 0xFFu; }
+fn cm_a_count(did: u32) -> u32 { return (compound_meta[did].x >> 8u) & 0xFFu; }
+fn cm_b_el(did: u32) -> u32 { return (compound_meta[did].x >> 16u) & 0xFFu; }
+fn cm_b_count(did: u32) -> u32 { return (compound_meta[did].x >> 24u) & 0xFFu; }
+fn cm_is_acid(did: u32) -> bool { return (compound_meta[did].y & 0xFFu) != 0u; }
+fn cm_is_basic_oxide(did: u32) -> bool { return ((compound_meta[did].y >> 8u) & 0xFFu) != 0u; }
+fn cm_is_alloy(did: u32) -> bool { return ((compound_meta[did].y >> 16u) & 0xFFu) != 0u; }
+fn cm_metal_or_halogen(did: u32) -> u32 { return (compound_meta[did].y >> 24u) & 0xFFu; }
+fn cm_acid_strength(did: u32) -> f32 { return bitcast<f32>(compound_meta[did].z); }
+fn cm_basicity(did: u32) -> f32 { return bitcast<f32>(compound_meta[did].w); }
+
+fn make_cell(el: u32, did: u32, temp: i32, phase: u32) -> vec4<u32> {
+    let clamped = clamp(temp, -273, 5000);
+    let traw = u32(clamped) & 0xFFFFu;
+    let x = (el & 0xFFu) | ((did & 0xFFu) << 8u);
+    let y = (FLAG_UPDATED << 8u) | ((phase & 3u) << 10u) | (traw << 16u);
+    return vec4<u32>(x, y, 0u, 0u);
+}
+
+fn make_h_cell(temp: i32) -> vec4<u32> {
+    return make_cell(EL_H, 0u, temp, 0u);
+}
+fn make_water_cell(temp: i32) -> vec4<u32> {
+    return make_cell(EL_WATER, 0u, temp, 0u);
+}
+
+fn is_atomic_metal(el: u32) -> bool {
+    // Atomic metals from the table (lib.rs is_atomic_metal):
+    //   Na 25, Mg 26, Al 27, Si 28*, K 32, Ca 33, Fe 34, Cu 35, Au 36,
+    //   Hg 37, U 38, Zn 48, Ag 49, Ni 50, Pb 51, B 52, Ra 53, Cs 54.
+    //   *Si is metalloid (treated as metal in alloy formation).
+    return el == 25u || el == 26u || el == 27u || el == 28u
+        || el == 32u || el == 33u || el == 34u || el == 35u
+        || el == 36u || el == 37u || el == 38u
+        || el == 48u || el == 49u || el == 50u || el == 51u
+        || el == 52u || el == 53u || el == 54u;
+}
+
+// Result of one pair attempt — fired flag + new cells. The caller
+// commits these only on the first hit per Margolus block.
+struct PairResult {
+    fired: u32,
+    a: vec4<u32>,
+    b: vec4<u32>,
+    // For alloy_acid_leach the "salt deposit" goes into a separate
+    // empty cell within the block — c_aux holds that updated cell.
+    // valid_aux: 0=ignore, 1=write salt to aux slot.
+    valid_aux: u32,
+    aux: vec4<u32>,
+    aux_kind: u32,           // 0=c00, 1=c10, 2=c01, 3=c11
+}
+
+// MODE 0 — acid_displacement. Pair (a, b): a is acid (Derived HX),
+// b is atomic metal with EN < 1.88. Result: a → derived(metal,halogen),
+// b → H gas. Heat goes to the salt cell.
+fn try_acid_displacement(c_a: vec4<u32>, c_b: vec4<u32>, seed: u32) -> PairResult {
+    var out: PairResult;
+    out.fired = 0u; out.a = c_a; out.b = c_b;
+    out.valid_aux = 0u; out.aux = c_a; out.aux_kind = 0u;
+    if (sc_updated(c_a) || sc_updated(c_b)) { return out; }
+    // Try (a is acid, b is metal); also try the reverse.
+    if (sc_el(c_a) == EL_DERIVED && cm_is_acid(sc_did(c_a))) {
+        let halogen = cm_metal_or_halogen(sc_did(c_a));
+        let strength = cm_acid_strength(sc_did(c_a));
+        if (strength <= 0.0) { return out; }
+        let metal_el = sc_el(c_b);
+        let prof = chem_lut[metal_el];
+        let metal_e = prof.x;
+        if (metal_e <= 0.0 || metal_e >= 1.88) { return out; }
+        let metal_reactivity = 1.88 - metal_e;
+        let rate = min(strength * metal_reactivity * 0.5, 0.5);
+        let r = sc_hash(seed, u.frame);
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+        let salt_id = sc_get_did(metal_el, halogen);
+        if (salt_id == 0xFFu) { return out; }
+        let dt = i32((strength + metal_reactivity) * 80.0);
+        out.fired = 1u;
+        // Acid cell becomes the salt; metal cell becomes H gas.
+        out.a = make_cell(EL_DERIVED, salt_id, sc_temp(c_b) + dt, 0u);
+        out.b = make_h_cell(sc_temp(c_a));
+        return out;
+    }
+    if (sc_el(c_b) == EL_DERIVED && cm_is_acid(sc_did(c_b))) {
+        let halogen = cm_metal_or_halogen(sc_did(c_b));
+        let strength = cm_acid_strength(sc_did(c_b));
+        if (strength <= 0.0) { return out; }
+        let metal_el = sc_el(c_a);
+        let prof = chem_lut[metal_el];
+        let metal_e = prof.x;
+        if (metal_e <= 0.0 || metal_e >= 1.88) { return out; }
+        let metal_reactivity = 1.88 - metal_e;
+        let rate = min(strength * metal_reactivity * 0.5, 0.5);
+        let r = sc_hash(seed, u.frame ^ 0xDEADBEEFu);
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+        let salt_id = sc_get_did(metal_el, halogen);
+        if (salt_id == 0xFFu) { return out; }
+        let dt = i32((strength + metal_reactivity) * 80.0);
+        out.fired = 1u;
+        out.a = make_h_cell(sc_temp(c_b));
+        out.b = make_cell(EL_DERIVED, salt_id, sc_temp(c_a) + dt, 0u);
+        return out;
+    }
+    return out;
+}
+
+// MODE 1 — base_neutralization. Pair (a, b): a is basic_oxide, b is acid.
+// Result: a → salt (metal + halogen), b → water. Heat warms both.
+fn try_base_neutralization(c_a: vec4<u32>, c_b: vec4<u32>, seed: u32) -> PairResult {
+    var out: PairResult;
+    out.fired = 0u; out.a = c_a; out.b = c_b;
+    out.valid_aux = 0u; out.aux = c_a; out.aux_kind = 0u;
+    if (sc_updated(c_a) || sc_updated(c_b)) { return out; }
+
+    // Try (a is basic, b is acid).
+    if (sc_el(c_a) == EL_DERIVED && cm_is_basic_oxide(sc_did(c_a))
+        && sc_el(c_b) == EL_DERIVED && cm_is_acid(sc_did(c_b))) {
+        let metal_el = cm_metal_or_halogen(sc_did(c_a));
+        let basicity = cm_basicity(sc_did(c_a));
+        let halogen = cm_metal_or_halogen(sc_did(c_b));
+        let strength = cm_acid_strength(sc_did(c_b));
+        if (basicity <= 0.0 || strength <= 0.0) { return out; }
+        let rate = min(basicity * strength * 0.5, 0.5);
+        let r = sc_hash(seed, u.frame);
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+        let salt_id = sc_get_did(metal_el, halogen);
+        if (salt_id == 0xFFu) { return out; }
+        let dt = i32((basicity + strength) * 60.0);
+        out.fired = 1u;
+        out.a = make_cell(EL_DERIVED, salt_id, sc_temp(c_a) + dt, 0u);
+        out.b = make_water_cell(sc_temp(c_b) + dt);
+        return out;
+    }
+    // Reverse: b is basic, a is acid.
+    if (sc_el(c_b) == EL_DERIVED && cm_is_basic_oxide(sc_did(c_b))
+        && sc_el(c_a) == EL_DERIVED && cm_is_acid(sc_did(c_a))) {
+        let metal_el = cm_metal_or_halogen(sc_did(c_b));
+        let basicity = cm_basicity(sc_did(c_b));
+        let halogen = cm_metal_or_halogen(sc_did(c_a));
+        let strength = cm_acid_strength(sc_did(c_a));
+        if (basicity <= 0.0 || strength <= 0.0) { return out; }
+        let rate = min(basicity * strength * 0.5, 0.5);
+        let r = sc_hash(seed, u.frame ^ 0xDEADBEEFu);
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+        let salt_id = sc_get_did(metal_el, halogen);
+        if (salt_id == 0xFFu) { return out; }
+        let dt = i32((basicity + strength) * 60.0);
+        out.fired = 1u;
+        out.a = make_water_cell(sc_temp(c_a) + dt);
+        out.b = make_cell(EL_DERIVED, salt_id, sc_temp(c_b) + dt, 0u);
+        return out;
+    }
+    return out;
+}
+
+// MODE 2 — alloy_formation. Pair (a, b): both atomic metals in liquid
+// phase, different elements. Result: both become alloy (Derived).
+fn try_alloy_formation(c_a: vec4<u32>, c_b: vec4<u32>, seed: u32) -> PairResult {
+    var out: PairResult;
+    out.fired = 0u; out.a = c_a; out.b = c_b;
+    out.valid_aux = 0u; out.aux = c_a; out.aux_kind = 0u;
+    if (sc_updated(c_a) || sc_updated(c_b)) { return out; }
+    let el_a = sc_el(c_a);
+    let el_b = sc_el(c_b);
+    if (el_a == el_b) { return out; }
+    if (!is_atomic_metal(el_a) || !is_atomic_metal(el_b)) { return out; }
+    if (sc_phase(c_a) != PHASE_LIQUID || sc_phase(c_b) != PHASE_LIQUID) { return out; }
+    let alloy_id = sc_get_alloy(el_a, el_b);
+    if (alloy_id == 0xFFu) { return out; }
+    // Per-frame rate 0.15 (matches macroquad).
+    let r = sc_hash(seed, u.frame);
+    if (f32(r & 0xFFFFu) / 65536.0 > 0.15) { return out; }
+    out.fired = 1u;
+    out.a = make_cell(EL_DERIVED, alloy_id, sc_temp(c_a), PHASE_LIQUID);
+    out.b = make_cell(EL_DERIVED, alloy_id, sc_temp(c_b), PHASE_LIQUID);
+    return out;
+}
+
+// MODE 3 — alloy_acid_leach. Pair (a, b): a is alloy with reactive
+// constituent (EN<1.88), b is acid. Result: a → leftover pure metal,
+// b → H gas. Salt precipitates into an empty cell elsewhere in the
+// Margolus block (caller writes via aux slot).
+fn try_alloy_leach(c_a: vec4<u32>, c_b: vec4<u32>,
+                   c_other_a: vec4<u32>, c_other_b: vec4<u32>,
+                   other_a_kind: u32, other_b_kind: u32,
+                   seed: u32) -> PairResult {
+    var out: PairResult;
+    out.fired = 0u; out.a = c_a; out.b = c_b;
+    out.valid_aux = 0u; out.aux = c_a; out.aux_kind = 0u;
+    if (sc_updated(c_a) || sc_updated(c_b)) { return out; }
+    // Variant A: a is alloy, b is acid.
+    if (sc_el(c_a) == EL_DERIVED && cm_is_alloy(sc_did(c_a))
+        && sc_el(c_b) == EL_DERIVED && cm_is_acid(sc_did(c_b))) {
+        let alloy_a_el = cm_a_el(sc_did(c_a));
+        let alloy_b_el = cm_b_el(sc_did(c_a));
+        let prof_a = chem_lut[alloy_a_el];
+        let prof_b = chem_lut[alloy_b_el];
+        // Rank by EN: lowest = reactive, highest = leftover.
+        var reactive_el: u32; var reactive_e: f32;
+        var leftover_el: u32;
+        if (prof_a.x < prof_b.x) {
+            reactive_el = alloy_a_el; reactive_e = prof_a.x;
+            leftover_el = alloy_b_el;
+        } else {
+            reactive_el = alloy_b_el; reactive_e = prof_b.x;
+            leftover_el = alloy_a_el;
+        }
+        if (reactive_e <= 0.0 || reactive_e >= 1.88) { return out; }
+        let halogen = cm_metal_or_halogen(sc_did(c_b));
+        let strength = cm_acid_strength(sc_did(c_b));
+        if (strength <= 0.0) { return out; }
+        let metal_reactivity = 2.0 - reactive_e;
+        let rate = min(strength * metal_reactivity * 0.3, 0.4);
+        let r = sc_hash(seed, u.frame);
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+        let salt_id = sc_get_did(reactive_el, halogen);
+        if (salt_id == 0xFFu) { return out; }
+        out.fired = 1u;
+        // Alloy → pure leftover metal at original temp.
+        out.a = make_cell(leftover_el, 0u, sc_temp(c_a), 0u);
+        // Acid → H gas at original temp.
+        out.b = make_h_cell(sc_temp(c_b));
+        // Salt deposit: try to drop it into one of the two other
+        // cells in the block if either is Empty.
+        if (sc_el(c_other_a) == EL_EMPTY) {
+            out.valid_aux = 1u;
+            out.aux = make_cell(EL_DERIVED, salt_id, sc_temp(c_a), 0u);
+            out.aux_kind = other_a_kind;
+        } else if (sc_el(c_other_b) == EL_EMPTY) {
+            out.valid_aux = 1u;
+            out.aux = make_cell(EL_DERIVED, salt_id, sc_temp(c_a), 0u);
+            out.aux_kind = other_b_kind;
+        }
+        return out;
+    }
+    // Variant B: b is alloy, a is acid (mirror).
+    if (sc_el(c_b) == EL_DERIVED && cm_is_alloy(sc_did(c_b))
+        && sc_el(c_a) == EL_DERIVED && cm_is_acid(sc_did(c_a))) {
+        let alloy_a_el = cm_a_el(sc_did(c_b));
+        let alloy_b_el = cm_b_el(sc_did(c_b));
+        let prof_a = chem_lut[alloy_a_el];
+        let prof_b = chem_lut[alloy_b_el];
+        var reactive_el: u32; var reactive_e: f32;
+        var leftover_el: u32;
+        if (prof_a.x < prof_b.x) {
+            reactive_el = alloy_a_el; reactive_e = prof_a.x;
+            leftover_el = alloy_b_el;
+        } else {
+            reactive_el = alloy_b_el; reactive_e = prof_b.x;
+            leftover_el = alloy_a_el;
+        }
+        if (reactive_e <= 0.0 || reactive_e >= 1.88) { return out; }
+        let halogen = cm_metal_or_halogen(sc_did(c_a));
+        let strength = cm_acid_strength(sc_did(c_a));
+        if (strength <= 0.0) { return out; }
+        let metal_reactivity = 2.0 - reactive_e;
+        let rate = min(strength * metal_reactivity * 0.3, 0.4);
+        let r = sc_hash(seed, u.frame ^ 0xDEADBEEFu);
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+        let salt_id = sc_get_did(reactive_el, halogen);
+        if (salt_id == 0xFFu) { return out; }
+        out.fired = 1u;
+        out.a = make_h_cell(sc_temp(c_a));
+        out.b = make_cell(leftover_el, 0u, sc_temp(c_b), 0u);
+        if (sc_el(c_other_a) == EL_EMPTY) {
+            out.valid_aux = 1u;
+            out.aux = make_cell(EL_DERIVED, salt_id, sc_temp(c_b), 0u);
+            out.aux_kind = other_a_kind;
+        } else if (sc_el(c_other_b) == EL_EMPTY) {
+            out.valid_aux = 1u;
+            out.aux = make_cell(EL_DERIVED, salt_id, sc_temp(c_b), 0u);
+            out.aux_kind = other_b_kind;
+        }
+        return out;
+    }
+    return out;
+}
+
+// Dispatch a single pair attempt by mode. The alloy-leach path also
+// needs the "other two" cells of the block in case it produces a salt
+// deposit; pass them in unconditionally for simplicity.
+fn try_pair(
+    mode: u32,
+    c_a: vec4<u32>, c_b: vec4<u32>,
+    c_other_a: vec4<u32>, c_other_b: vec4<u32>,
+    other_a_kind: u32, other_b_kind: u32,
+    seed: u32,
+) -> PairResult {
+    if (mode == 0u) { return try_acid_displacement(c_a, c_b, seed); }
+    if (mode == 1u) { return try_base_neutralization(c_a, c_b, seed); }
+    if (mode == 2u) { return try_alloy_formation(c_a, c_b, seed); }
+    return try_alloy_leach(c_a, c_b, c_other_a, c_other_b,
+                            other_a_kind, other_b_kind, seed);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    let block_seed = by * u.width + bx;
+    var fired = false;
+
+    // Pair (c00, c10): "other" cells are c01, c11.
+    if (!fired) {
+        let r = try_pair(u.mode, c00, c10, c01, c11, 2u, 3u, block_seed);
+        if (r.fired != 0u) {
+            c00 = r.a; c10 = r.b;
+            if (r.valid_aux != 0u) {
+                if (r.aux_kind == 0u) { c00 = r.aux; }
+                else if (r.aux_kind == 1u) { c10 = r.aux; }
+                else if (r.aux_kind == 2u) { c01 = r.aux; }
+                else { c11 = r.aux; }
+            }
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_pair(u.mode, c01, c11, c00, c10, 0u, 1u, block_seed ^ 0xA5A5A5A5u);
+        if (r.fired != 0u) {
+            c01 = r.a; c11 = r.b;
+            if (r.valid_aux != 0u) {
+                if (r.aux_kind == 0u) { c00 = r.aux; }
+                else if (r.aux_kind == 1u) { c10 = r.aux; }
+                else if (r.aux_kind == 2u) { c01 = r.aux; }
+                else { c11 = r.aux; }
+            }
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_pair(u.mode, c00, c01, c10, c11, 1u, 3u, block_seed ^ 0x5A5A5A5Au);
+        if (r.fired != 0u) {
+            c00 = r.a; c01 = r.b;
+            if (r.valid_aux != 0u) {
+                if (r.aux_kind == 0u) { c00 = r.aux; }
+                else if (r.aux_kind == 1u) { c10 = r.aux; }
+                else if (r.aux_kind == 2u) { c01 = r.aux; }
+                else { c11 = r.aux; }
+            }
+            fired = true;
+        }
+    }
+    if (!fired) {
+        let r = try_pair(u.mode, c10, c11, c00, c01, 0u, 2u, block_seed ^ 0xC3C3C3C3u);
+        if (r.fired != 0u) {
+            c10 = r.a; c11 = r.b;
+            if (r.valid_aux != 0u) {
+                if (r.aux_kind == 0u) { c00 = r.aux; }
+                else if (r.aux_kind == 1u) { c10 = r.aux; }
+                else if (r.aux_kind == 2u) { c01 = r.aux; }
+                else { c11 = r.aux; }
+            }
+        }
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct SupportingChemUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    mode: u32,
+    frame: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+/// GPU port of the four supporting chemistry passes:
+///   * acid_displacement   (mode 0)
+///   * base_neutralization (mode 1)
+///   * alloy_formation     (mode 2)
+///   * alloy_acid_leach    (mode 3)
+///
+/// One Margolus 2x2 4-phase compute pipeline; mode is selected via a
+/// per-mode set of pre-baked uniform buffers (4 modes × 4 phases =
+/// 16 uniform buffers / 16 bind groups). The compound-metadata LUT
+/// (acid/basic/alloy flags + halogen/metal id + acid_strength /
+/// basicity) is shared with the chemistry framework.
+struct SupportingChemCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 16],
+    pass_bind_groups: [wgpu::BindGroup; 16],
+}
+
+impl SupportingChemCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        // Reuse the chem LUT (we only care about EN per element).
+        let mut chem_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            chem_data[i] = crate::ui_atom_chem_props(i as u8);
+        }
+        let chem_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-supchem-chem-lut"),
+            contents: bytemuck::cast_slice(&chem_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let pair_data = crate::ui_atom_pair_did_lut();
+        let pair_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-supchem-pair-lut"),
+            contents: bytemuck::cast_slice(&pair_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let alloy_data = crate::ui_atom_pair_alloy_lut();
+        let alloy_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-supchem-alloy-lut"),
+            contents: bytemuck::cast_slice(&alloy_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let meta_data = crate::ui_compound_meta_lut();
+        let meta_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-supchem-meta-lut"),
+            contents: bytemuck::cast_slice(&meta_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // 4 modes × 4 phases = 16 uniform buffers.
+        let mut pass_uniform_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(16);
+        for mode in 0..4u32 {
+            for phase in 0..4u32 {
+                let label = format!("alembic-supchem-u-m{}-p{}", mode, phase);
+                let u = SupportingChemUniforms {
+                    width: W as u32, height: H as u32,
+                    pass_id: phase, mode, frame: 0,
+                    _pad0: 0, _pad1: 0, _pad2: 0,
+                };
+                pass_uniform_bufs.push(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&label),
+                    contents: bytemuck::cast_slice(&[u]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                }));
+            }
+        }
+        let pass_uniform_bufs: [wgpu::Buffer; 16] = pass_uniform_bufs
+            .try_into()
+            .map_err(|_| ())
+            .unwrap();
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-supchem-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let mut groups: Vec<wgpu::BindGroup> = Vec::with_capacity(16);
+        for i in 0..16 {
+            groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("alembic-supchem-bind"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: chem_lut_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: pair_lut_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: alloy_lut_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: meta_lut_buf.as_entire_binding() },
+                ],
+            }));
+        }
+        let pass_bind_groups: [wgpu::BindGroup; 16] = groups.try_into().map_err(|_| ()).unwrap();
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-supchem-shader"),
+            source: wgpu::ShaderSource::Wgsl(SUPPORTING_CHEM_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-supchem-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-supchem-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let _ = chem_lut_buf;
+        let _ = pair_lut_buf;
+        let _ = alloy_lut_buf;
+        let _ = meta_lut_buf;
+        SupportingChemCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        // Update frame on every uniform buffer.
+        for buf in &self.pass_uniform_bufs {
+            queue.write_buffer(buf, 16, bytemuck::cast_slice(&[frame]));
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        // Run modes in macroquad order: acid_disp, alloy_leach,
+        // base_neutral, alloy_form. Each mode = 4 phases.
+        let mode_order: [u32; 4] = [0, 3, 1, 2];
+        for mode in mode_order {
+            for phase in 0..4u32 {
+                let idx = (mode as usize) * 4 + phase as usize;
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("alembic-supchem-cpass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.pipeline);
+                cpass.set_bind_group(0, &self.pass_bind_groups[idx], &[]);
+                cpass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -5197,6 +5808,9 @@ struct GpuState {
     moisture_compute: MoistureCtx,
     /// Emergent chemistry framework — chemical_reactions et al.
     chem_compute: ChemReactionsCtx,
+    /// Supporting chemistry passes — acid_displacement,
+    /// base_neutralization, alloy_formation, alloy_acid_leach.
+    sup_chem_compute: SupportingChemCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -5642,6 +6256,7 @@ impl GpuState {
         let glass_etch_compute = GlassEtchCtx::new(&device, &queue, &cells_buf, sif_derived_id);
         let moisture_compute = MoistureCtx::new(&device, &queue, &cells_buf);
         let chem_compute = ChemReactionsCtx::new(&device, &queue, &cells_buf);
+        let sup_chem_compute = SupportingChemCtx::new(&device, &queue, &cells_buf);
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -5696,6 +6311,7 @@ impl GpuState {
             glass_etch_compute,
             moisture_compute,
             chem_compute,
+            sup_chem_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -7604,10 +8220,10 @@ impl GpuState {
                 // compound-constituent lookups land on GPU. They have
                 // presence early-outs so per-frame cost is minimal
                 // when their inputs aren't in the world.
-                acid_displacement: false,
-                alloy_formation: false,
-                alloy_acid_leach: false,
-                base_neutralization: false,
+                acid_displacement: true,
+                alloy_formation: true,
+                alloy_acid_leach: true,
+                base_neutralization: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
@@ -7686,14 +8302,20 @@ impl GpuState {
             //     evaporation + passive drying. Replaces the moisture
             //     section of CPU `World::thermal_post`.
             self.moisture_compute.encode(&mut encoder, &self.queue, self.frame_counter);
-            // 4h. emergent chemistry — chemical_reactions, plus the
-            //     supporting always-running passes. Margolus 2x2,
-            //     uses the pre-registered atom_pair_did LUT and the
-            //     chem_lut for activation/rate gating.
+            // 4h. emergent chemistry — chemical_reactions. Margolus
+            //     2x2, uses the pre-registered atom_pair_did LUT and
+            //     the chem_lut for activation/rate gating.
             self.chem_compute.encode(
                 &mut encoder, &self.queue, self.frame_counter,
                 self.world.ambient_oxygen,
                 self.world.ambient_offset,
+            );
+            // 4i. supporting chemistry — acid_displacement +
+            //     base_neutralization + alloy_formation +
+            //     alloy_acid_leach. Margolus 2x2 × 4 modes; uses the
+            //     compound_meta LUT for acid/basic/alloy flags.
+            self.sup_chem_compute.encode(
+                &mut encoder, &self.queue, self.frame_counter,
             );
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local

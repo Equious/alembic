@@ -2086,6 +2086,160 @@ pub fn ui_atom_pair_did_lut() -> Vec<[u32; 4]> {
     out
 }
 
+/// Pre-register every (atomic_metal, atomic_metal) alloy pair so the
+/// alloy_formation shader can look up the alloy compound by atom-id
+/// pair without going through `alloy_or_lookup` (which would mutate
+/// the registry mid-frame on GPU). Returns a flat 96×96 byte LUT of
+/// alloy_id (255 = no alloy), packed into vec4<u32> for std140.
+pub fn ui_atom_pair_alloy_lut() -> Vec<[u32; 4]> {
+    let metal_ids: Vec<u8> = ATOMS
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.implemented)
+        .filter_map(|(i, _)| atom_to_element(i))
+        .filter(|&el| is_atomic_metal(el))
+        .map(|el| el as u8)
+        .collect();
+    for &a in &metal_ids {
+        for &b in &metal_ids {
+            if a == b { continue; }
+            let _ = alloy_or_lookup(element_from_u8(a), element_from_u8(b));
+        }
+    }
+    // Build the 96×96 byte LUT, indexing by sorted atomic-number so
+    // (CuFe, FeCu) resolve to the same alloy_id (matches alloy_or_lookup).
+    let mut bytes: Vec<u8> = vec![255u8; 96 * 96];
+    DERIVED_COMPOUNDS.with(|r| {
+        let reg = r.borrow();
+        for (i, c) in reg.iter().enumerate() {
+            if c.constituents.len() != 2 { continue; }
+            let (a_el, a_count) = c.constituents[0];
+            let (b_el, b_count) = c.constituents[1];
+            // Alloys are 1:1 stoichiometry; everything else (HCl, MgCl₂, …)
+            // is filtered out so the alloy LUT only points at real alloys.
+            if a_count != 1 || b_count != 1 { continue; }
+            // Both constituents must be atomic metals.
+            if !is_atomic_metal(a_el) || !is_atomic_metal(b_el) { continue; }
+            let a = a_el as u8 as usize;
+            let b = b_el as u8 as usize;
+            if a < 96 && b < 96 {
+                bytes[a * 96 + b] = i as u8;
+                bytes[b * 96 + a] = i as u8;
+            }
+        }
+    });
+    let mut out: Vec<[u32; 4]> = Vec::with_capacity(96 * 96 / 16);
+    for chunk in bytes.chunks(16) {
+        let mut q = [0u32; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            let lane = i / 4;
+            let byte_in_lane = i % 4;
+            q[lane] |= (b as u32) << (byte_in_lane * 8);
+        }
+        out.push(q);
+    }
+    out
+}
+
+/// Per-derived-compound metadata packed for the supporting chemistry
+/// passes. One vec4<u32> per slot, indexed by derived_id (0..256).
+///
+/// Layout:
+///   x = a_el | a_count<<8 | b_el<<16 | b_count<<24
+///   y = is_acid (0/1) | is_basic_oxide (0/1)<<8 | is_alloy (0/1)<<16
+///       | metal_or_halogen_el<<24
+///   z = acid_strength as f32 (bitcast to u32)
+///   w = basicity as f32 (bitcast to u32)
+///
+/// `metal_or_halogen_el` is the halogen end of an acid (Cl, F) or the
+/// metal end of a basic oxide; 0 when neither flag is set.
+pub fn ui_compound_meta_lut() -> Vec<[u32; 4]> {
+    let mut out = vec![[0u32; 4]; 256];
+    DERIVED_COMPOUNDS.with(|r| {
+        let reg = r.borrow();
+        for (i, c) in reg.iter().enumerate() {
+            if i >= 256 { break; }
+            let (a_el, a_count) = c.constituents.first().copied()
+                .unwrap_or((Element::Empty, 0));
+            let (b_el, b_count) = c.constituents.get(1).copied()
+                .unwrap_or((Element::Empty, 0));
+            let x = (a_el as u32 & 0xFF)
+                | ((a_count as u32 & 0xFF) << 8)
+                | ((b_el as u32 & 0xFF) << 16)
+                | ((b_count as u32 & 0xFF) << 24);
+
+            // is_acid: H + halogen (F/Cl). Strength = (halogen EN - 2.20).
+            let mut is_acid = 0u32;
+            let mut acid_strength = 0.0f32;
+            let mut halogen_el: u8 = 0;
+            if c.constituents.len() >= 2
+                && a_el == Element::H
+                && matches!(b_el, Element::F | Element::Cl)
+            {
+                is_acid = 1;
+                if let Some(p) = atom_profile_for(b_el) {
+                    acid_strength = (p.electronegativity - 2.20).max(0.0);
+                }
+                halogen_el = b_el as u8;
+            }
+
+            // is_basic_oxide: metal + O. Basicity = (1.5 - metal EN) clamped >=0.
+            // Faithful port of basic_oxide_signature semantics.
+            let mut is_basic_oxide = 0u32;
+            let mut basicity = 0.0f32;
+            let mut metal_el: u8 = 0;
+            if c.constituents.len() >= 2 {
+                let (oxide_metal, _o_check) = if b_el == Element::O {
+                    (a_el, b_el)
+                } else if a_el == Element::O {
+                    (b_el, a_el)
+                } else {
+                    (Element::Empty, Element::Empty)
+                };
+                if oxide_metal != Element::Empty
+                    && is_atomic_metal(oxide_metal)
+                {
+                    if let Some(p) = atom_profile_for(oxide_metal) {
+                        let b = (1.5 - p.electronegativity).max(0.0);
+                        if b > 0.0 {
+                            is_basic_oxide = 1;
+                            basicity = b;
+                            metal_el = oxide_metal as u8;
+                        }
+                    }
+                }
+            }
+
+            // is_alloy: 1:1 stoichiometry, both atomic metals.
+            let mut is_alloy = 0u32;
+            if a_count == 1 && b_count == 1
+                && is_atomic_metal(a_el) && is_atomic_metal(b_el)
+            {
+                is_alloy = 1;
+            }
+
+            // Choose what to encode in metal_or_halogen_el slot.
+            // Acid → halogen; basic oxide → metal; otherwise 0.
+            let encoded_el: u32 = if is_acid != 0 {
+                halogen_el as u32
+            } else if is_basic_oxide != 0 {
+                metal_el as u32
+            } else {
+                0
+            };
+
+            let y = is_acid
+                | (is_basic_oxide << 8)
+                | (is_alloy << 16)
+                | (encoded_el << 24);
+            let z = acid_strength.to_bits();
+            let w = basicity.to_bits();
+            out[i] = [x, y, z, w];
+        }
+    });
+    out
+}
+
 /// Element-id constants the chemistry shader needs as bespoke
 /// product targets. Returns `[Water, Salt, Rust, CO2, H, Steam,
 /// Derived, Empty]` packed into a single `[u32; 8]` (vec4 × 2). The
