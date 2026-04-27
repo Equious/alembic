@@ -4323,6 +4323,10 @@ struct GpuState {
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
     prof_frame_count: u32,
+    /// Most recently computed FPS (last completed 1-second window).
+    /// Used by the side-panel FPS readout. 0 until the first window
+    /// closes.
+    last_fps: u32,
     prof_sim_us: u64,
     prof_compute_us: u64,
     prof_render_us: u64,
@@ -4793,6 +4797,7 @@ impl GpuState {
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
+            last_fps: 0,
             prof_sim_us: 0,
             prof_compute_us: 0,
             prof_render_us: 0,
@@ -5122,10 +5127,24 @@ impl GpuState {
                 // 14pt centered label.
                 Self::style_panel(ui, btn_normal, btn_hover, btn_border);
 
-                // ---- TOOLS section ----
-                ui.label(
-                    egui::RichText::new("TOOLS").color(section_header).size(11.0),
-                );
+                // ---- TOOLS section + PAUSED indicator ----
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("TOOLS").color(section_header).size(11.0),
+                    );
+                    if self.paused {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new("PAUSED")
+                                        .color(egui::Color32::YELLOW)
+                                        .size(11.0),
+                                );
+                            },
+                        );
+                    }
+                });
                 ui.add_space(8.0);
 
                 // Tool buttons (Paint / Heat / Vacuum / Pipet) at fixed 30px
@@ -5181,9 +5200,14 @@ impl GpuState {
                     self.build_mode = !self.build_mode;
                 }
 
-                // ---- Element readout ----
+                // ---- Element readout — `<name>   B<radius>` matches
+                // macroquad panel_element_rect layout.
                 ui.add_space(14.0);
-                let sel_name = crate::ui_element_name(self.selected);
+                let sel_name = if self.selected == Element::Derived {
+                    crate::derived_formula_of(self.selected_did)
+                } else {
+                    crate::ui_element_name(self.selected).to_string()
+                };
                 let (sr, sg, sb) = self.selected.base_color();
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(
@@ -5196,8 +5220,8 @@ impl GpuState {
                         egui::Color32::from_rgb(sr, sg, sb),
                     );
                     ui.label(
-                        egui::RichText::new(format!("Element: {}", sel_name))
-                            .color(value_color)
+                        egui::RichText::new(format!("{}   B{}", sel_name, self.brush_radius))
+                            .color(egui::Color32::from_rgb(200, 200, 220))
                             .size(13.0),
                     );
                 });
@@ -5208,20 +5232,6 @@ impl GpuState {
                     egui::RichText::new("SIMULATION").color(section_header).size(11.0),
                 );
                 ui.add_space(4.0);
-
-                // Brush radius row — readout matches the rest of the
-                // panel; user adjusts it via mouse-wheel scroll over
-                // the sim.
-                let brush_delta = Self::ambient_row(
-                    ui, "Brush",
-                    &format!("{}", self.brush_radius),
-                    dim_label, value_color,
-                );
-                if brush_delta > 0.5 {
-                    self.brush_radius = (self.brush_radius + 1).min(30);
-                } else if brush_delta < -0.5 {
-                    self.brush_radius = (self.brush_radius - 1).max(1);
-                }
 
                 let shift_held = ctx.input(|i| i.modifiers.shift);
 
@@ -5375,8 +5385,23 @@ impl GpuState {
                         .color(dim_label).size(11.0),
                 );
                 ui.label(
-                    egui::RichText::new("Space — pause   |   C — clear")
+                    egui::RichText::new("Space pause  |  C clear  |  U hide panel")
                         .color(dim_label).size(11.0),
+                );
+
+                // FPS readout at the very bottom — right-aligned with
+                // a small margin so digit-width changes don't reflow
+                // anything above. Mirrors the macroquad bottom FPS.
+                ui.with_layout(
+                    egui::Layout::bottom_up(egui::Align::Max),
+                    |ui| {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!("{} fps", self.last_fps))
+                                .color(egui::Color32::from_rgb(140, 140, 160))
+                                .size(12.0),
+                        );
+                    },
                 );
             });
 
@@ -6490,6 +6515,7 @@ impl GpuState {
                 (self.prof_compute_us as f32 / f) / 1000.0,
                 (self.prof_render_us as f32 / f) / 1000.0,
             );
+            self.last_fps = self.prof_frame_count;
             self.prof_frame_count = 0;
             self.prof_sim_us = 0;
             self.prof_compute_us = 0;
