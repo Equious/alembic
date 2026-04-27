@@ -6182,6 +6182,296 @@ impl JouleHeatingCtx {
     }
 }
 
+const DECAY_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    frame: u32,
+    has_u: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element decay LUT. Layout per slot:
+//   x = half_life_frames (0 → not radioactive)
+//   y = decay_heat
+//   z = decay_product element id
+//   w = is_radioactive (1.0 / 0.0)
+@group(0) @binding(2) var<uniform> decay_lut: array<vec4<f32>, 96>;
+// Connected-component size for each U cell. CPU computes this in
+// `compute_u_components` once per frame and uploads when uranium
+// is present (cleared otherwise).
+@group(0) @binding(3) var<storage, read> u_component_size: array<u32>;
+
+const EL_U: u32 = 38u;
+const EL_PB: u32 = 51u;
+const EL_B: u32 = 52u;
+const FLAG_FROZEN: u32 = 0x02u;
+const PHASE_MASK: u32 = 0x0Cu;
+const CRITICAL_MASS: f32 = 5000.0;
+const LN2: f32 = 0.6931472;
+
+fn d_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn d_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn d_set_temp(c: vec4<u32>, t: i32) -> vec4<u32> {
+    let clamped = clamp(t, -273, 5000);
+    let raw = u32(clamped) & 0xFFFFu;
+    let lo_y = c.y & 0xFFFFu;
+    return vec4<u32>(c.x, lo_y | (raw << 16u), c.z, c.w);
+}
+fn d_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn d_phase_bits(c: vec4<u32>) -> u32 { return d_flag(c) & PHASE_MASK; }
+fn d_frozen(c: vec4<u32>) -> bool { return (d_flag(c) & FLAG_FROZEN) != 0u; }
+
+fn d_hash(a: u32, b: u32, salt: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= salt * 374761393u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+fn d_rand01(seed: u32) -> f32 {
+    return f32(seed & 0xFFFFFFu) / 16777216.0;
+}
+
+// Criticality multiplier — mirrors the U branch in `World::decay`.
+// Reads u_component_size for the cell; runs a 7×7 Pb/B absorber scan
+// only when base > 1500. Non-U cells get multiplier = 1.0 (called
+// only for U here).
+fn u_multiplier(x: i32, y: i32, idx: u32) -> f32 {
+    let base = f32(u_component_size[idx]);
+    var absorb_penalty = 0.0;
+    if (base > 1500.0) {
+        var pb_count = 0.0;
+        var b_count = 0.0;
+        for (var dy: i32 = -3; dy <= 3; dy = dy + 1) {
+            for (var dx: i32 = -3; dx <= 3; dx = dx + 1) {
+                if (dx == 0 && dy == 0) { continue; }
+                let nx = x + dx;
+                let ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= i32(u.width) || ny >= i32(u.height)) { continue; }
+                let nidx = u32(ny) * u.width + u32(nx);
+                let nel = d_el(cells[nidx]);
+                if (nel == EL_PB) { pb_count = pb_count + 1.0; }
+                else if (nel == EL_B) { b_count = b_count + 1.0; }
+            }
+        }
+        absorb_penalty = pb_count * 20.0 + b_count * 100.0;
+    }
+    let eff = max(base - absorb_penalty, 0.0);
+    return 1.0 + (eff / CRITICAL_MASS) * 9.0;
+}
+
+// Faithful per-cell port of `World::decay`'s tail loop:
+//   * compute multiplier (U: component-size + absorber scan; else 1)
+//   * trickle heat with stochastic round
+//   * alpha-decay transmutation: prob = (ln2 / half_life) × multiplier
+//
+// CPU still owns: compute_u_components (the flood fill that fills the
+// u_component_size buffer), central blast spawning, u_burst_committed
+// marking, fission flash (3×3 heat + shockwave) and prompt-fission
+// burst (3×3 heat + transmute + shockwave). Those need shockwave-
+// queue access and component-graph state. The 4-cardinal heat write
+// from a transmutation event is intentionally skipped here because
+// adjacent threads transmuting on the same frame would race on the
+// shared neighbor; events are rare (worst case U pile ~5000 cells ×
+// p≈4.6e-6/frame = 0.023 events/frame), so visual divergence is
+// negligible.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let x = gid.x;
+    let y = gid.y;
+    if (x >= u.width || y >= u.height) { return; }
+    let i = y * u.width + x;
+    var c = cells[i];
+    let el = d_el(c);
+    let lut = decay_lut[el];
+    if (lut.w < 0.5) { return; }
+    let half_life = lut.x;
+    let decay_heat = lut.y;
+    let product_el = u32(lut.z);
+    if (half_life <= 0.0) { return; }
+
+    var multiplier: f32 = 1.0;
+    if (el == EL_U && u.has_u != 0u) {
+        multiplier = u_multiplier(i32(x), i32(y), i);
+    }
+
+    // Trickle. Stochastic round so sub-1 deltas accumulate over time.
+    let trickle = decay_heat * 0.0002 * multiplier;
+    let cur_temp = d_temp(c);
+    let temp_f = f32(cur_temp) + trickle;
+    let floor_v = floor(temp_f);
+    let frac = temp_f - floor_v;
+    let r1 = d_hash(i, u.frame, 0xA5A5A5A5u);
+    let roll1 = d_rand01(r1);
+    let stepped = select(floor_v, floor_v + 1.0, roll1 < frac);
+    c = d_set_temp(c, i32(clamp(stepped, -273.0, 5000.0)));
+
+    // Alpha-decay transmutation.
+    let p = (LN2 / half_life) * multiplier;
+    let r2 = d_hash(i, u.frame, 0x5A5A5A5Au);
+    let roll2 = d_rand01(r2);
+    if (roll2 >= p) {
+        cells[i] = c;
+        return;
+    }
+
+    let event_heat_f = decay_heat * multiplier;
+    let event_heat = i32(min(event_heat_f, 2000.0));
+    let new_temp = clamp(cur_temp + event_heat, -273, 5000);
+    let old_phase = d_phase_bits(c);
+    let old_frozen = d_frozen(c);
+    var new_flag = old_phase;
+    if (old_frozen) { new_flag = new_flag | FLAG_FROZEN; }
+
+    // Build product cell. Mirror `Cell::new(product)`: life=0 (Pb is
+    // non-ephemeral; U/Ra both decay to Pb), seed=hash, defaults
+    // zeroed for moisture/burn/pressure/solute. Temp is overridden
+    // with cur_temp + event_heat.
+    let seed = (d_hash(i, u.frame, 0xC3C3C3C3u) & 0xFFu);
+    let new_x = (product_el & 0xFFu);
+    let new_y = seed
+              | (new_flag << 8u)
+              | ((u32(new_temp) & 0xFFFFu) << 16u);
+    let new_z = 0u;
+    let new_w = 0u;
+    cells[i] = vec4<u32>(new_x, new_y, new_z, new_w);
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct DecayUniforms {
+    width: u32,
+    height: u32,
+    frame: u32,
+    has_u: u32,
+}
+
+/// GPU port of the per-cell tail of `World::decay` — trickle heat +
+/// alpha-decay transmutation for every radioactive cell. CPU keeps
+/// `compute_u_components`, central-blast shockwaves, U-burst
+/// commitment, fission flashes, and prompt-fission bursts (those
+/// need the shockwave queue and component-graph state). The
+/// per-frame `u_component_size` buffer is uploaded only when the
+/// world has uranium.
+struct DecayCtx {
+    pipeline: wgpu::ComputePipeline,
+    uniform_buf: wgpu::Buffer,
+    component_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    component_staging: Vec<u32>,
+}
+
+impl DecayCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mut decay_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            decay_data[i] = crate::ui_decay_props(i as u8);
+        }
+        let decay_lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-decay-lut"),
+            contents: bytemuck::cast_slice(&decay_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let uniforms = DecayUniforms {
+            width: W as u32, height: H as u32, frame: 0, has_u: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-decay-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let component_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-decay-u-component-size"),
+            size: (W * H * std::mem::size_of::<u32>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-decay-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-decay-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: decay_lut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: component_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-decay-shader"),
+            source: wgpu::ShaderSource::Wgsl(DECAY_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-decay-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-decay-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let _ = decay_lut_buf;
+        DecayCtx {
+            pipeline,
+            uniform_buf,
+            component_buf,
+            bind_group,
+            component_staging: vec![0u32; W * H],
+        }
+    }
+
+    /// Upload the latest `u_component_size` snapshot from CPU. Called
+    /// only when uranium is present in the world; the GPU shader
+    /// consults `has_u` to gate the per-cell read.
+    fn upload(&mut self, queue: &wgpu::Queue, sizes: &[u16], has_u: bool, frame: u32) {
+        if has_u {
+            for (i, &v) in sizes.iter().enumerate() {
+                self.component_staging[i] = v as u32;
+            }
+            queue.write_buffer(&self.component_buf, 0, bytemuck::cast_slice(&self.component_staging));
+        }
+        let has_u_u = if has_u { 1u32 } else { 0u32 };
+        queue.write_buffer(&self.uniform_buf, 8, bytemuck::cast_slice(&[frame]));
+        queue.write_buffer(&self.uniform_buf, 12, bytemuck::cast_slice(&[has_u_u]));
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-decay-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -7559,6 +7849,11 @@ struct GpuState {
     /// `energized` mask. compute_energized still runs on CPU and
     /// uploads the mask each frame.
     joule_compute: JouleHeatingCtx,
+    /// Per-cell radioactive trickle + alpha-decay transmutation.
+    /// CPU still does compute_u_components, central blast, fission
+    /// flash, prompt-fission burst (those need shockwave queue +
+    /// component-graph state).
+    decay_compute: DecayCtx,
     /// GPU paint kernel — Paint-mode brush mutates cells_buf directly
     /// instead of going through world.cells + 17 MB upload.
     paint_compute: PaintCtx,
@@ -8028,6 +8323,7 @@ impl GpuState {
         let burn_compute = BurnCyclesCtx::new(&device, &queue, &cells_buf);
         let pshove_compute = PressureShoveCtx::new(&device, &queue, &cells_buf);
         let joule_compute = JouleHeatingCtx::new(&device, &queue, &cells_buf);
+        let decay_compute = DecayCtx::new(&device, &queue, &cells_buf);
         let paint_compute = PaintCtx::new(&device, &queue, &cells_buf);
         let cell_bytes = (W * H * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
         let fresh_sync_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -8094,6 +8390,7 @@ impl GpuState {
             burn_compute,
             pshove_compute,
             joule_compute,
+            decay_compute,
             paint_compute,
             fresh_sync_buf,
             last_frame_did_readback: false,
@@ -10194,6 +10491,7 @@ impl GpuState {
                 thermite: true,
                 magnesium_burn: true,
                 joule_heating: true,
+                decay_per_cell: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
@@ -10328,6 +10626,21 @@ impl GpuState {
                 self.frame_counter,
             );
             self.joule_compute.encode(&mut encoder);
+            // 6d. Decay — per-cell trickle + alpha-decay transmutation
+            //     for every radioactive cell. Skips when no
+            //     radioactive atoms are in the world (sticky session
+            //     flag). When U is present, CPU's `decay()` has just
+            //     populated `world.u_component_size` for the
+            //     criticality multiplier read here.
+            if self.session_has_radioactive {
+                self.decay_compute.upload(
+                    &self.queue,
+                    &self.world.u_component_size,
+                    self.world.has_u_now,
+                    self.frame_counter,
+                );
+                self.decay_compute.encode(&mut encoder);
+            }
             // 7. Motion: 5 passes (vfall, lspread-even/odd, dslide-even/odd).
             self.motion_compute.encode(
                 &mut encoder, &self.queue, self.frame_counter,

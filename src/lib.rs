@@ -628,6 +628,26 @@ pub fn ui_atom_phase_points(id: u8) -> [f32; 4] {
     [0.0, 0.0, 0.0, 0.0]
 }
 
+/// Per-element decay data for the GPU per-cell decay shader.
+/// Layout: `[half_life_frames, decay_heat, decay_product_el, is_radioactive]`
+/// All packed as f32 for uniform buffer compatibility. half_life_frames
+/// is the raw frame count; decay_product_el is the Element id; the
+/// is_radioactive flag is 1.0 when half_life > 0, 0.0 otherwise.
+pub fn ui_decay_props(id: u8) -> [f32; 4] {
+    let el = element_from_u8(id);
+    if let Some(a) = atom_profile_for(el) {
+        if a.half_life_frames > 0 {
+            return [
+                a.half_life_frames as f32,
+                a.decay_heat as f32,
+                a.decay_product as u8 as f32,
+                1.0,
+            ];
+        }
+    }
+    [0.0, 0.0, 0.0, 0.0]
+}
+
 /// Per-element radioactive activity for the GPU render shader's
 /// cyan-green pulse tint. Returns 0.0 for stable elements, otherwise
 /// `(30000.0 / half_life_frames).clamp(0.35, 1.0)` — same curve the
@@ -3466,6 +3486,10 @@ pub struct World {
     pub u_component_cx: Vec<i16>,
     pub u_component_cy: Vec<i16>,
     pub u_central_blast_fired: Vec<bool>,
+    /// True after `decay()` ran this frame and detected uranium.
+    /// Used by the wgpu binary to gate the U-component-size upload
+    /// to GPU + the criticality-multiplier branch in the shader.
+    pub has_u_now: bool,
     pub frame: u32,
     pub ambient_offset: i16,
     pub gravity: f32,
@@ -3524,6 +3548,7 @@ impl World {
             u_component_cx: vec![0; W * H],
             u_component_cy: vec![0; W * H],
             u_central_blast_fired: vec![false; W * H],
+            has_u_now: false,
             frame: 0,
             ambient_offset: 0,
             gravity: 1.0,
@@ -4014,7 +4039,7 @@ impl World {
         }
     }
 
-    fn decay(&mut self) {
+    fn decay(&mut self, gpu_per_cell: bool) {
         // Early-exit when there's no U in the world. Decay's heavy work
         // (component flood-fill, critical-mass scans, per-cell radioactive
         // ticks) is all gated on Element::U presence. Cheap O(W*H) scan
@@ -4032,6 +4057,7 @@ impl World {
             if c.el == Element::U { has_u = true; has_radioactive = true; break; }
             if c.el == Element::Ra { has_radioactive = true; }
         }
+        self.has_u_now = has_u;
         if !has_radioactive { return; }
         if has_u { self.compute_u_components(); }
         // Clear stale commit flags from previous frames: any cell that
@@ -4150,13 +4176,16 @@ impl World {
             };
             // Continuous trickle heat from bulk alpha emission. Scales
             // with the multiplier so near-critical piles warm faster.
-            let trickle = (a.decay_heat as f32) * 0.0002 * multiplier;
-            let exact = c.temp as f32 + trickle;
-            let floor = exact.floor();
-            let frac = exact - floor;
-            let roll = rand::gen_range::<f32>(0.0, 1.0);
-            let stepped = if roll < frac { floor + 1.0 } else { floor };
-            self.cells[i].temp = stepped.clamp(-273.0, 5000.0) as i16;
+            // Skipped on CPU when the GPU is running per-cell decay.
+            if !gpu_per_cell {
+                let trickle = (a.decay_heat as f32) * 0.0002 * multiplier;
+                let exact = c.temp as f32 + trickle;
+                let floor = exact.floor();
+                let frac = exact - floor;
+                let roll = rand::gen_range::<f32>(0.0, 1.0);
+                let stepped = if roll < frac { floor + 1.0 } else { floor };
+                self.cells[i].temp = stepped.clamp(-273.0, 5000.0) as i16;
+            }
             // Sub-atomic fission flash. Separate from the slow U→Pb
             // transmutation below — represents visible fission activity
             // (neutrons crashing, alpha tracks) that intensifies rapidly
@@ -4242,24 +4271,32 @@ impl World {
             // scales with the criticality multiplier, so mid-range piles
             // pop visibly, larger piles pop frantically. Each event
             // emits a small shockwave — the transmutation IS the pop.
+            //
+            // When the GPU is running per-cell decay, the transmutation
+            // proper happens in the WGSL pass; CPU still emits the
+            // event-paired shockwave for U cells (the GPU shader has
+            // no shockwave queue), so we still need the random roll
+            // here using the same per-cell rate as the GPU.
             let p = (ln2 / (a.half_life_frames as f32)) * multiplier;
             if rand::gen_range::<f32>(0.0, 1.0) >= p { continue; }
-            let product = a.decay_product;
-            let event_heat = ((a.decay_heat as f32) * multiplier).min(2000.0) as i32;
-            let old_frozen = c.is_frozen();
-            let old_phase = c.phase();
-            let mut d = Cell::new(product);
-            d.temp = (c.temp as i32 + event_heat).clamp(-273, 5000) as i16;
-            if old_frozen { d.flag |= Cell::FLAG_FROZEN; }
-            d.set_phase(old_phase);
-            self.cells[i] = d;
-            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = x + dx;
-                let ny = y + dy;
-                if !Self::in_bounds(nx, ny) { continue; }
-                let ni = Self::idx(nx, ny);
-                let t = self.cells[ni].temp as i32 + event_heat / 2;
-                self.cells[ni].temp = t.clamp(-273, 5000) as i16;
+            if !gpu_per_cell {
+                let product = a.decay_product;
+                let event_heat = ((a.decay_heat as f32) * multiplier).min(2000.0) as i32;
+                let old_frozen = c.is_frozen();
+                let old_phase = c.phase();
+                let mut d = Cell::new(product);
+                d.temp = (c.temp as i32 + event_heat).clamp(-273, 5000) as i16;
+                if old_frozen { d.flag |= Cell::FLAG_FROZEN; }
+                d.set_phase(old_phase);
+                self.cells[i] = d;
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if !Self::in_bounds(nx, ny) { continue; }
+                    let ni = Self::idx(nx, ny);
+                    let t = self.cells[ni].temp as i32 + event_heat / 2;
+                    self.cells[ni].temp = t.clamp(-273, 5000) as i16;
+                }
             }
             // Shockwave per transmutation — the visible pop that
             // signals a single atom just fissioned. Yield scales with
@@ -4470,6 +4507,18 @@ impl World {
         self.active_emf = 0.0;
         self.galvanic_cathode_el = None;
         self.galvanic_anode_el = None;
+        // Cheap early-exit. Without a battery AND without any atomic
+        // metal in the world, no circuit is possible: galvanic
+        // detection scans candidates that are atomic metals on brine,
+        // and battery flooding seeds from BattPos/BattNeg cells. If
+        // none of those exist, every flood below is empty work over
+        // the full W*H grid (~2 ms idle cost on big worlds). Skip it.
+        let has_battery = self.present_elements[Element::BattPos as usize]
+            || self.present_elements[Element::BattNeg as usize];
+        let has_any_metal = (0..ELEMENT_COUNT).any(|i| {
+            self.present_elements[i] && is_atomic_metal(element_from_u8(i as u8))
+        });
+        if !has_battery && !has_any_metal { return; }
         // Seed lists.
         let mut pos_seeds: Vec<(i32, i32)> = Vec::new();
         let mut neg_seeds: Vec<(i32, i32)> = Vec::new();
@@ -4805,6 +4854,10 @@ pub struct GpuChem {
     pub thermite: bool,
     pub magnesium_burn: bool,
     pub joule_heating: bool,
+    /// True when the GPU runs per-cell radioactive trickle heat +
+    /// transmutation. The U-criticality / central blast / fission
+    /// flash logic stays on CPU since it needs component-graph state.
+    pub decay_per_cell: bool,
 }
 
 impl World {
@@ -4913,7 +4966,7 @@ impl World {
             self.joule_heating();    mark!("joule");
         }
         self.electrolysis();         mark!("electrolysis");
-        self.decay();                mark!("decay");
+        self.decay(gpu_chem.decay_per_cell); mark!("decay");
         if !gpu_chem.tree_support {
             self.tree_support_check(); mark!("tree_support");
         }
@@ -6015,7 +6068,7 @@ impl World {
         self.compute_energized();    mark!("energized");
         self.joule_heating();        mark!("joule");
         self.electrolysis();         mark!("electrolysis");
-        self.decay();                mark!("decay");
+        self.decay(false);           mark!("decay");
         self.tree_support_check();   mark!("tree_support");
         self.thermite();             mark!("thermite");
         self.magnesium_burn();       mark!("mg_burn");
