@@ -4216,6 +4216,102 @@ fn try_alloy_leach(c_a: vec4<u32>, c_b: vec4<u32>,
     return out;
 }
 
+// MODE 4 — halogen_displacement. F + Salt or F + Derived metal-chloride
+// → metal-F + Cl gas. Element ids: F=23, Cl=31, Salt=40 (NaCl), Na=25.
+fn try_halogen_displacement(c_a: vec4<u32>, c_b: vec4<u32>, seed: u32) -> PairResult {
+    var out: PairResult;
+    out.fired = 0u; out.a = c_a; out.b = c_b;
+    out.valid_aux = 0u; out.aux = c_a; out.aux_kind = 0u;
+    if (sc_updated(c_a) || sc_updated(c_b)) { return out; }
+
+    // Identify which is F and which is the chloride.
+    var f_cell: vec4<u32>; var ch_cell: vec4<u32>;
+    var f_is_a: bool;
+    if (sc_el(c_a) == 23u) { f_cell = c_a; ch_cell = c_b; f_is_a = true; }
+    else if (sc_el(c_b) == 23u) { f_cell = c_b; ch_cell = c_a; f_is_a = false; }
+    else { return out; }
+
+    // Identify the metal in the chloride.
+    var metal_el: u32;
+    let ch_el = sc_el(ch_cell);
+    if (ch_el == 40u) {
+        metal_el = 25u;  // Salt → Na
+    } else if (ch_el == EL_DERIVED) {
+        let did = sc_did(ch_cell);
+        let a_el = cm_a_el(did);
+        let b_el = cm_b_el(did);
+        if (a_el == 31u) { metal_el = b_el; }
+        else if (b_el == 31u) { metal_el = a_el; }
+        else { return out; }
+    } else {
+        return out;
+    }
+    if (!is_atomic_metal(metal_el)) { return out; }
+
+    let rate = 0.30;
+    let r = sc_hash(seed, u.frame);
+    if (f_is_a == false) {
+        // Use a different bit pattern so the two orderings don't
+        // synchronize their RNG and double-fire.
+        let r2 = sc_hash(seed, u.frame ^ 0xDEADBEEFu);
+        if (f32(r2 & 0xFFFFu) / 65536.0 > rate) { return out; }
+    } else {
+        if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+    }
+
+    let fluoride_id = sc_get_did(metal_el, 23u);
+    if (fluoride_id == 0xFFu) { return out; }
+
+    let t_f = sc_temp(f_cell);
+    let t_ch = sc_temp(ch_cell);
+    let dt: i32 = 200;
+    let new_fluoride = make_cell(EL_DERIVED, fluoride_id, min(t_ch + dt, 5000), 0u);
+    let new_cl = make_cell(31u, 0u, min(t_f + dt, 5000), 0u);
+    out.fired = 1u;
+    if (f_is_a) { out.a = new_cl; out.b = new_fluoride; }
+    else { out.a = new_fluoride; out.b = new_cl; }
+    return out;
+}
+
+// MODE 5 — hg_amalgamation. Hg + atomic metal (not Fe/Ni) → both
+// become amalgam (Derived alloy). Element ids: Hg=37, Fe=34, Ni=50.
+fn try_hg_amalgamation(c_a: vec4<u32>, c_b: vec4<u32>, seed: u32) -> PairResult {
+    var out: PairResult;
+    out.fired = 0u; out.a = c_a; out.b = c_b;
+    out.valid_aux = 0u; out.aux = c_a; out.aux_kind = 0u;
+    if (sc_updated(c_a) || sc_updated(c_b)) { return out; }
+
+    var hg_cell: vec4<u32>; var metal_cell: vec4<u32>;
+    var hg_is_a: bool;
+    if (sc_el(c_a) == 37u && sc_el(c_b) != 37u) {
+        hg_cell = c_a; metal_cell = c_b; hg_is_a = true;
+    } else if (sc_el(c_b) == 37u && sc_el(c_a) != 37u) {
+        hg_cell = c_b; metal_cell = c_a; hg_is_a = false;
+    } else {
+        return out;
+    }
+
+    let met_el = sc_el(metal_cell);
+    if (!is_atomic_metal(met_el)) { return out; }
+    // Skip ferromagnetic metals — Hg beads up on Fe/Ni.
+    if (met_el == 34u || met_el == 50u) { return out; }
+
+    let alloy_id = sc_get_alloy(37u, met_el);
+    if (alloy_id == 0xFFu) { return out; }
+
+    let r_seed = select(u.frame ^ 0xDEADBEEFu, u.frame, hg_is_a);
+    let r = sc_hash(seed, r_seed);
+    let rate = 0.05;
+    if (f32(r & 0xFFFFu) / 65536.0 > rate) { return out; }
+
+    let amalgam_a = make_cell(EL_DERIVED, alloy_id, sc_temp(c_a), PHASE_LIQUID);
+    let amalgam_b = make_cell(EL_DERIVED, alloy_id, sc_temp(c_b), PHASE_LIQUID);
+    out.fired = 1u;
+    out.a = amalgam_a;
+    out.b = amalgam_b;
+    return out;
+}
+
 // Dispatch a single pair attempt by mode. The alloy-leach path also
 // needs the "other two" cells of the block in case it produces a salt
 // deposit; pass them in unconditionally for simplicity.
@@ -4229,8 +4325,12 @@ fn try_pair(
     if (mode == 0u) { return try_acid_displacement(c_a, c_b, seed); }
     if (mode == 1u) { return try_base_neutralization(c_a, c_b, seed); }
     if (mode == 2u) { return try_alloy_formation(c_a, c_b, seed); }
-    return try_alloy_leach(c_a, c_b, c_other_a, c_other_b,
-                            other_a_kind, other_b_kind, seed);
+    if (mode == 3u) {
+        return try_alloy_leach(c_a, c_b, c_other_a, c_other_b,
+                                other_a_kind, other_b_kind, seed);
+    }
+    if (mode == 4u) { return try_halogen_displacement(c_a, c_b, seed); }
+    return try_hg_amalgamation(c_a, c_b, seed);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -4340,8 +4440,8 @@ struct SupportingChemUniforms {
 /// basicity) is shared with the chemistry framework.
 struct SupportingChemCtx {
     pipeline: wgpu::ComputePipeline,
-    pass_uniform_bufs: [wgpu::Buffer; 16],
-    pass_bind_groups: [wgpu::BindGroup; 16],
+    pass_uniform_bufs: [wgpu::Buffer; 24],
+    pass_bind_groups: [wgpu::BindGroup; 24],
 }
 
 impl SupportingChemCtx {
@@ -4375,9 +4475,9 @@ impl SupportingChemCtx {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // 4 modes × 4 phases = 16 uniform buffers.
-        let mut pass_uniform_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(16);
-        for mode in 0..4u32 {
+        // 6 modes × 4 phases = 24 uniform buffers.
+        let mut pass_uniform_bufs: Vec<wgpu::Buffer> = Vec::with_capacity(24);
+        for mode in 0..6u32 {
             for phase in 0..4u32 {
                 let label = format!("alembic-supchem-u-m{}-p{}", mode, phase);
                 let u = SupportingChemUniforms {
@@ -4392,7 +4492,7 @@ impl SupportingChemCtx {
                 }));
             }
         }
-        let pass_uniform_bufs: [wgpu::Buffer; 16] = pass_uniform_bufs
+        let pass_uniform_bufs: [wgpu::Buffer; 24] = pass_uniform_bufs
             .try_into()
             .map_err(|_| ())
             .unwrap();
@@ -4414,8 +4514,8 @@ impl SupportingChemCtx {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
-        let mut groups: Vec<wgpu::BindGroup> = Vec::with_capacity(16);
-        for i in 0..16 {
+        let mut groups: Vec<wgpu::BindGroup> = Vec::with_capacity(24);
+        for i in 0..24 {
             groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("alembic-supchem-bind"),
                 layout: &bgl,
@@ -4429,7 +4529,7 @@ impl SupportingChemCtx {
                 ],
             }));
         }
-        let pass_bind_groups: [wgpu::BindGroup; 16] = groups.try_into().map_err(|_| ()).unwrap();
+        let pass_bind_groups: [wgpu::BindGroup; 24] = groups.try_into().map_err(|_| ()).unwrap();
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("alembic-supchem-shader"),
@@ -4464,9 +4564,10 @@ impl SupportingChemCtx {
         let blocks_y = (H as u32 + 1) / 2;
         let wg_x = (blocks_x + 7) / 8;
         let wg_y = (blocks_y + 7) / 8;
-        // Run modes in macroquad order: acid_disp, alloy_leach,
-        // base_neutral, alloy_form. Each mode = 4 phases.
-        let mode_order: [u32; 4] = [0, 3, 1, 2];
+        // Run modes in macroquad order: halogen_disp + hg_amalg first
+        // (these run before chemical_reactions in lib.rs:9728-9737),
+        // then acid_disp + alloy_leach + base_neutral + alloy_form.
+        let mode_order: [u32; 6] = [4, 5, 0, 3, 1, 2];
         for mode in mode_order {
             for phase in 0..4u32 {
                 let idx = (mode as usize) * 4 + phase as usize;
@@ -8224,6 +8325,8 @@ impl GpuState {
                 alloy_formation: true,
                 alloy_acid_leach: true,
                 base_neutralization: true,
+                halogen_displacement: true,
+                hg_amalgamation: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }

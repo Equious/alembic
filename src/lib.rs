@@ -4696,6 +4696,8 @@ pub struct GpuChem {
     pub alloy_formation: bool,
     pub alloy_acid_leach: bool,
     pub base_neutralization: bool,
+    pub halogen_displacement: bool,
+    pub hg_amalgamation: bool,
 }
 
 impl World {
@@ -4811,8 +4813,12 @@ impl World {
         if !gpu_chem.glass_etching {
             self.glass_etching();    mark!("glass_etch");
         }
-        self.halogen_displacement(); mark!("halogen_disp");
-        self.hg_amalgamation();      mark!("hg_amalg");
+        if !gpu_chem.halogen_displacement {
+            self.halogen_displacement(); mark!("halogen_disp");
+        }
+        if !gpu_chem.hg_amalgamation {
+            self.hg_amalgamation();      mark!("hg_amalg");
+        }
         if !gpu_chem.flame_test_emission {
             self.flame_test_emission(); mark!("flame_emit");
         }
