@@ -1950,6 +1950,84 @@ pub fn register_compound(donor: Element, acceptor: Element) -> Option<u8> {
     derive_or_lookup(donor, acceptor)
 }
 
+/// Stable list of paintable compound elements for UI palettes — same
+/// as the macroquad periodic-table compound row.
+pub fn ui_compound_palette() -> &'static [Element] {
+    &COMPOUND_PALETTE
+}
+
+/// Iterate the implemented atomic elements (in atomic-number order).
+/// Returns (Element, atomic_number, symbol, group, period). Used by
+/// the wgpu UI to render the periodic-table palette.
+pub fn ui_atoms() -> Vec<(Element, u8, &'static str, u8, u8)> {
+    let mut out = Vec::new();
+    for (i, a) in ATOMS.iter().enumerate() {
+        if !a.implemented { continue; }
+        if let Some(el) = atom_to_element(i) {
+            out.push((el, a.number, a.symbol, a.group, a.period));
+        }
+    }
+    out
+}
+
+/// Display name for an Element — primarily used by the UI panel
+/// header. Atom symbols (H, O, Fe, …) for atomic elements; long names
+/// for compounds.
+pub fn ui_element_name(el: Element) -> &'static str {
+    match el {
+        Element::Empty => "Eraser",
+        Element::Sand => "Sand",
+        Element::Water => "Water",
+        Element::Stone => "Stone",
+        Element::Wood => "Wood",
+        Element::Fire => "Fire",
+        Element::CO2 => "CO₂",
+        Element::Steam => "Steam",
+        Element::Lava => "Lava",
+        Element::Obsidian => "Obsidian",
+        Element::Seed => "Seed",
+        Element::Mud => "Mud",
+        Element::Leaves => "Leaves",
+        Element::Oil => "Oil",
+        Element::Ice => "Ice",
+        Element::MoltenGlass => "Molten Glass",
+        Element::Glass => "Glass",
+        Element::Charcoal => "Charcoal",
+        Element::H => "H",   Element::He => "He",
+        Element::C => "C",   Element::N => "N",   Element::O => "O",
+        Element::F => "F",   Element::Ne => "Ne",
+        Element::Na => "Na", Element::Mg => "Mg", Element::Al => "Al",
+        Element::Si => "Si", Element::P => "P",   Element::S => "S",
+        Element::Cl => "Cl", Element::Ar => "Ar",
+        Element::K => "K",   Element::Ca => "Ca", Element::Fe => "Fe",
+        Element::Ni => "Ni", Element::Cu => "Cu", Element::Zn => "Zn",
+        Element::Ag => "Ag", Element::Cs => "Cs", Element::Au => "Au",
+        Element::Hg => "Hg", Element::Pb => "Pb", Element::Ra => "Ra",
+        Element::B => "B",   Element::U => "U",
+        Element::Rust => "Rust",
+        Element::Salt => "Salt",
+        Element::Derived => "Derived",
+        Element::Gunpowder => "Gunpowder",
+        Element::Quartz => "Quartz",
+        Element::Firebrick => "Firebrick",
+        Element::BattPos => "Batt+",
+        Element::BattNeg => "Batt−",
+    }
+}
+
+/// Snapshot the registered Derived compound ids and their formulas
+/// for palette rendering.
+pub fn ui_derived_palette() -> Vec<(u8, String, [u8; 3])> {
+    let mut out = Vec::new();
+    DERIVED_COMPOUNDS.with(|r| {
+        let reg = r.borrow();
+        for (i, c) in reg.iter().enumerate() {
+            out.push((i as u8, c.formula.clone(), [c.color.0, c.color.1, c.color.2]));
+        }
+    });
+    out
+}
+
 fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
     let (da, aa) = match (atom_profile_for(donor), atom_profile_for(acceptor)) {
         (Some(d), Some(a)) => (d, a),
@@ -2531,7 +2609,7 @@ impl Element {
     #[inline] fn pressure_p(self) -> &'static PressureProfile { &PRESSURE[self as usize] }
     #[inline] fn electrical(self) -> &'static ElectricalProfile { &ELECTRICAL[self as usize] }
 
-    fn base_color(self) -> (u8, u8, u8) {
+    pub fn base_color(self) -> (u8, u8, u8) {
         match self {
             Element::Empty    => (10, 10, 14),
             Element::Sand     => (204, 178, 108),

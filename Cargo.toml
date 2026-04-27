@@ -12,6 +12,10 @@ wgpu = "24"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1.16", features = ["derive"] }
+# egui-wgpu UI (port of the macroquad sidebar / palette / tool panel)
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = { version = "0.31", default-features = false, features = ["links"] }
 
 [[bin]]
 name = "alembic"

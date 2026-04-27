@@ -23,6 +23,14 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use egui_wgpu::ScreenDescriptor;
+
+/// Perceptual brightness (0..255) — used to pick black vs white text
+/// when overlaying a label on an element-color tile.
+fn luminance(r: u8, g: u8, b: u8) -> u32 {
+    (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000
+}
+
 use crate::{color_rgb, motion_props, pressure_source_props, thermal_profile_vec4, Element, World, H, W};
 // Reference motion_props from a const so the `crate::motion_props`
 // path inside the motion ctx body doesn't trip the unused-import
@@ -4311,6 +4319,11 @@ struct GpuState {
     /// 'static lifetime contract is satisfied without unsafe.
     window: Arc<Window>,
 
+    // ---- egui UI ----
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+
     // ---- Input state ----
     /// Currently-selected element for the paint brush.
     selected: Element,
@@ -4662,6 +4675,27 @@ impl GpuState {
             .unwrap_or(0) as u32;
         let glass_etch_compute = GlassEtchCtx::new(&device, &queue, &cells_buf, sif_derived_id);
 
+        // egui setup. Renderer matches the swapchain format so we can
+        // paint the UI directly into the same surface pass that draws
+        // the sim.
+        let egui_ctx = egui::Context::default();
+        let egui_viewport_id = egui_ctx.viewport_id();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui_viewport_id,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(2 * 1024),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            None,  // depth format
+            1,     // msaa samples
+            false, // dithering
+        );
+
         let mut state = GpuState {
             surface,
             surface_config,
@@ -4711,6 +4745,9 @@ impl GpuState {
             cam_center_x: W as f32 * 0.5,
             cam_center_y: H as f32 * 0.5,
             cam_scale: 1.0,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         };
         state.camera_reset();
         state
@@ -4865,6 +4902,256 @@ impl GpuState {
         self.surface_config.width = w;
         self.surface_config.height = h;
         self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Build the side panel UI in egui. Faithful port of the macroquad
+    /// sidebar panel: TOOLS section header, periodic-table palette
+    /// (compounds first, atoms second, derived compounds last), brush
+    /// radius slider, pause toggle, clear button, ambient sliders.
+    /// Mutations to `self.selected`, `self.brush_radius`, etc. take
+    /// effect this frame.
+    fn draw_ui(&mut self, ctx: &egui::Context) {
+        let panel_w = 260.0;
+        egui::SidePanel::right("alembic-side-panel")
+            .resizable(false)
+            .exact_width(panel_w)
+            .frame(
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(18, 18, 24))
+                    .inner_margin(egui::Margin::same(10)),
+            )
+            .show(ctx, |ui| {
+                ui.style_mut().visuals.widgets.inactive.bg_fill =
+                    egui::Color32::from_rgb(36, 36, 46);
+                ui.style_mut().visuals.widgets.hovered.bg_fill =
+                    egui::Color32::from_rgb(56, 56, 72);
+                ui.style_mut().visuals.widgets.active.bg_fill =
+                    egui::Color32::from_rgb(70, 80, 100);
+
+                ui.heading(
+                    egui::RichText::new("ALEMBIC")
+                        .color(egui::Color32::from_rgb(220, 220, 240))
+                        .size(18.0),
+                );
+                ui.add_space(4.0);
+
+                // ---- Currently selected ----
+                let sel_name = crate::ui_element_name(self.selected);
+                let (sr, sg, sb) = self.selected.base_color();
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(22.0, 22.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        egui::Color32::from_rgb(sr, sg, sb),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Selected: {}", sel_name))
+                            .color(egui::Color32::from_rgb(230, 230, 240)),
+                    );
+                });
+                ui.add_space(4.0);
+
+                // ---- Controls ----
+                ui.label(
+                    egui::RichText::new("CONTROLS")
+                        .color(egui::Color32::from_rgb(130, 130, 150))
+                        .size(11.0),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Brush:");
+                    ui.add(
+                        egui::Slider::new(&mut self.brush_radius, 1..=30)
+                            .show_value(true),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    let pause_text = if self.paused { "Resume" } else { "Pause" };
+                    if ui.button(pause_text).clicked() {
+                        self.paused = !self.paused;
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.pending_clear = true;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+
+                // ---- Compound palette ----
+                ui.label(
+                    egui::RichText::new("COMPOUNDS")
+                        .color(egui::Color32::from_rgb(130, 130, 150))
+                        .size(11.0),
+                );
+                let compounds = crate::ui_compound_palette();
+                let tile = 30.0;
+                let cols = ((panel_w - 24.0) / (tile + 4.0)) as usize;
+                let cols = cols.max(1);
+                Self::tile_grid(ui, compounds, cols, tile, &mut self.selected);
+
+                ui.add_space(8.0);
+
+                // ---- Other compound-like elements (Wood, Fire, Charcoal,
+                // Salt, BattPos/BattNeg, Gunpowder are not in COMPOUND_PALETTE)
+                let extras: [Element; 7] = [
+                    Element::Wood, Element::Fire, Element::Charcoal,
+                    Element::Salt, Element::Gunpowder,
+                    Element::BattPos, Element::BattNeg,
+                ];
+                Self::tile_grid(ui, &extras, cols, tile, &mut self.selected);
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ---- Atom palette (periodic-table layout) ----
+                ui.label(
+                    egui::RichText::new("ATOMS (periodic table)")
+                        .color(egui::Color32::from_rgb(130, 130, 150))
+                        .size(11.0),
+                );
+                ui.add_space(2.0);
+
+                let atoms = crate::ui_atoms();
+                Self::periodic_table(ui, &atoms, panel_w - 24.0, &mut self.selected);
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ---- Derived compounds ----
+                let derived = crate::ui_derived_palette();
+                if !derived.is_empty() {
+                    ui.label(
+                        egui::RichText::new("DERIVED")
+                            .color(egui::Color32::from_rgb(130, 130, 150))
+                            .size(11.0),
+                    );
+                    ui.add_space(2.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for (did, formula, [r, g, b]) in &derived {
+                                    let selected_now =
+                                        self.selected == Element::Derived;
+                                    let mut btn = egui::Button::new(
+                                        egui::RichText::new(formula)
+                                            .color(egui::Color32::WHITE)
+                                            .size(11.0),
+                                    )
+                                    .fill(egui::Color32::from_rgb(*r, *g, *b))
+                                    .min_size(egui::vec2(38.0, 28.0));
+                                    if selected_now {
+                                        btn = btn.stroke(egui::Stroke::new(
+                                            2.0,
+                                            egui::Color32::from_rgb(120, 230, 120),
+                                        ));
+                                    }
+                                    if ui.add(btn).clicked() {
+                                        self.selected = Element::Derived;
+                                        let _ = did; // selecting Derived
+                                    }
+                                }
+                            });
+                        });
+                }
+            });
+    }
+
+    /// Render a flat grid of element tiles. Clicking a tile sets `selected`.
+    fn tile_grid(
+        ui: &mut egui::Ui,
+        elements: &[Element],
+        cols: usize,
+        tile: f32,
+        selected: &mut Element,
+    ) {
+        let mut chunks = elements.chunks(cols).peekable();
+        while let Some(row) = chunks.next() {
+            ui.horizontal(|ui| {
+                for &el in row {
+                    let (r, g, b) = el.base_color();
+                    let mut btn = egui::Button::new(
+                        egui::RichText::new(crate::ui_element_name(el))
+                            .color(if luminance(r, g, b) > 128 {
+                                egui::Color32::BLACK
+                            } else {
+                                egui::Color32::WHITE
+                            })
+                            .size(11.0),
+                    )
+                    .fill(egui::Color32::from_rgb(r, g, b))
+                    .min_size(egui::vec2(tile, tile));
+                    if *selected == el {
+                        btn = btn.stroke(egui::Stroke::new(
+                            2.0,
+                            egui::Color32::from_rgb(120, 230, 120),
+                        ));
+                    }
+                    if ui.add(btn).clicked() {
+                        *selected = el;
+                    }
+                }
+            });
+            if chunks.peek().is_some() {
+                ui.add_space(2.0);
+            }
+        }
+    }
+
+    /// Render the atom palette in periodic-table layout (period rows,
+    /// group columns). Empty cells are placeholders (gaps in the table).
+    fn periodic_table(
+        ui: &mut egui::Ui,
+        atoms: &[(Element, u8, &'static str, u8, u8)],
+        avail_w: f32,
+        selected: &mut Element,
+    ) {
+        // 18 groups but lanthanides/actinides usually broken out; we
+        // keep them inline at groups 3 for periods 6/7 to fit the panel.
+        let cols = 18.0;
+        let tile = ((avail_w - (cols - 1.0) * 2.0) / cols).max(14.0).min(28.0);
+        let mut by_pp: std::collections::BTreeMap<(u8, u8), (Element, &'static str)> =
+            std::collections::BTreeMap::new();
+        for &(el, _num, sym, group, period) in atoms {
+            by_pp.insert((period, group), (el, sym));
+        }
+        let max_period = atoms.iter().map(|a| a.4).max().unwrap_or(7);
+        for period in 1..=max_period {
+            ui.horizontal(|ui| {
+                for group in 1..=18u8 {
+                    if let Some(&(el, sym)) = by_pp.get(&(period, group)) {
+                        let (r, g, b) = el.base_color();
+                        let dark = luminance(r, g, b) < 128;
+                        let mut btn = egui::Button::new(
+                            egui::RichText::new(sym)
+                                .color(if dark {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::BLACK
+                                })
+                                .size(10.0),
+                        )
+                        .fill(egui::Color32::from_rgb(r, g, b))
+                        .min_size(egui::vec2(tile, tile));
+                        if *selected == el {
+                            btn = btn.stroke(egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgb(120, 230, 120),
+                            ));
+                        }
+                        if ui.add(btn).clicked() {
+                            *selected = el;
+                        }
+                    } else {
+                        // empty slot — invisible spacer
+                        ui.add_space(tile + 2.0);
+                    }
+                }
+            });
+        }
     }
 
     fn render(&mut self) {
@@ -5038,6 +5325,22 @@ impl GpuState {
         // frame encoder — it reads cells_buf and writes sim_texture
         // directly, replacing the old CPU pixel-fill + texture upload.
 
+        // Build the egui UI for this frame. Run BEFORE acquiring the
+        // swapchain image so any UI state changes (selected element,
+        // brush radius, ambient sliders, paused) take effect this frame.
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let egui_full_output = self.egui_ctx.clone().run(raw_input, |ctx| {
+            self.draw_ui(ctx);
+        });
+        self.egui_state.handle_platform_output(&self.window, egui_full_output.platform_output);
+        let egui_clipped = self
+            .egui_ctx
+            .tessellate(egui_full_output.shapes, egui_full_output.pixels_per_point);
+        let screen_desc = ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point: egui_full_output.pixels_per_point,
+        };
+
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
@@ -5053,6 +5356,19 @@ impl GpuState {
         // First: render compute pass fills sim_texture from cells_buf.
         // Then: the display pipeline samples sim_texture to the swapchain.
         self.render_compute.encode(&mut encoder);
+        // egui texture upkeep — must happen on the encoder before the
+        // render pass begins.
+        for (id, image_delta) in &egui_full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &egui_clipped,
+            &screen_desc,
+        );
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("alembic-sim-pass"),
@@ -5073,6 +5389,14 @@ impl GpuState {
             rpass.set_pipeline(&self.sim_pipeline);
             rpass.set_bind_group(0, &self.sim_bind_group, &[]);
             rpass.draw(0..3, 0..1);
+            // egui draws on top of the sim. forget_lifetime cast lets
+            // the renderer accept our short-lived RenderPass handle —
+            // egui-wgpu wants a static-borrowed lifetime here.
+            let mut rpass_static = rpass.forget_lifetime();
+            self.egui_renderer.render(&mut rpass_static, &egui_clipped, &screen_desc);
+        }
+        for id in &egui_full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         self.window.pre_present_notify();
@@ -5139,6 +5463,20 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         let Some(state) = self.state.as_mut() else { return; };
+
+        // egui consumes input events first so the side panel responds
+        // to clicks/hovers/typing. If egui says it consumed pointer or
+        // keyboard input, we suppress the matching sim handler below.
+        let egui_resp = state.egui_state.on_window_event(&state.window, &event);
+        let egui_wants_pointer = egui_resp.consumed
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseWheel { .. }
+            );
+        let egui_wants_keyboard = egui_resp.consumed
+            && matches!(event, WindowEvent::KeyboardInput { .. });
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
@@ -5162,6 +5500,9 @@ impl ApplicationHandler for App {
                 state.middle_drag_from = None;
             }
             WindowEvent::MouseInput { state: mouse_state, button, .. } => {
+                if egui_wants_pointer || state.egui_ctx.is_pointer_over_area() {
+                    return;
+                }
                 let pressed = mouse_state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => state.paint_down = pressed,
@@ -5177,6 +5518,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if egui_wants_pointer || state.egui_ctx.is_pointer_over_area() {
+                    return;
+                }
                 // Plain wheel → brush radius. Ctrl+wheel → camera zoom
                 // anchored at the cursor (cell under the cursor stays
                 // under the cursor across the zoom).
@@ -5199,6 +5543,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if egui_wants_keyboard { return; }
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     // Track Ctrl (both sides) for wheel-zoom gating.
