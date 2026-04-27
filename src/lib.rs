@@ -1942,6 +1942,14 @@ fn alloy_or_lookup(a: Element, b: Element) -> Option<u8> {
     })
 }
 
+/// Pre-register a derived compound so its `derived_id` is known
+/// before any reaction fires. GPU chemistry shaders need stable
+/// derived_ids at compile time; calling this at startup pins the id
+/// for `(donor, acceptor)`.
+pub fn register_compound(donor: Element, acceptor: Element) -> Option<u8> {
+    derive_or_lookup(donor, acceptor)
+}
+
 fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
     let (da, aa) = match (atom_profile_for(donor), atom_profile_for(acceptor)) {
         (Some(d), Some(a)) => (d, a),
@@ -4113,6 +4121,7 @@ pub struct GpuChem {
     pub dissolve: bool,
     pub diffuse_solute: bool,
     pub reactions: bool,
+    pub glass_etching: bool,
 }
 
 impl World {
@@ -4225,7 +4234,9 @@ impl World {
         }
         self.thermite();             mark!("thermite");
         self.magnesium_burn();       mark!("mg_burn");
-        self.glass_etching();        mark!("glass_etch");
+        if !gpu_chem.glass_etching {
+            self.glass_etching();    mark!("glass_etch");
+        }
         self.halogen_displacement(); mark!("halogen_disp");
         self.hg_amalgamation();      mark!("hg_amalg");
         if !gpu_chem.flame_test_emission {

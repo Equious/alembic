@@ -2661,6 +2661,324 @@ impl WaterSandCtx {
     }
 }
 
+const GLASS_ETCH_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,            // 0..3 = Margolus phase
+    frame: u32,
+    sif_derived_id: u32,     // pre-registered SiF compound id
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+
+const EL_O:           u32 = 22u;
+const EL_F:           u32 = 23u;
+const EL_GLASS:       u32 = 16u;
+const EL_MOLTENGLASS: u32 = 15u;
+const EL_DERIVED:     u32 = 41u;
+
+const FLAG_FROZEN: u32 = 0x02u;
+
+fn ge_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn ge_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn ge_frozen(c: vec4<u32>) -> bool { return (ge_flag(c) & FLAG_FROZEN) != 0u; }
+fn ge_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+
+fn ge_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Build a Cell with given el, derived_id, temp; clears all other fields
+// (matches `Cell::new(el)` then `derived_id=`/`temp=` overrides).
+fn make_cell(el: u32, did: u32, temp: i32) -> vec4<u32> {
+    let clamped = clamp(temp, -273, 5000);
+    let traw = u32(clamped) & 0xFFFFu;
+    let x = (el & 0xFFu) | ((did & 0xFFu) << 8u);
+    let y = traw << 16u;
+    return vec4<u32>(x, y, 0u, 0u);
+}
+
+// Faithful port of `World::glass_etching`:
+//
+//   F + Glass/MoltenGlass  →  SiF (Derived) + O
+//
+//   Rate 0.20 / cell-pair (frozen Glass: 0.02× → 0.004 effective).
+//   Both products gain +800°C exotherm.
+//
+// Margolus 2x2 4-phase makes the multi-cell write race-free per phase.
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let phase = u.pass_id & 3u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    let r00 = ge_hash(by * u.width + bx, u.frame);
+    let r10 = ge_hash(by * u.width + bx + 7u, u.frame ^ 0xA5A5A5A5u);
+    let r01 = ge_hash(by * u.width + bx + 13u, u.frame ^ 0x5A5A5A5Au);
+    let r11 = ge_hash(by * u.width + bx + 23u, u.frame ^ 0xC3C3C3C3u);
+
+    let sif = u.sif_derived_id;
+
+    // Rate 0.20 → 51/256. Frozen Glass: 0.004 → 1/256.
+    // Try every (F, Glass-or-MoltenGlass) ordered neighbor pair within
+    // the 2x2 block and apply with the correct rate. Returns after the
+    // first conversion in the block (matches CPU's `break` on first hit
+    // per F cell).
+    var done = false;
+
+    // Helper macro is awkward in WGSL; inline pairs below.
+    // 4 cell positions × 2 horiz/vert neighbors = 4 unique unordered
+    // pairs in the block: (00,10), (01,11), (00,01), (10,11).
+
+    // Pair c00 ↔ c10
+    if (!done) {
+        if (ge_el(c00) == EL_F
+            && (ge_el(c10) == EL_GLASS || ge_el(c10) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c10);
+            let thresh = select(51u, 1u, frozen);
+            if ((r00 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c10);
+                let t_f = ge_temp(c00);
+                c10 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c00 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        } else if (ge_el(c10) == EL_F
+            && (ge_el(c00) == EL_GLASS || ge_el(c00) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c00);
+            let thresh = select(51u, 1u, frozen);
+            if ((r00 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c00);
+                let t_f = ge_temp(c10);
+                c00 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c10 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        }
+    }
+    // Pair c01 ↔ c11
+    if (!done) {
+        if (ge_el(c01) == EL_F
+            && (ge_el(c11) == EL_GLASS || ge_el(c11) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c11);
+            let thresh = select(51u, 1u, frozen);
+            if ((r10 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c11);
+                let t_f = ge_temp(c01);
+                c11 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c01 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        } else if (ge_el(c11) == EL_F
+            && (ge_el(c01) == EL_GLASS || ge_el(c01) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c01);
+            let thresh = select(51u, 1u, frozen);
+            if ((r10 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c01);
+                let t_f = ge_temp(c11);
+                c01 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c11 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        }
+    }
+    // Pair c00 ↔ c01 (vertical, left)
+    if (!done) {
+        if (ge_el(c00) == EL_F
+            && (ge_el(c01) == EL_GLASS || ge_el(c01) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c01);
+            let thresh = select(51u, 1u, frozen);
+            if ((r01 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c01);
+                let t_f = ge_temp(c00);
+                c01 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c00 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        } else if (ge_el(c01) == EL_F
+            && (ge_el(c00) == EL_GLASS || ge_el(c00) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c00);
+            let thresh = select(51u, 1u, frozen);
+            if ((r01 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c00);
+                let t_f = ge_temp(c01);
+                c00 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c01 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        }
+    }
+    // Pair c10 ↔ c11 (vertical, right)
+    if (!done) {
+        if (ge_el(c10) == EL_F
+            && (ge_el(c11) == EL_GLASS || ge_el(c11) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c11);
+            let thresh = select(51u, 1u, frozen);
+            if ((r11 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c11);
+                let t_f = ge_temp(c10);
+                c11 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c10 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        } else if (ge_el(c11) == EL_F
+            && (ge_el(c10) == EL_GLASS || ge_el(c10) == EL_MOLTENGLASS)) {
+            let frozen = ge_frozen(c10);
+            let thresh = select(51u, 1u, frozen);
+            if ((r11 & 0xFFu) < thresh) {
+                let t_glass = ge_temp(c10);
+                let t_f = ge_temp(c11);
+                c10 = make_cell(EL_DERIVED, sif, t_glass + 800);
+                c11 = make_cell(EL_O, 0u, t_f + 800);
+                done = true;
+            }
+        }
+    }
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct GlassEtchUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+    sif_derived_id: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+/// GPU port of `World::glass_etching`. Margolus 2x2 4-phase, race-free
+/// per phase. Pre-registers the SiF derived compound at startup so
+/// the shader can write its known derived_id directly. The reaction
+/// rate (0.20, or 0.004 for frozen Glass) and exotherm (+800°C) match
+/// the CPU implementation.
+struct GlassEtchCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 4],
+    pass_bind_groups: [wgpu::BindGroup; 4],
+}
+
+impl GlassEtchCtx {
+    fn new(
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        cells_buf: &wgpu::Buffer,
+        sif_derived_id: u32,
+    ) -> Self {
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = GlassEtchUniforms {
+                width: W as u32, height: H as u32, pass_id, frame: 0,
+                sif_derived_id, _pad0: 0, _pad1: 0, _pad2: 0,
+            };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let pass_uniform_bufs: [wgpu::Buffer; 4] = [
+            mk_uniform("alembic-glassetch-u-0", 0),
+            mk_uniform("alembic-glassetch-u-1", 1),
+            mk_uniform("alembic-glassetch-u-2", 2),
+            mk_uniform("alembic-glassetch-u-3", 3),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-glassetch-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-glassetch-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 4] = [mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3)];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-glassetch-shader"),
+            source: wgpu::ShaderSource::Wgsl(GLASS_ETCH_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-glassetch-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-glassetch-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        GlassEtchCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let arr = [frame];
+        let bytes: &[u8] = bytemuck::cast_slice(&arr);
+        for i in 0..4 {
+            queue.write_buffer(&self.pass_uniform_bufs[i], 12, bytes);
+        }
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x = (blocks_x + 7) / 8;
+        let wg_y = (blocks_y + 7) / 8;
+        for i in 0..4 {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-glassetch-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[i], &[]);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+    }
+}
+
 const TREE_SUPPORT_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -3980,6 +4298,8 @@ struct GpuState {
     fire_emit_compute: FireEmitCtx,
     /// Moisture chemistry: Water+Sand→Mud. Margolus 2x2 4-phase.
     water_sand_compute: WaterSandCtx,
+    /// Glass etching: F + Glass → SiF (Derived) + O. Margolus 2x2.
+    glass_etch_compute: GlassEtchCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -4334,6 +4654,13 @@ impl GpuState {
         let solute_compute = SoluteCtx::new(&device, &queue, &cells_buf);
         let fire_emit_compute = FireEmitCtx::new(&device, &queue, &cells_buf);
         let water_sand_compute = WaterSandCtx::new(&device, &queue, &cells_buf);
+        // Pre-register the SiF derived compound so the glass-etching
+        // shader can write its derived_id directly. If registration
+        // fails (registry full / Si or F not atom), shader gates on
+        // `sif_derived_id == 0` would silently no-op.
+        let sif_derived_id = crate::register_compound(crate::Element::Si, crate::Element::F)
+            .unwrap_or(0) as u32;
+        let glass_etch_compute = GlassEtchCtx::new(&device, &queue, &cells_buf, sif_derived_id);
 
         let mut state = GpuState {
             surface,
@@ -4364,6 +4691,7 @@ impl GpuState {
             solute_compute,
             fire_emit_compute,
             water_sand_compute,
+            glass_etch_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -4577,6 +4905,7 @@ impl GpuState {
                 dissolve: true,
                 diffuse_solute: true,
                 reactions: true,
+                glass_etching: true,
             };
             self.world.step_skip_gpu_v2(macroquad::math::Vec2::new(0.0, 0.0), gpu_chem);
         }
@@ -4649,6 +4978,9 @@ impl GpuState {
             // 4e. water+sand → mud moisture chemistry. Margolus 2x2
             //     4-phase. Replaces CPU `World::reactions`.
             self.water_sand_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 4f. glass etching: F + Glass → SiF + O. Margolus 2x2
+            //     4-phase. Replaces CPU `World::glass_etching`.
+            self.glass_etch_compute.encode(&mut encoder, &self.queue, self.frame_counter);
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.
