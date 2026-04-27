@@ -5096,28 +5096,59 @@ impl GpuState {
                 // Brush radius row — readout matches the rest of the
                 // panel; user adjusts it via mouse-wheel scroll over
                 // the sim.
-                Self::ambient_row(
+                let brush_delta = Self::ambient_row(
                     ui, "Brush",
                     &format!("{}", self.brush_radius),
                     dim_label, value_color,
                 );
+                if brush_delta > 0.5 {
+                    self.brush_radius = (self.brush_radius + 1).min(30);
+                } else if brush_delta < -0.5 {
+                    self.brush_radius = (self.brush_radius - 1).max(1);
+                }
+
+                let shift_held = ctx.input(|i| i.modifiers.shift);
 
                 let ambient_actual = 20 + self.world.ambient_offset;
-                Self::ambient_row(
+                let temp_delta = Self::ambient_row(
                     ui, "Temp",
                     &format!("{:+}°C", ambient_actual),
                     dim_label, value_color,
                 );
-                Self::ambient_row(
+                if temp_delta.abs() > 0.5 {
+                    let step: i16 = if shift_held { 250 } else { 25 };
+                    if temp_delta > 0.0 {
+                        self.world.ambient_offset =
+                            (self.world.ambient_offset + step).min(4980);
+                    } else {
+                        self.world.ambient_offset =
+                            (self.world.ambient_offset - step).max(-293);
+                    }
+                }
+
+                let o2_delta = Self::ambient_row(
                     ui, "O₂",
                     &format!("{:.0}%", self.world.ambient_oxygen * 100.0),
                     dim_label, value_color,
                 );
-                Self::ambient_row(
+                if o2_delta > 0.5 {
+                    self.world.ambient_oxygen =
+                        (self.world.ambient_oxygen + 0.05).min(2.0);
+                } else if o2_delta < -0.5 {
+                    self.world.ambient_oxygen =
+                        (self.world.ambient_oxygen - 0.05).max(0.0);
+                }
+
+                let grav_delta = Self::ambient_row(
                     ui, "Grav",
                     &format!("{:.1}×", self.world.gravity),
                     dim_label, value_color,
                 );
+                if grav_delta > 0.5 {
+                    self.world.gravity = (self.world.gravity + 0.1).min(2.0);
+                } else if grav_delta < -0.5 {
+                    self.world.gravity = (self.world.gravity - 0.1).max(0.0);
+                }
 
                 // ---- Wind pad ----
                 ui.add_space(14.0);
@@ -5285,14 +5316,16 @@ impl GpuState {
     }
 
     /// One ambient row (Temp / O₂ / Grav) — label left, value right,
-    /// hover-glow background. Mirrors the macroquad ambient row.
+    /// hover-glow background. Returns the wheel delta (lines, +up/-down)
+    /// while the row is hovered, so the caller can apply the row-
+    /// specific step + clamp to the matching world field.
     fn ambient_row(
         ui: &mut egui::Ui,
         label: &str,
         value: &str,
         dim: egui::Color32,
         val_color: egui::Color32,
-    ) {
+    ) -> f32 {
         let bw = ui.available_width();
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(bw, 28.0),
@@ -5323,6 +5356,11 @@ impl GpuState {
             val_color,
         );
         ui.add_space(5.0);
+        if resp.hovered() {
+            ui.input(|i| i.smooth_scroll_delta.y)
+        } else {
+            0.0
+        }
     }
 
     /// Periodic-table modal overlay. Mirrors `draw_periodic_table` —
