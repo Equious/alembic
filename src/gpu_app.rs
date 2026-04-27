@@ -1218,6 +1218,15 @@ fn diagonal_slide(x: u32, parity: u32) {
         if (cell_updated(c) || cell_frozen(c)) { y = y - 1; continue; }
         let k = cell_kind(c);
         if (k != KIND_POWDER && k != KIND_LIQUID) { y = y - 1; continue; }
+        // Leaves drift slowly — same 25% gate as the leaves branch in
+        // vfall (matches lib.rs:7735's `rand::gen_range::<u8>(0, 4)
+        // != 0` skip). Without this, leaves fall like ordinary
+        // powder once their straight-down is blocked.
+        let el_here = cell_el(c);
+        if (el_here == EL_LEAVES) {
+            let r_drift = hash_u32_motion(i_here, u.frame);
+            if ((r_drift & 3u) != 0u) { y = y - 1; continue; }
+        }
         // If straight-down was open, vfall would have moved us. If it
         // was blocked, try diagonals now.
         if (can_enter(c, i32(x), y + 1, 1)) { y = y - 1; continue; }
