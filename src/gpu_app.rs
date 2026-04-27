@@ -4333,6 +4333,10 @@ struct GpuState {
     selected_did: u8,
     /// Wind vector set by the wind pad widget.
     wind: macroquad::math::Vec2,
+    /// Pipet bucket — collected cells that haven't yet been released.
+    pipet_bucket: Vec<crate::Cell>,
+    /// Pipet target species filter (None = collect any).
+    pipet_target: Option<(Element, u8)>,
 
     // ---- Input state ----
     /// Currently-selected element for the paint brush.
@@ -4763,6 +4767,8 @@ impl GpuState {
             pt_open: false,
             selected_did: 0,
             wind: macroquad::math::Vec2::new(0.0, 0.0),
+            pipet_bucket: Vec::with_capacity(2048),
+            pipet_target: None,
         };
         state.camera_reset();
         state
@@ -4885,11 +4891,72 @@ impl GpuState {
     fn apply_brush(&mut self) {
         let Some((px, py)) = self.cursor_pos else { return; };
         let Some((gx, gy)) = self.cursor_to_grid(px, py) else { return; };
-        if self.paint_down {
-            self.world.paint(gx, gy, self.brush_radius, self.selected, 0, false);
-        }
-        if self.erase_down {
-            self.world.paint(gx, gy, self.brush_radius, Element::Empty, 0, false);
+        match self.tool_mode {
+            crate::ToolMode::Paint => {
+                if self.paint_down {
+                    let did = if self.selected == Element::Derived {
+                        self.selected_did
+                    } else { 0 };
+                    self.world.paint(
+                        gx, gy, self.brush_radius,
+                        self.selected, did, self.build_mode,
+                    );
+                }
+                if self.erase_down {
+                    self.world.paint(
+                        gx, gy, self.brush_radius, Element::Empty, 0, false,
+                    );
+                }
+            }
+            crate::ToolMode::Heat => {
+                // L = warm, R = cool. 5°C per frame default.
+                if self.paint_down {
+                    self.world.apply_heat(gx, gy, self.brush_radius, 5);
+                }
+                if self.erase_down {
+                    self.world.apply_heat(gx, gy, self.brush_radius, -5);
+                }
+            }
+            crate::ToolMode::Vacuum => {
+                if self.paint_down {
+                    self.world.apply_vacuum(gx, gy, self.brush_radius);
+                }
+            }
+            crate::ToolMode::Pipet => {
+                // L collects, R releases. Target/filter set via panel UI.
+                if self.paint_down {
+                    self.world.pipet_collect(
+                        gx, gy, self.brush_radius,
+                        self.pipet_target,
+                        &mut self.pipet_bucket,
+                        2048,
+                    );
+                }
+                if self.erase_down {
+                    self.world.pipet_release(
+                        gx, gy, self.brush_radius, &mut self.pipet_bucket,
+                    );
+                }
+            }
+            // Prefab and Wire need their own dropdowns + click-handling
+            // logic that hasn't been ported yet. Fall back to the Paint
+            // brush as a placeholder so the buttons aren't fully dead.
+            crate::ToolMode::Prefab | crate::ToolMode::Wire => {
+                if self.paint_down {
+                    let did = if self.selected == Element::Derived {
+                        self.selected_did
+                    } else { 0 };
+                    self.world.paint(
+                        gx, gy, self.brush_radius,
+                        self.selected, did, self.build_mode,
+                    );
+                }
+                if self.erase_down {
+                    self.world.paint(
+                        gx, gy, self.brush_radius, Element::Empty, 0, false,
+                    );
+                }
+            }
         }
     }
 
@@ -5026,9 +5093,9 @@ impl GpuState {
                 );
                 ui.add_space(4.0);
 
-                // Brush radius row — not in the macroquad panel directly
-                // (it uses [/] keys + scroll), but exposing it here is
-                // a quality-of-life addition matching the readout style.
+                // Brush radius row — readout matches the rest of the
+                // panel; user adjusts it via mouse-wheel scroll over
+                // the sim.
                 Self::ambient_row(
                     ui, "Brush",
                     &format!("{}", self.brush_radius),

@@ -7505,7 +7505,7 @@ impl World {
         true
     }
 
-    fn apply_heat(&mut self, cx: i32, cy: i32, radius: i32, delta: i16) {
+    pub fn apply_heat(&mut self, cx: i32, cy: i32, radius: i32, delta: i16) {
         for y in (cy - radius)..=(cy + radius) {
             for x in (cx - radius)..=(cx + radius) {
                 let dx = x - cx;
@@ -7567,7 +7567,7 @@ impl World {
     // this frame is consumed this frame. Hop counts scale with distance
     // so gas accelerates dramatically as it approaches. Walls block the
     // pull so genuinely sealed pockets stay untouched.
-    fn apply_vacuum(&mut self, cx: i32, cy: i32, radius: i32) {
+    pub fn apply_vacuum(&mut self, cx: i32, cy: i32, radius: i32) {
         // Pressure field — kept for inspector feedback and for the main
         // pressure-gradient motion system to visualize the suction. Actual
         // motion is driven by the direct pull below.
@@ -7797,7 +7797,7 @@ impl World {
     // etc.). If `target` is Some, only cells of that species are taken;
     // if None, any non-frozen non-empty cell qualifies. Frozen cells are
     // never siphoned — the pipet can't drain structural walls.
-    fn pipet_collect(
+    pub fn pipet_collect(
         &mut self, cx: i32, cy: i32, radius: i32,
         target: Option<(Element, u8)>, bucket: &mut Vec<Cell>, limit: usize,
     ) {
@@ -7830,7 +7830,7 @@ impl World {
     // cells in the brush. Cells retain whatever state they had when
     // collected (temperature carries over, etc.). Returns the number
     // placed this call.
-    fn pipet_release(
+    pub fn pipet_release(
         &mut self, cx: i32, cy: i32, radius: i32,
         bucket: &mut Vec<Cell>,
     ) -> usize {
