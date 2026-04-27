@@ -5661,6 +5661,303 @@ impl PressureShoveCtx {
     }
 }
 
+const PAINT_SHADER: &str = r#"
+// GPU paint kernel — replaces World::paint() for the simple disk
+// brush. Each frame the CPU pushes 0..MAX_OPS paint operations
+// (cursor pos + radius + element + flags) and the shader writes
+// them straight into cells_buf. Eliminates the 17 MB CPU→GPU
+// upload + readback roundtrip when all the user is doing is
+// painting sand and water.
+//
+// Faithful port of paint() (lib.rs:8489):
+//   * Empty target → write new cell
+//   * Same-element overpaint → stack pressure (overpaint_pressure)
+//   * Different non-empty + non-frozen → skip (additive only)
+//   * Frozen-mode → overwrite + FLAG_FROZEN
+//   * Liquid sparsity (1/50 spawn) when not frozen
+//   * Erase (el == Empty) → clear including frozen
+//
+// Cell construction matches Cell::new(): el id, default temp 20°C,
+// default moisture per element, formation_pressure (gas/liquid),
+// random per-cell seed.
+
+const MAX_OPS: u32 = 32u;
+
+struct Uniforms {
+    width: u32,
+    height: u32,
+    num_ops: u32,
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Each op packed into 2 vec4<i32> = 32 bytes:
+//   slot0: cx, cy, radius, el_did_flags
+//   slot1: formation_pressure, overpaint_pressure, default_moisture, sparsity
+// el_did_flags layout: el (low 8) | did (8..16) | flags (16..24) | _
+// flags bits: 0=frozen, 1=erase
+@group(0) @binding(2) var<uniform> ops_data: array<vec4<i32>, 64>;
+
+const FLAG_UPDATED: u32 = 0x01u;
+const FLAG_FROZEN:  u32 = 0x02u;
+
+fn pa_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn pa_flag(c: vec4<u32>) -> u32 { return (c.y >> 8u) & 0xFFu; }
+fn pa_frozen(c: vec4<u32>) -> bool { return (pa_flag(c) & FLAG_FROZEN) != 0u; }
+fn pa_pressure(c: vec4<u32>) -> i32 {
+    let raw = (c.z >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+
+fn pa_set_pressure(c: vec4<u32>, p: i32) -> vec4<u32> {
+    let clamped = clamp(p, -32768, 32767);
+    let raw = u32(clamped) & 0xFFFFu;
+    let lo_z = c.z & 0xFFFFu;
+    return vec4<u32>(c.x, c.y, lo_z | (raw << 16u), c.w);
+}
+
+fn pa_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// Build a fresh cell — matches Cell::new for the painted element +
+// derived_id. temp = 20, seed = pseudo-random byte from cell index,
+// flag = FLAG_FROZEN if frozen. formation_pressure goes into the
+// pressure slot. moisture from per-element default.
+fn make_paint_cell(
+    el: u32,
+    did: u32,
+    frozen: bool,
+    formation_pressure: i32,
+    default_moisture: u32,
+    seed_byte: u32,
+) -> vec4<u32> {
+    let traw: u32 = 20u;  // 20°C
+    let flag: u32 = select(0u, FLAG_FROZEN, frozen);
+    // c.x: el | did<<8 | life<<16. life = 0 default; the engine sets
+    // it on Fire/Steam etc. via lifecycle; paint doesn't set it here.
+    let cx = (el & 0xFFu) | ((did & 0xFFu) << 8u);
+    // c.y: seed | flag<<8 | temp<<16. seed in low byte for color noise.
+    let cy = (seed_byte & 0xFFu) | ((flag & 0xFFu) << 8u) | (traw << 16u);
+    // c.z: moisture | burn<<8 | pressure<<16.
+    let praw = u32(clamp(formation_pressure, -32768, 32767)) & 0xFFFFu;
+    let cz = (default_moisture & 0xFFu) | (praw << 16u);
+    // c.w: solute_el | solute_amt<<8 | solute_did<<16. Default 0.
+    return vec4<u32>(cx, cy, cz, 0u);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let xi = i32(gid.x);
+    let yi = i32(gid.y);
+    if (xi >= i32(u.width) || yi >= i32(u.height)) { return; }
+    let i = u32(yi) * u.width + u32(xi);
+    var c = cells[i];
+
+    for (var k: u32 = 0u; k < u.num_ops; k = k + 1u) {
+        let op0 = ops_data[k * 2u + 0u];
+        let op1 = ops_data[k * 2u + 1u];
+        let cx = op0.x;
+        let cy = op0.y;
+        let radius = op0.z;
+        let packed = u32(op0.w);
+        let el = packed & 0xFFu;
+        let did = (packed >> 8u) & 0xFFu;
+        let flags = (packed >> 16u) & 0xFFu;
+        let frozen = (flags & 1u) != 0u;
+        let erase  = (flags & 2u) != 0u;
+        let formation_pressure = op1.x;
+        let overpaint_pressure = op1.y;
+        let default_moisture = u32(op1.z);
+        let sparsity = u32(op1.w);
+
+        let dx = xi - cx;
+        let dy = yi - cy;
+        if (dx * dx + dy * dy > radius * radius) { continue; }
+
+        // Liquid sparsity gate.
+        if (sparsity > 1u) {
+            let r = pa_hash(i, u.frame ^ k);
+            if ((r % sparsity) != 0u) { continue; }
+        }
+
+        if (erase) {
+            // Erase always clears, even frozen cells.
+            c = vec4<u32>(0u, 0u, 0u, 0u);
+            continue;
+        }
+
+        let existing_el = pa_el(c);
+        let existing_frozen = pa_frozen(c);
+
+        if (existing_el == el && existing_el != 0u) {
+            // Over-paint same element: stack pressure, don't recreate.
+            if (overpaint_pressure != 0) {
+                let new_p = pa_pressure(c) + overpaint_pressure;
+                c = pa_set_pressure(c, new_p);
+            }
+            continue;
+        }
+
+        if (existing_el != 0u && !frozen) {
+            // Additive paint never overwrites different matter outside
+            // build mode. Erase first, or switch to Build, to modify.
+            continue;
+        }
+
+        // Frozen-mode + non-empty existing: inherit existing pressure
+        // so a freshly-frozen wall doesn't immediately rupture against
+        // its hydrostatically-settled neighbors (lib.rs:8554).
+        var inherited_pressure = formation_pressure;
+        if (frozen && existing_el != 0u) {
+            inherited_pressure = pa_pressure(c);
+        }
+
+        let seed_byte = (pa_hash(i, u.frame ^ (k + 1024u))) & 0xFFu;
+        c = make_paint_cell(el, did, frozen, inherited_pressure,
+                            default_moisture, seed_byte);
+    }
+
+    cells[i] = c;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Default)]
+struct PaintOpGpu {
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    el_did_flags: u32,
+    formation_pressure: i32,
+    overpaint_pressure: i32,
+    default_moisture: u32,
+    sparsity: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct PaintUniforms {
+    width: u32,
+    height: u32,
+    num_ops: u32,
+    frame: u32,
+}
+
+const PAINT_MAX_OPS: usize = 32;
+
+/// GPU paint kernel — eliminates the per-frame 17 MB CPU→GPU cells
+/// upload by mutating cells_buf directly. CPU just queues paint ops
+/// (cursor pos + radius + element) and uploads ~1 KB of op data.
+struct PaintCtx {
+    pipeline: wgpu::ComputePipeline,
+    uniform_buf: wgpu::Buffer,
+    ops_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// CPU staging for the ops upload — reused per frame.
+    ops_staging: Vec<PaintOpGpu>,
+}
+
+impl PaintCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let uniforms = PaintUniforms {
+            width: W as u32, height: H as u32, num_ops: 0, frame: 0,
+        };
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-paint-uniforms"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let ops_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-paint-ops"),
+            size: (PAINT_MAX_OPS * std::mem::size_of::<PaintOpGpu>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-paint-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-paint-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: ops_buf.as_entire_binding() },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-paint-shader"),
+            source: wgpu::ShaderSource::Wgsl(PAINT_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-paint-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-paint-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        PaintCtx {
+            pipeline, uniform_buf, ops_buf, bind_group,
+            ops_staging: Vec::with_capacity(PAINT_MAX_OPS),
+        }
+    }
+
+    fn clear_ops(&mut self) { self.ops_staging.clear(); }
+
+    fn push_op(&mut self, op: PaintOpGpu) {
+        if self.ops_staging.len() < PAINT_MAX_OPS {
+            self.ops_staging.push(op);
+        }
+    }
+
+    fn has_ops(&self) -> bool { !self.ops_staging.is_empty() }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let n = self.ops_staging.len() as u32;
+        if n == 0 { return; }
+        // Pad up to MAX_OPS with zeroed ops for std140 array stability.
+        let mut padded: [PaintOpGpu; PAINT_MAX_OPS] = [PaintOpGpu::default(); PAINT_MAX_OPS];
+        for (i, op) in self.ops_staging.iter().enumerate() {
+            padded[i] = *op;
+        }
+        queue.write_buffer(&self.ops_buf, 0, bytemuck::cast_slice(&padded));
+        let uniforms = PaintUniforms {
+            width: W as u32, height: H as u32, num_ops: n, frame,
+        };
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+        let wg_x = (W as u32 + 7) / 8;
+        let wg_y = (H as u32 + 7) / 8;
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("alembic-paint-cpass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(wg_x, wg_y, 1);
+    }
+}
+
 const JOULE_HEATING_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -7247,6 +7544,18 @@ struct GpuState {
     /// `energized` mask. compute_energized still runs on CPU and
     /// uploads the mask each frame.
     joule_compute: JouleHeatingCtx,
+    /// GPU paint kernel — Paint-mode brush mutates cells_buf directly
+    /// instead of going through world.cells + 17 MB upload.
+    paint_compute: PaintCtx,
+    /// One-shot staging buffer for "eager fresh sync" — when readback
+    /// transitions false → true, the ring's read_idx has stale data
+    /// (last copied N frames ago). Use this buffer for an inline
+    /// copy + wait so the resumed CPU step starts from current GPU
+    /// state instead of re-uploading old cells over fresh ones.
+    fresh_sync_buf: wgpu::Buffer,
+    /// Was last frame's needs_readback true? Drives the eager sync
+    /// detection.
+    last_frame_did_readback: bool,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -7276,6 +7585,14 @@ struct GpuState {
     selected_did: u8,
     /// Wind vector set by the wind pad widget.
     wind: macroquad::math::Vec2,
+    /// Sticky session flags — once the user paints or sees any of
+    /// these, we keep doing the full CPU sync forever this session.
+    /// Conservative: false positives only cost FPS, never correctness.
+    /// Cleared by Shift+C clear-all so e.g. test-fired uranium gets
+    /// forgotten if the world is wiped.
+    session_has_circuit: bool,
+    session_has_radioactive: bool,
+    session_has_metal: bool,
     /// Pipet bucket — collected cells that haven't yet been released.
     pipet_bucket: Vec<crate::Cell>,
     /// Pipet target species filter (None = collect any).
@@ -7696,6 +8013,14 @@ impl GpuState {
         let burn_compute = BurnCyclesCtx::new(&device, &queue, &cells_buf);
         let pshove_compute = PressureShoveCtx::new(&device, &queue, &cells_buf);
         let joule_compute = JouleHeatingCtx::new(&device, &queue, &cells_buf);
+        let paint_compute = PaintCtx::new(&device, &queue, &cells_buf);
+        let cell_bytes = (W * H * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
+        let fresh_sync_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("alembic-fresh-sync"),
+            size: cell_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -7754,6 +8079,9 @@ impl GpuState {
             burn_compute,
             pshove_compute,
             joule_compute,
+            paint_compute,
+            fresh_sync_buf,
+            last_frame_did_readback: false,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -7789,6 +8117,9 @@ impl GpuState {
             pt_open: false,
             selected_did: 0,
             wind: macroquad::math::Vec2::new(0.0, 0.0),
+            session_has_circuit: false,
+            session_has_radioactive: false,
+            session_has_metal: false,
             pipet_bucket: Vec::with_capacity(2048),
             pipet_target: None,
             prefab_kind: crate::PrefabKind::Box,
@@ -7926,22 +8257,97 @@ impl GpuState {
 
     /// Apply a brush stroke at the current cursor location, if any.
     /// Skips when the cursor is outside the sim rect (over letterbox).
+    /// Translate a CPU-style paint() call into a GPU paint op and
+    /// push it onto the per-frame paint queue. Mirrors the formation
+    /// pressure / sparsity / overpaint logic from World::paint.
+    fn enqueue_paint_op(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        el: Element,
+        derived_id: u8,
+        frozen: bool,
+        erase: bool,
+    ) {
+        // Sticky session-flag updates. Painting BattPos/BattNeg means
+        // the user is building a circuit; mark so compute_energized
+        // syncs from now on. Painting U/Ra: enable decay sync.
+        // Painting any atomic metal: galvanic detection might fire
+        // from now on.
+        match el {
+            Element::BattPos | Element::BattNeg => {
+                self.session_has_circuit = true;
+            }
+            Element::U | Element::Ra => {
+                self.session_has_radioactive = true;
+            }
+            Element::Na | Element::Mg | Element::Al | Element::Si
+            | Element::K  | Element::Ca | Element::Fe | Element::Cu
+            | Element::Au | Element::Hg | Element::Zn | Element::Ag
+            | Element::Ni | Element::Pb | Element::B  | Element::Cs => {
+                self.session_has_metal = true;
+            }
+            _ => {}
+        }
+        let el_id = el as u32;
+        // motion_props: kind_id at slot x. Kind enum 0=Empty 1=Solid 2=Gravel
+        // 3=Powder 4=Liquid 5=Gas 6=Fire.
+        let kind_id = crate::motion_props(el_id as u8)[0] as u32;
+        // Sparsity for liquid in non-frozen mode (matches lib.rs:8499).
+        let sparsity: u32 = if frozen || erase {
+            1
+        } else if kind_id == 4 {
+            50
+        } else {
+            1
+        };
+        // Overpaint pressure boost (matches lib.rs:8511).
+        let overpaint_pressure: i32 = if erase {
+            0
+        } else if kind_id == 5 || kind_id == 6 {
+            400  // Gas / Fire
+        } else if kind_id == 4 {
+            200  // Liquid
+        } else {
+            0
+        };
+        // Per-element formation pressure (slot z of pressure_perm_props).
+        let press_props = crate::pressure_perm_props(el_id as u8);
+        let formation_pressure = press_props[2] as i32;
+        // Per-element default moisture (slot w of moisture_props).
+        let m_props = crate::moisture_props(el_id as u8);
+        let default_moisture = m_props[3] as u32;
+
+        let mut flags: u32 = 0;
+        if frozen { flags |= 1; }
+        if erase  { flags |= 2; }
+        let el_did_flags =
+            (el_id & 0xFF) | ((derived_id as u32 & 0xFF) << 8) | ((flags & 0xFF) << 16);
+
+        self.paint_compute.push_op(PaintOpGpu {
+            cx, cy, radius,
+            el_did_flags,
+            formation_pressure,
+            overpaint_pressure,
+            default_moisture,
+            sparsity,
+        });
+    }
+
     fn apply_brush(&mut self) {
         let Some((px, py)) = self.cursor_pos else { return; };
         let Some((gx, gy)) = self.cursor_to_grid(px, py) else { return; };
         match self.tool_mode {
             crate::ToolMode::Paint => {
+                // Paint goes through the GPU paint kernel — CPU just
+                // enqueues ops, the shader mutates cells_buf next tick.
+                // No more 17 MB upload roundtrip per paint frame.
                 if self.selected == Element::Seed {
-                    // Seed paint: ONE seed per click + ONE per new
-                    // cell crossed while held. Otherwise a held
-                    // radius-4 brush plants ~50 seeds/frame.
                     let pressed = self.paint_pressed_event;
                     let held = self.paint_down;
                     if pressed || (held && self.last_seed_cell != Some((gx, gy))) {
-                        self.world.paint(
-                            gx, gy, 0,
-                            Element::Seed, 0, self.build_mode,
-                        );
+                        self.enqueue_paint_op(gx, gy, 0, Element::Seed, 0, self.build_mode, false);
                         self.last_seed_cell = Some((gx, gy));
                     }
                     if !held { self.last_seed_cell = None; }
@@ -7949,14 +8355,15 @@ impl GpuState {
                     let did = if self.selected == Element::Derived {
                         self.selected_did
                     } else { 0 };
-                    self.world.paint(
+                    self.enqueue_paint_op(
                         gx, gy, self.brush_radius,
-                        self.selected, did, self.build_mode,
+                        self.selected, did, self.build_mode, false,
                     );
                 }
                 if self.erase_down {
-                    self.world.paint(
-                        gx, gy, self.brush_radius, Element::Empty, 0, false,
+                    self.enqueue_paint_op(
+                        gx, gy, self.brush_radius,
+                        Element::Empty, 0, false, true,
                     );
                 }
             }
@@ -9600,30 +10007,82 @@ impl GpuState {
             self.pending_seek = 0;
             self.rewind_active = true;
         }
-        // Reverted the conditional-readback optimization: skipping
-        // copies/readbacks left the ring buffer with stale frames-old
-        // data, so when CPU work resumed (paint / inspector / circuit)
-        // the upload of that stale world.cells clobbered the GPU's
-        // freshly-advanced cells_buf — visually rewinding the sim to
-        // the moment the last full sync ran. The proper fix is a GPU
-        // paint compute kernel + cells_buf-as-source-of-truth model
-        // (paint mutates GPU directly, CPU mirror is read-only). Until
-        // that lands, every running frame syncs.
-        let needs_readback = true;
+        // Sticky-session-flag readback gating. With GPU paint live,
+        // Paint mode no longer mutates world.cells. The remaining CPU
+        // mutators are the still-CPU passes:
+        //   * compute_energized + electrolysis: gated on circuit
+        //     (BattPos/BattNeg/galvanic metals) being present
+        //   * decay: gated on U/Ra
+        //   * other tools (Heat/Vacuum/Pipet/Prefab/Wire) mutate
+        //     world.cells via the CPU helpers
+        // When NONE of those apply, the per-frame readback + 17 MB
+        // upload + CPU step are pure overhead — the GPU is fully
+        // authoritative and we don't need to roundtrip.
+        //
+        // Flags are sticky for the whole session (cleared on Shift+C)
+        // so we never get the false→true transition that previously
+        // surfaced stale ring-buffer data and rewound the sim. Once
+        // a flag is set we just always sync until clear-all.
+        let needs_readback = self.session_has_circuit
+            || self.session_has_radioactive
+            || self.session_has_metal
+            || self.tool_mode != crate::ToolMode::Paint;
+        let force_fresh = needs_readback && !self.last_frame_did_readback;
         if !self.paused {
-            let _ = self.device.poll(wgpu::Maintain::Wait);
-            self.motion_compute.read_back_prev_into(&mut self.world);
-            self.rewind_active = false;
+            if needs_readback {
+                if force_fresh {
+                    // Inline fresh sync: the readback ring has been
+                    // dormant (Paint-mode default scene). Issue a
+                    // one-shot copy to fresh_sync_buf and wait only
+                    // for that submission so the CPU step starts
+                    // from current GPU state. Without this we'd read
+                    // ring data from the last-active session and
+                    // overwrite the fresh GPU state with N-frames-old
+                    // cells (the 'rewind' bug).
+                    let mut sync_enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("alembic-fresh-sync-encoder"),
+                    });
+                    let cell_bytes = (W * H * std::mem::size_of::<crate::Cell>()) as wgpu::BufferAddress;
+                    sync_enc.copy_buffer_to_buffer(
+                        &self.cells_buf, 0, &self.fresh_sync_buf, 0, cell_bytes,
+                    );
+                    let sub = self.queue.submit(std::iter::once(sync_enc.finish()));
+                    self.fresh_sync_buf
+                        .slice(..)
+                        .map_async(wgpu::MapMode::Read, |_| {});
+                    let _ = self.device.poll(wgpu::Maintain::WaitForSubmissionIndex(sub));
+                    {
+                        let data = self.fresh_sync_buf.slice(..).get_mapped_range();
+                        crate::cells_copy_from_bytes(&mut self.world.cells, &data);
+                    }
+                    self.fresh_sync_buf.unmap();
+                } else {
+                    // Steady-state readback path. The motion ring
+                    // has been writing every frame because
+                    // last_frame_did_readback was true; read+unmap
+                    // its current read_idx slot.
+                    let _ = self.device.poll(wgpu::Maintain::Wait);
+                    self.motion_compute.read_back_prev_into(&mut self.world);
+                }
+                self.rewind_active = false;
+            } else {
+                // CPU has nothing to do this frame. Drain finished
+                // map_async callbacks asynchronously without blocking.
+                let _ = self.device.poll(wgpu::Maintain::Poll);
+            }
         } else if !self.rewind_active {
             // Plain pause (no rewind) — still pull last GPU frame so
             // paint actions and the shockwave overlay use fresh state.
             let _ = self.device.poll(wgpu::Maintain::Wait);
             self.motion_compute.read_back_prev_into(&mut self.world);
         }
+        self.last_frame_did_readback = needs_readback;
         let t_compute_readback = t_compute_start.elapsed();
 
         // Pending C-key clear runs AFTER readback so it sticks.
-        // Shift+C also wipes frozen / build cells (matches macroquad).
+        // Shift+C also wipes frozen / build cells (matches macroquad)
+        // AND clears session-stick flags so the world genuinely resets
+        // to "no circuit / no radioactive / no metals" state.
         if self.pending_clear {
             let wipe_frozen = self.pending_clear_all;
             for c in self.world.cells.iter_mut() {
@@ -9631,9 +10090,25 @@ impl GpuState {
                     *c = crate::Cell::EMPTY;
                 }
             }
+            if self.pending_clear_all {
+                self.session_has_circuit = false;
+                self.session_has_radioactive = false;
+                self.session_has_metal = false;
+            }
             self.pending_clear = false;
             self.pending_clear_all = false;
+            // Push the cleared CPU state up to the GPU buffer so the
+            // next render cycle paints empty cells. (When the session
+            // flags are clear, the regular upload path is gated off.)
+            self.queue.write_buffer(
+                &self.cells_buf, 0,
+                crate::cells_as_bytes(&self.world.cells),
+            );
         }
+        // Reset the GPU paint queue at the top of the frame; apply_brush
+        // may push fresh ops (Paint mode), and the encoder dispatches
+        // them later.
+        self.paint_compute.clear_ops();
         self.apply_brush();
         // Press-event flags fire exactly once per click; reset them as
         // soon as the brush handler has had a chance to consume them.
@@ -9708,6 +10183,18 @@ impl GpuState {
         // readback — completely undoing the readback skip above.
         if needs_readback {
             self.queue.write_buffer(&self.cells_buf, 0, crate::cells_as_bytes(&self.world.cells));
+        }
+        // GPU paint dispatch — runs even when paused so the user can
+        // paint into the static scene. Mutates cells_buf directly,
+        // no roundtrip via world.cells.
+        if self.paint_compute.has_ops() {
+            let mut paint_encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("alembic-paint-encoder"),
+            });
+            self.paint_compute.encode(
+                &mut paint_encoder, &self.queue, self.frame_counter,
+            );
+            self.queue.submit(std::iter::once(paint_encoder.finish()));
         }
         // Sync Derived registry: CPU chemistry passes can register
         // new compounds (FeCl, KCl, Al₂O₃, …); GPU motion + render
