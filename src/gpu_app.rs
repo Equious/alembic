@@ -2680,6 +2680,356 @@ impl WaterSandCtx {
     }
 }
 
+const MOISTURE_SHADER: &str = r#"
+struct Uniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,        // 0=absorption, 1=evaporate+dry, 2..5=Margolus wicking
+    frame: u32,
+}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read_write> cells: array<vec4<u32>>;
+// Per-element moisture data: x=is_source, y=is_sink, z=conductivity,
+// w=default_moisture. is_source/is_sink encoded as 0.0 / 1.0.
+@group(0) @binding(2) var<uniform> moisture_lut: array<vec4<f32>, 96>;
+
+const EL_EMPTY: u32 = 0u;
+const EL_WATER: u32 = 2u;
+
+fn m_el(c: vec4<u32>) -> u32 { return c.x & 0xFFu; }
+fn m_temp(c: vec4<u32>) -> i32 {
+    let raw = (c.y >> 16u) & 0xFFFFu;
+    return i32(raw) - i32(select(0u, 65536u, raw >= 32768u));
+}
+fn m_moisture(c: vec4<u32>) -> u32 { return c.z & 0xFFu; }
+fn m_set_moisture(c: vec4<u32>, mst: u32) -> vec4<u32> {
+    let z = (c.z & 0xFFFFFF00u) | (mst & 0xFFu);
+    return vec4<u32>(c.x, c.y, z, c.w);
+}
+fn m_set_temp(c: vec4<u32>, t: i32) -> vec4<u32> {
+    let clamped = clamp(t, -273, 5000);
+    let raw = u32(clamped) & 0xFFFFu;
+    let lo_y = c.y & 0xFFFFu;
+    return vec4<u32>(c.x, lo_y | (raw << 16u), c.z, c.w);
+}
+fn m_is_source(el: u32) -> bool { return moisture_lut[el].x > 0.5; }
+fn m_is_sink(el: u32) -> bool { return moisture_lut[el].y > 0.5; }
+fn m_conductivity(el: u32) -> f32 { return moisture_lut[el].z; }
+
+fn m_hash(a: u32, b: u32) -> u32 {
+    var h: u32 = a * 2654435761u;
+    h ^= b * 1597334677u;
+    h ^= h >> 16u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    return h;
+}
+
+// One Margolus 2x2 pair-transfer in the wicking pass. Reads c_a/c_b
+// by reference, applies the gradient transfer, returns updated cells.
+fn try_wick(c_a: vec4<u32>, c_b: vec4<u32>) -> vec2<vec4<u32>> {
+    let el_a = m_el(c_a);
+    let el_b = m_el(c_b);
+    let sink_a = m_is_sink(el_a);
+    let sink_b = m_is_sink(el_b);
+    if (!sink_a || !sink_b) {
+        return vec2<vec4<u32>>(c_a, c_b);
+    }
+    let m_a = m_moisture(c_a);
+    let m_b = m_moisture(c_b);
+    let t_a = m_temp(c_a);
+    let t_b = m_temp(c_b);
+    let k_a = m_conductivity(el_a);
+    let k_b = m_conductivity(el_b);
+    let k = min(k_a, k_b);
+    if (k <= 0.0) {
+        return vec2<vec4<u32>>(c_a, c_b);
+    }
+    // Donor is whichever has more moisture (and the recipient
+    // mustn't be past boiling — water doesn't migrate into a cell
+    // that's actively evaporating).
+    if (m_a > m_b) {
+        if (t_b > 100) { return vec2<vec4<u32>>(c_a, c_b); }
+        let gradient = i32(m_a) - i32(m_b);
+        if (gradient <= 3) { return vec2<vec4<u32>>(c_a, c_b); }
+        let flow = max(round(k * f32(gradient)), 1.0);
+        let amt = u32(min(min(flow, f32(m_a)), f32(255u - m_b)));
+        if (amt == 0u) { return vec2<vec4<u32>>(c_a, c_b); }
+        return vec2<vec4<u32>>(
+            m_set_moisture(c_a, m_a - amt),
+            m_set_moisture(c_b, m_b + amt),
+        );
+    } else if (m_b > m_a) {
+        if (t_a > 100) { return vec2<vec4<u32>>(c_a, c_b); }
+        let gradient = i32(m_b) - i32(m_a);
+        if (gradient <= 3) { return vec2<vec4<u32>>(c_a, c_b); }
+        let flow = max(round(k * f32(gradient)), 1.0);
+        let amt = u32(min(min(flow, f32(m_b)), f32(255u - m_a)));
+        if (amt == 0u) { return vec2<vec4<u32>>(c_a, c_b); }
+        return vec2<vec4<u32>>(
+            m_set_moisture(c_a, m_a + amt),
+            m_set_moisture(c_b, m_b - amt),
+        );
+    }
+    return vec2<vec4<u32>>(c_a, c_b);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (u.pass_id <= 1u) {
+        // ---- Per-cell passes (absorption / evaporate+dry) ----
+        let x = gid.x;
+        let y = gid.y;
+        if (x >= u.width || y >= u.height) { return; }
+        let i = y * u.width + x;
+        var c = cells[i];
+        let el = m_el(c);
+        if (el == EL_EMPTY || el == EL_WATER) { return; }
+
+        if (u.pass_id == 0u) {
+            // Absorption: any 4-neighbor is_source → +5 moisture.
+            // Skip if not a sink or already saturated.
+            let mst = m_moisture(c);
+            if (!m_is_sink(el) || mst >= 250u) { return; }
+            let xi = i32(x);
+            let yi = i32(y);
+            let neighbors = array<vec2<i32>, 4>(
+                vec2<i32>( 1,  0),
+                vec2<i32>(-1,  0),
+                vec2<i32>( 0,  1),
+                vec2<i32>( 0, -1),
+            );
+            for (var k: i32 = 0; k < 4; k = k + 1) {
+                let n = neighbors[k];
+                let nx = xi + n.x;
+                let ny = yi + n.y;
+                if (nx < 0 || nx >= i32(u.width) || ny < 0 || ny >= i32(u.height)) {
+                    continue;
+                }
+                let n_idx = u32(ny) * u.width + u32(nx);
+                let nc = cells[n_idx];
+                if (m_is_source(m_el(nc))) {
+                    let new_m = min(mst + 5u, 255u);
+                    cells[i] = m_set_moisture(c, new_m);
+                    return;
+                }
+            }
+        } else {
+            // Evaporate + passive drying.
+            let mst = m_moisture(c);
+            if (mst == 0u) { return; }
+            let temp = m_temp(c);
+            let r = m_hash(i, u.frame);
+            // Heat-driven evaporation (temp > 80°C).
+            if (temp > 80) {
+                let excess = u32(temp - 80);
+                let rate = clamp(excess / 40u, 1u, 10u);
+                let drops = clamp(excess / 200u, 1u, 20u);
+                if ((r % 10u) < rate) {
+                    let new_m = select(mst - drops, 0u, drops >= mst);
+                    c = m_set_moisture(c, new_m);
+                    c = m_set_temp(c, temp - i32(drops));
+                    cells[i] = c;
+                    return;
+                }
+            }
+            // Passive drying — only at air-exposed faces, prob 1/400.
+            let xi = i32(x);
+            let yi = i32(y);
+            var exposed: bool = false;
+            let neighbors = array<vec2<i32>, 4>(
+                vec2<i32>( 1,  0),
+                vec2<i32>(-1,  0),
+                vec2<i32>( 0,  1),
+                vec2<i32>( 0, -1),
+            );
+            for (var k: i32 = 0; k < 4; k = k + 1) {
+                let n = neighbors[k];
+                let nx = xi + n.x;
+                let ny = yi + n.y;
+                if (nx < 0 || nx >= i32(u.width) || ny < 0 || ny >= i32(u.height)) {
+                    continue;
+                }
+                let n_idx = u32(ny) * u.width + u32(nx);
+                if (m_el(cells[n_idx]) == EL_EMPTY) {
+                    exposed = true;
+                    break;
+                }
+            }
+            if (exposed && (r % 400u) < 1u) {
+                cells[i] = m_set_moisture(c, mst - 1u);
+            }
+        }
+        return;
+    }
+
+    // ---- Wicking — Margolus 2x2 4-phase ----
+    let phase = u.pass_id - 2u;
+    let off_x = phase & 1u;
+    let off_y = (phase >> 1u) & 1u;
+    let bx = gid.x * 2u + off_x;
+    let by = gid.y * 2u + off_y;
+    if (bx + 1u >= u.width || by + 1u >= u.height) { return; }
+
+    let i00 = by * u.width + bx;
+    let i10 = by * u.width + bx + 1u;
+    let i01 = (by + 1u) * u.width + bx;
+    let i11 = (by + 1u) * u.width + bx + 1u;
+    var c00 = cells[i00];
+    var c10 = cells[i10];
+    var c01 = cells[i01];
+    var c11 = cells[i11];
+
+    // Try all 4 unique pairs in the block.
+    let r0 = try_wick(c00, c10);
+    c00 = r0.x; c10 = r0.y;
+    let r1 = try_wick(c01, c11);
+    c01 = r1.x; c11 = r1.y;
+    let r2 = try_wick(c00, c01);
+    c00 = r2.x; c01 = r2.y;
+    let r3 = try_wick(c10, c11);
+    c10 = r3.x; c11 = r3.y;
+
+    cells[i00] = c00;
+    cells[i10] = c10;
+    cells[i01] = c01;
+    cells[i11] = c11;
+}
+"#;
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MoistureUniforms {
+    width: u32,
+    height: u32,
+    pass_id: u32,
+    frame: u32,
+}
+
+/// GPU port of the moisture sections of `World::thermal_post`:
+/// absorption (per-cell), wicking (Margolus 2x2 4-phase), heat-driven
+/// evaporation + passive air-exposure drying (per-cell). 6 dispatches
+/// per frame: 1 absorption + 4 wicking + 1 evaporate/dry.
+struct MoistureCtx {
+    pipeline: wgpu::ComputePipeline,
+    pass_uniform_bufs: [wgpu::Buffer; 6],
+    pass_bind_groups: [wgpu::BindGroup; 6],
+}
+
+impl MoistureCtx {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, cells_buf: &wgpu::Buffer) -> Self {
+        let mut props_data: Vec<[f32; 4]> = vec![[0.0; 4]; 96];
+        for i in 0..96 {
+            props_data[i] = crate::moisture_props(i as u8);
+        }
+        let lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("alembic-moisture-lut"),
+            contents: bytemuck::cast_slice(&props_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let mk_uniform = |label: &str, pass_id: u32| {
+            let u = MoistureUniforms { width: W as u32, height: H as u32, pass_id, frame: 0 };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(&[u]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        // 0 absorb, 1 evaporate+dry, 2-5 wicking phases.
+        let pass_uniform_bufs: [wgpu::Buffer; 6] = [
+            mk_uniform("alembic-moisture-u-absorb", 0),
+            mk_uniform("alembic-moisture-u-evap",   1),
+            mk_uniform("alembic-moisture-u-wick0",  2),
+            mk_uniform("alembic-moisture-u-wick1",  3),
+            mk_uniform("alembic-moisture-u-wick2",  4),
+            mk_uniform("alembic-moisture-u-wick3",  5),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("alembic-moisture-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let mk_bind = |i: usize| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("alembic-moisture-bind"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pass_uniform_bufs[i].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: lut_buf.as_entire_binding() },
+            ],
+        });
+        let pass_bind_groups: [wgpu::BindGroup; 6] = [
+            mk_bind(0), mk_bind(1), mk_bind(2), mk_bind(3), mk_bind(4), mk_bind(5),
+        ];
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("alembic-moisture-shader"),
+            source: wgpu::ShaderSource::Wgsl(MOISTURE_SHADER.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("alembic-moisture-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("alembic-moisture-pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // lut_buf retained via the bind groups; binding 2 holds the
+        // strong ref for the lifetime of the ctx.
+        let _ = lut_buf;
+        MoistureCtx { pipeline, pass_uniform_bufs, pass_bind_groups }
+    }
+
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, frame: u32) {
+        let arr = [frame];
+        let bytes: &[u8] = bytemuck::cast_slice(&arr);
+        for i in 0..6 {
+            queue.write_buffer(&self.pass_uniform_bufs[i], 12, bytes);
+        }
+        let wg_x_cell = (W as u32 + 7) / 8;
+        let wg_y_cell = (H as u32 + 7) / 8;
+        let blocks_x = (W as u32 + 1) / 2;
+        let blocks_y = (H as u32 + 1) / 2;
+        let wg_x_mar = (blocks_x + 7) / 8;
+        let wg_y_mar = (blocks_y + 7) / 8;
+        // Order: absorption → wicking (4 phases) → evaporate+dry.
+        let order: [(usize, u32, u32); 6] = [
+            (0, wg_x_cell, wg_y_cell),
+            (2, wg_x_mar,  wg_y_mar),
+            (3, wg_x_mar,  wg_y_mar),
+            (4, wg_x_mar,  wg_y_mar),
+            (5, wg_x_mar,  wg_y_mar),
+            (1, wg_x_cell, wg_y_cell),
+        ];
+        for (idx, gx, gy) in order {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("alembic-moisture-cpass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.pass_bind_groups[idx], &[]);
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+    }
+}
+
 const GLASS_ETCH_SHADER: &str = r#"
 struct Uniforms {
     width: u32,
@@ -4319,6 +4669,9 @@ struct GpuState {
     water_sand_compute: WaterSandCtx,
     /// Glass etching: F + Glass → SiF (Derived) + O. Margolus 2x2.
     glass_etch_compute: GlassEtchCtx,
+    /// Moisture absorption + wicking + evaporation + passive drying.
+    /// Replaces the moisture sections of CPU `World::thermal_post`.
+    moisture_compute: MoistureCtx,
     frame_counter: u32,
     // Lightweight perf counter — prints fps + sim time once per second.
     prof_last_print: std::time::Instant,
@@ -4762,6 +5115,7 @@ impl GpuState {
         let sif_derived_id = crate::register_compound(crate::Element::Si, crate::Element::F)
             .unwrap_or(0) as u32;
         let glass_etch_compute = GlassEtchCtx::new(&device, &queue, &cells_buf, sif_derived_id);
+        let moisture_compute = MoistureCtx::new(&device, &queue, &cells_buf);
 
         // egui setup. Renderer matches the swapchain format so we can
         // paint the UI directly into the same surface pass that draws
@@ -4814,6 +5168,7 @@ impl GpuState {
             fire_emit_compute,
             water_sand_compute,
             glass_etch_compute,
+            moisture_compute,
             frame_counter: 0,
             prof_last_print: std::time::Instant::now(),
             prof_frame_count: 0,
@@ -6716,6 +7071,7 @@ impl GpuState {
                 diffuse_solute: true,
                 reactions: true,
                 glass_etching: true,
+                moisture: true,
             };
             self.world.step_skip_gpu_v2(self.wind, gpu_chem);
         }
@@ -6790,6 +7146,10 @@ impl GpuState {
             // 4f. glass etching: F + Glass → SiF + O. Margolus 2x2
             //     4-phase. Replaces CPU `World::glass_etching`.
             self.glass_etch_compute.encode(&mut encoder, &self.queue, self.frame_counter);
+            // 4g. moisture: absorption + Margolus 2x2 wicking +
+            //     evaporation + passive drying. Replaces the moisture
+            //     section of CPU `World::thermal_post`.
+            self.moisture_compute.encode(&mut encoder, &self.queue, self.frame_counter);
             // 5. flame_test_emission — Margolus 4-phase, hot flame-
             //    coloring elements emit colored Fire into block-local
             //    empty cells.

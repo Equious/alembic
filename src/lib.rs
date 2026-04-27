@@ -553,6 +553,22 @@ pub fn pressure_perm_props(id: u8) -> [u32; 4] {
 ///   y = density (SIGNED — gases have negative density)
 ///   z = viscosity (gates rigid-into-fluid and horizontal liquid spread)
 ///   w = molar_mass (drives gas ambient buoyancy vs AMBIENT_AIR)
+/// Per-element moisture data packed for the GPU thermal_post moisture
+/// passes. Layout: `[is_source, is_sink, conductivity, default_moisture]`.
+/// is_source / is_sink encoded as 1.0 / 0.0; conductivity is the
+/// gradient diffusion coefficient (water 1.0, mud 0.10, sand 0.08, …).
+pub fn moisture_props(id: u8) -> [f32; 4] {
+    let i = id as usize;
+    if i >= ELEMENT_COUNT { return [0.0; 4]; }
+    let m = &MOISTURE[i];
+    [
+        if m.is_source { 1.0 } else { 0.0 },
+        if m.is_sink { 1.0 } else { 0.0 },
+        m.conductivity,
+        m.default_moisture as f32,
+    ]
+}
+
 pub fn motion_props(id: u8) -> [f32; 4] {
     let i = id as usize;
     if i >= ELEMENT_COUNT { return [0.0; 4]; }
@@ -4376,6 +4392,10 @@ pub struct GpuChem {
     pub diffuse_solute: bool,
     pub reactions: bool,
     pub glass_etching: bool,
+    /// True when the GPU is running moisture absorption + wicking.
+    /// thermal_post on CPU will skip its moisture sections so the
+    /// two passes don't double-fire.
+    pub moisture: bool,
 }
 
 impl World {
@@ -4520,6 +4540,13 @@ impl World {
         }
         if !gpu_chem.reactions {
             self.reactions();        mark!("reactions");
+        }
+        // Moisture sections of thermal_post run independently of the
+        // GPU thermal_post (which only handles combustion + phase
+        // changes). When run_thermal_diffuse is true the legacy
+        // thermal() above already did moisture, so skip.
+        if !run_thermal_diffuse && !gpu_chem.moisture {
+            self.thermal_post_moisture(); mark!("thermal_post_moisture");
         }
         if run_motion {
             for y in (0..H as i32).rev() {
@@ -4668,13 +4695,11 @@ impl World {
         }
     }
 
-    /// Sections 2 + 3 of thermal: moisture dynamics, evaporation,
-    /// combustion-driven phase changes. These have writes-to-non-self
-    /// neighbors and stay on CPU regardless of which step variant the
-    /// caller uses.
-    pub fn thermal_post(&mut self) {
-        // 2) Moisture dynamics — wetting from water contact, heat-driven and
-        // passive evaporation *only on cells touching air* (surface-first).
+    /// Moisture dynamics — absorption (sink touching source → +5),
+    /// gradient wicking, heat-driven evaporation, passive air-exposed
+    /// drying. Split out so the GPU port can offload it independently
+    /// of combustion + phase changes.
+    pub fn thermal_post_moisture(&mut self) {
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -4682,7 +4707,6 @@ impl World {
                 if c.el == Element::Water || c.el == Element::Empty { continue; }
 
                 // Absorption from any adjacent moisture source (water, ice, mud).
-                // Non-sinks (oil, stone-wise no, but oil is hydrophobic here) skip.
                 if c.moisture < 250 && c.el.moisture().is_sink {
                     for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                         let n = self.get(x + dx, y + dy).el;
@@ -4693,9 +4717,7 @@ impl World {
                     }
                 }
 
-                // Wicking: gradient-driven diffusion through solids/powders.
-                // Moisture shares with every drier non-water neighbor, scaled
-                // by the bottleneck material's conductivity.
+                // Wicking: gradient-driven diffusion through sinks.
                 let c = self.cells[i];
                 let my_k = c.el.moisture().conductivity;
                 if c.moisture > 5 && my_k > 0.0 && c.el.moisture().is_sink {
@@ -4704,9 +4726,6 @@ impl World {
                         let nidx = Self::idx(x + dx, y + dy);
                         let n = self.cells[nidx];
                         if !n.el.moisture().is_sink { continue; }
-                        // Don't pump moisture INTO cells past boiling — water
-                        // doesn't travel into a cell that's actively evaporating,
-                        // otherwise wet neighbors shield hot ones indefinitely.
                         if n.temp > 100 { continue; }
                         let k = my_k.min(n.el.moisture().conductivity);
                         if k <= 0.0 { continue; }
@@ -4727,9 +4746,7 @@ impl World {
                     }
                 }
 
-                // Heat-driven evaporation. Higher temps shed multiple moisture
-                // units per frame, so extreme heat sources (lava, fire) can
-                // actually dry a wet surface faster than wicking refills it.
+                // Heat-driven evaporation.
                 if c.temp > 80 && c.moisture > 0 {
                     let excess = (c.temp as i32 - 80).max(0) as u32;
                     let rate   = (excess / 40).clamp(1, 10) as u16;
@@ -4739,8 +4756,7 @@ impl World {
                         self.cells[i].temp -= drops as i16;
                     }
                 }
-                // Passive drying: only where moisture can actually leave —
-                // at an air-exposed face.
+                // Passive drying: only where moisture can leave.
                 let mut exposed = false;
                 for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     if self.get(x + dx, y + dy).el == Element::Empty {
@@ -4754,6 +4770,16 @@ impl World {
                 }
             }
         }
+    }
+
+    /// Sections 2 + 3 of thermal: moisture dynamics, evaporation,
+    /// combustion-driven phase changes. These have writes-to-non-self
+    /// neighbors and stay on CPU regardless of which step variant the
+    /// caller uses.
+    pub fn thermal_post(&mut self) {
+        // 2) Moisture dynamics — delegated so the GPU port can offload
+        // it independently of the combustion section below.
+        self.thermal_post_moisture();
 
         // 3) Combustion + phase changes.
         for y in 0..H as i32 {
