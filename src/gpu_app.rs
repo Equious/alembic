@@ -4417,6 +4417,10 @@ struct GpuState {
     pending_clear_all: bool,
     /// Side panel hidden when false (U toggles).
     panel_visible: bool,
+    /// Last grid cell where a seed was painted while the brush was
+    /// held — used to ensure exactly one seed per click + one per new
+    /// cell crossed (not 50 per frame for a held radius-4 brush).
+    last_seed_cell: Option<(i32, i32)>,
     /// Set on F2; render() captures the swapchain image after egui
     /// has been painted, encodes a timestamped PNG, and clears.
     pending_screenshot: bool,
@@ -4829,6 +4833,7 @@ impl GpuState {
             pending_clear: false,
             pending_clear_all: false,
             panel_visible: true,
+            last_seed_cell: None,
             pending_screenshot: false,
             screenshot_notice: None,
             pending_seek: 0,
@@ -4986,7 +4991,21 @@ impl GpuState {
         let Some((gx, gy)) = self.cursor_to_grid(px, py) else { return; };
         match self.tool_mode {
             crate::ToolMode::Paint => {
-                if self.paint_down {
+                if self.selected == Element::Seed {
+                    // Seed paint: ONE seed per click + ONE per new
+                    // cell crossed while held. Otherwise a held
+                    // radius-4 brush plants ~50 seeds/frame.
+                    let pressed = self.paint_pressed_event;
+                    let held = self.paint_down;
+                    if pressed || (held && self.last_seed_cell != Some((gx, gy))) {
+                        self.world.paint(
+                            gx, gy, 0,
+                            Element::Seed, 0, self.build_mode,
+                        );
+                        self.last_seed_cell = Some((gx, gy));
+                    }
+                    if !held { self.last_seed_cell = None; }
+                } else if self.paint_down {
                     let did = if self.selected == Element::Derived {
                         self.selected_did
                     } else { 0 };
@@ -5009,11 +5028,13 @@ impl GpuState {
                 if self.erase_down {
                     self.world.apply_heat(gx, gy, self.brush_radius, -5);
                 }
+                self.last_seed_cell = None;
             }
             crate::ToolMode::Vacuum => {
                 if self.paint_down {
                     self.world.apply_vacuum(gx, gy, self.brush_radius);
                 }
+                self.last_seed_cell = None;
             }
             crate::ToolMode::Pipet => {
                 // L collects, R releases. Target/filter set via panel UI.
