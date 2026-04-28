@@ -982,6 +982,20 @@ static ELECTRICAL: [ElectricalProfile; ELEMENT_COUNT] = {
     a[Element::N as usize] = ElectricalProfile {
         conductivity: 0.0, glow_color: Some((255, 130, 160)),
     };
+    // Oxygen — discharge tubes glow pale violet/lavender. The atomic
+    // O emission is mostly in a few violet lines; molecular O₂ adds
+    // some red-orange, blending toward a pinkish-violet overall.
+    a[Element::O as usize] = ElectricalProfile {
+        conductivity: 0.0, glow_color: Some((200, 150, 240)),
+    };
+    // Fluorine — discharge tubes glow pale pink-violet / red-violet.
+    // Strongest visible F atomic lines are in the red (624/685/703 nm)
+    // and the molecular band emission adds violet — combined to a dim
+    // pink-purple, distinctively different from the yellow-green gas
+    // color it would have when un-energized.
+    a[Element::F as usize] = ElectricalProfile {
+        conductivity: 0.0, glow_color: Some((220, 140, 200)),
+    };
     // Krypton — pale white with a faint blue. Real Kr discharge tubes
     // are off-white from the broad multi-line emission spectrum.
     a[Element::Kr as usize] = ElectricalProfile {
@@ -1866,6 +1880,14 @@ fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Op
         (Element::H, Element::O) => Some(Element::Water),
         (Element::Na, Element::Cl) => Some(Element::Salt),
         (Element::Fe, Element::O) => Some(Element::Rust),
+        // Iron rusts in water too — real chemistry, the dissolved O₂
+        // in liquid water is the actual oxidizer (more so in cold
+        // water, since dissolved O concentration is higher). Without
+        // this clause Fe in water does nothing because the derived
+        // registry can't synthesize from a non-atom acceptor.
+        (Element::Fe, Element::Water)
+        | (Element::Fe, Element::Ice)
+        | (Element::Fe, Element::Steam) => Some(Element::Rust),
         (Element::C, Element::O) => Some(Element::CO2),
         (m, Element::Water) | (m, Element::Ice) | (m, Element::Steam)
             if atom_profile_for(m).map_or(false, |a|
@@ -2042,6 +2064,28 @@ fn try_emergent_reaction(
     {
         activation = activation.max(500);
     }
+    // Al + heavier halogens (Br, I) is famously vigorous at room
+    // temp in real chemistry — Al strip in liquid Br₂ ignites in
+    // seconds. The generic bucket math lands Al+Br at 62°C activation
+    // (just above ambient) which makes the reaction silently fail to
+    // start without a heat source. Force ambient-fireable.
+    if donor_el == Element::Al
+        && matches!(acceptor_el, Element::Br | Element::I)
+    {
+        activation = activation.min(0);
+    }
+    // Mg/Ca + water hydrolysis is slow in real life — Mg is essentially
+    // inert in cold water, fizzes weakly in hot (~80°C) water, and only
+    // reacts vigorously with steam. The bespoke (metal, water) → H clause
+    // sweeps Mg/Ca in alongside the alkalis at full rate, which is wrong
+    // for these less-reactive alkaline-earth metals. 80°C activation
+    // floor matches the real "warm water needed" threshold.
+    if matches!(donor_el, Element::Mg | Element::Ca)
+        && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
+        && matches!(inferred, InferredProduct::Bespoke(Element::H))
+    {
+        activation = activation.max(80);
+    }
     if a_temp < activation || b_temp < activation { return None; }
 
     // Rate: base on reactivity, amplified by catalysts.
@@ -2059,8 +2103,36 @@ fn try_emergent_reaction(
     // (noticeable tarnish in minutes of game time) without the "sweating
     // rust" effect a higher rate produces when every Fe surface cell is
     // tested against virtual O every frame.
+    // Rust formation is direct cell-vs-cell, not virtual_o-damped, so
+    // submerged Fe gets dense, continuous reaction opportunities. Set
+    // explicit rates instead of trying to derive them through the
+    // catalyst-multiplier cap chain. Equivalences:
+    //   Fe + plain water == Fe + ambient O₂   (slow surface tarnish)
+    //   Fe + salt water  == Fe + spawned O₂   (visible accelerated)
     if matches!(inferred, InferredProduct::Bespoke(Element::Rust)) {
-        rate = (rate * 0.0005).min(0.05);
+        const RUST_AMBIENT_RATE: f32 = 0.00005;
+        const RUST_EXPLICIT_O_RATE: f32 = 0.0005;
+        let water_acceptor = matches!(acceptor_el,
+            Element::Water | Element::Ice | Element::Steam);
+        let has_salt = catalysts.iter().any(|&c| c == Element::Salt);
+        rate = if water_acceptor && has_salt {
+            RUST_EXPLICIT_O_RATE
+        } else if water_acceptor {
+            RUST_AMBIENT_RATE
+        } else {
+            RUST_EXPLICIT_O_RATE
+        };
+    }
+    // Mg/Ca in water — slow even when activation is met. Even in
+    // boiling water Mg only fizzes gently (real reaction takes minutes
+    // to visibly progress); we want the visible bubble-stream look but
+    // not the alkali-style flash conversion. 0.03 cap matches the rust
+    // tier's slow-corrosion timescale.
+    if matches!(inferred, InferredProduct::Bespoke(Element::H))
+        && matches!(donor_el, Element::Mg | Element::Ca)
+        && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
+    {
+        rate = (rate * 0.05).min(0.03);
     }
     // Derived compounds (non-bespoke products) reflect slow surface
     // corrosion/tarnish processes, not energetic combustion. Very low rate
@@ -2142,6 +2214,31 @@ fn try_emergent_reaction(
         // by itself.
         delta_temp = 450;
     }
+    // Mg/Ca + water — tame the heat. The default 400°C alkali-in-water
+    // exotherm is appropriate for Na/K (real Na flash-vaporizes water
+    // contact) but wrong for Mg/Ca (real reaction is gentle fizzing
+    // even at the boil). 80°C keeps the products warm but doesn't
+    // immediately steam-vaporize the surrounding water cells.
+    if matches!(inferred, InferredProduct::Bespoke(Element::H))
+        && matches!(donor_el, Element::Mg | Element::Ca)
+        && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
+    {
+        delta_temp = 80;
+    }
+    // Cs/Fr + water — boost the heat into detonation territory. The
+    // M + H₂O reaction enthalpy for the heavy alkalis is enough to
+    // self-detonate independent of any subsequent H₂ + O₂ combustion
+    // (which is why a Cs droplet in water explodes even in an oxygen-
+    // free atmosphere). 1500°C clears the 1200°C chemistry-shockwave
+    // threshold so the chem_blast accumulator picks up a real blast
+    // contribution, the water cells flash to hot steam, and the metal
+    // cells become near-vapor H₂.
+    if matches!(inferred, InferredProduct::Bespoke(Element::H))
+        && matches!(donor_el, Element::Cs | Element::Fr)
+        && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
+    {
+        delta_temp = 1500;
+    }
     // Violent tier heat scaling — same predicate as the rate boost above.
     // Scale heat to the EN gap so the released energy crosses the 1200°C
     // chemistry-shockwave threshold (lib.rs ~line 4657) and detonates.
@@ -2158,13 +2255,24 @@ fn try_emergent_reaction(
     }
 
     // For reactive-metal + water, acceptor cell becomes Steam (water ripped
-    // apart), donor cell becomes H gas. For all other pairs, both cells
-    // become the product (bespoke or derived).
+    // apart), donor cell becomes H gas. For rust formation, only the
+    // metal cell becomes Rust — water/O is the oxidizer, not bulk
+    // material being converted into rust (without this, every Fe+Water
+    // reaction creates TWO rust cells, doubling rust volume out of
+    // nowhere). Explicit O is consumed (Empty), water is preserved.
+    // For all other pairs, both cells become the product.
     let metal_in_water = matches!(acceptor_el,
             Element::Water | Element::Ice | Element::Steam)
         && matches!(inferred, InferredProduct::Bespoke(Element::H));
+    let rust_reaction = matches!(inferred, InferredProduct::Bespoke(Element::Rust));
     let products = if metal_in_water {
         [ProductSpec::bespoke(Element::H), ProductSpec::bespoke(Element::Steam)]
+    } else if rust_reaction {
+        let acceptor_product = match acceptor_el {
+            Element::O => Element::Empty,
+            _ => acceptor_el,  // water/ice/steam preserved
+        };
+        [ProductSpec::bespoke(Element::Rust), ProductSpec::bespoke(acceptor_product)]
     } else {
         let s = ProductSpec::from_inferred(inferred);
         [s, s]
@@ -2406,7 +2514,16 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
     // needs `8 - valence_e⁻` to complete its shell. Reduce by GCD so
     // we get the simplest integer ratio.
     let gives = da.valence_electrons.max(1);
-    let needs = 8u8.saturating_sub(aa.valence_electrons).max(1);
+    // H acceptor takes a single electron (H⁻ anion), like a halogen
+    // would — that's why metal hydrides are 1:1 (LiH, NaH, KH, RbH)
+    // or 1:2 (MgH₂, CaH₂). The 8-valence math would otherwise give
+    // M₇H (treating H as if it needs 7 electrons to reach an octet,
+    // which doesn't apply to H — its full shell is just 2 electrons).
+    let needs = if acceptor == Element::H {
+        1
+    } else {
+        8u8.saturating_sub(aa.valence_electrons).max(1)
+    };
     let g = gcd_u8(gives, needs);
     let donor_count = (needs / g).max(1);
     let acceptor_count = (gives / g).max(1);
@@ -2464,8 +2581,30 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         let kind = if molecular_gas {
             Kind::Gas
         } else {
+            // Ionic salts and oxides — anything pairing a solid metal
+            // donor with a typical anion-forming nonmetal acceptor
+            // (halogen, O, S, N, P) — render as Powder regardless of
+            // the acceptor's STP phase. Real metal halides and oxides
+            // are granular crystalline products that flake/slide like
+            // rust does, not rigid Gravel stacks. Without this rule,
+            // NaBr from Na+liquid-Br comes out as Gravel and stays
+            // glued to the Na pile, blocking the Br liquid from
+            // reaching fresh metal. (The earlier Solid+Gas → Powder
+            // rule didn't catch liquid acceptors like Br₂.)
+            let anion_acceptor = matches!(acceptor,
+                Element::F | Element::Cl | Element::Br | Element::I
+                | Element::O | Element::S | Element::N | Element::P);
+            // Tight passivating oxides — Al₂O₃, Cr₂O₃ — form coherent
+            // cohesive coatings that don't flake. They're the real-
+            // world textbook examples of self-protecting layers; we
+            // model that by keeping them as Gravel (rigid) instead
+            // of the default Powder for ionic salts.
+            let coating_oxide = acceptor == Element::O
+                && matches!(donor, Element::Al | Element::Cr);
             match (da.stp_state, aa.stp_state) {
                 (AtomState::Gas, AtomState::Gas) => Kind::Gas,
+                (AtomState::Solid, _) if coating_oxide => Kind::Gravel,
+                (AtomState::Solid, _) if anion_acceptor => Kind::Powder,
                 (AtomState::Solid, _)            => Kind::Gravel,
                 (AtomState::Liquid, _)           => Kind::Liquid,
                 (AtomState::Gas, _)              => Kind::Powder,
@@ -2487,10 +2626,28 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
             // a representative bound-oxide value (~20, ≈2 g/cm³) for O
             // pulls oxide densities up to where they belong, so e.g. BeO
             // sinks in water instead of floating.
-            let aa_d = if acceptor == Element::O {
-                20
-            } else {
-                acceptor.physics().density.max(0) as i32
+            // Bound-state density for nonmetal-gas acceptors. Their gas
+            // densities (negative or near-zero) drag the average down,
+            // so a metal+halogen salt comes out lighter than the parent
+            // metal — wrong, real ionic salts are heavier (LiF 2.64 vs
+            // Li 0.53; NaCl 2.16 vs Na 0.97). Without this override, a
+            // LiF rind floats on Li and stops the F attack at the
+            // surface; with it, LiF sinks through and exposes fresh Li.
+            let aa_d = match acceptor {
+                Element::O                                 => 20,
+                Element::F  | Element::Cl                  => 22,
+                // Br bound density bumped to 60 so NaBr/LiBr/KBr come
+                // out denser than liquid Br₂ (sim density 31). Without
+                // this, the salt formed at a Na-on-Br interface stays
+                // sandwiched between metal and liquid and the reaction
+                // dies; with it, the salt sinks INTO the bromine,
+                // exposing fresh metal and letting the reaction
+                // consume the Na pile (matching real chemistry — Na
+                // in Br₂ reacts vigorously to completion).
+                Element::Br                                => 60,
+                Element::I                                 => 45,
+                Element::N  | Element::S  | Element::P     => 22,
+                _ => acceptor.physics().density.max(0) as i32,
             };
             let total_d = da_d * donor_count as i32 + aa_d * acceptor_count as i32;
             (total_d / total as i32).clamp(1, 200) as i16
@@ -5014,6 +5171,10 @@ impl World {
         // Bespoke because exposing Glass to the general chemistry
         // engine would also make it react with O and metals.
         self.glass_etching();
+        // F + Water hydrolysis — F splits water into HF + O. Dedicated
+        // pass because Water's chemistry face (O-valence 6) blocks the
+        // generic engine from running F-as-acceptor here.
+        self.fluorine_hydrolysis();
         // Halogen displacement — F kicks Cl out of chloride salts.
         self.halogen_displacement();
         // Hg amalgamation — Hg dissolves Au/Ag/Cu/Na/etc. into a
@@ -6151,12 +6312,29 @@ impl World {
                                 if !Self::in_bounds(px, py) { continue; }
                                 let pi = Self::idx(px, py);
                                 if pi == i || pi == ni { continue; }
-                                let e = self.cells[pi].el;
+                                let cell = self.cells[pi];
+                                let e = cell.el;
                                 if matches!(e, Element::Water | Element::Ice
                                     | Element::Steam | Element::Salt)
                                     && cat_count < catalysts.len()
                                 {
                                     catalysts[cat_count] = e;
+                                    cat_count += 1;
+                                }
+                                // Dissolved NaCl in water counts as Salt
+                                // catalyst — without this, salt water is
+                                // chemically identical to plain water
+                                // (since salt is stored in solute_el of
+                                // a Water cell, not as a Salt cell). 32
+                                // threshold filters out trace dissolved
+                                // amounts so only meaningfully-salty
+                                // brine triggers the salt path.
+                                if e == Element::Water
+                                    && cell.solute_amt >= 32
+                                    && cell.solute_el == Element::Salt
+                                    && cat_count < catalysts.len()
+                                {
+                                    catalysts[cat_count] = Element::Salt;
                                     cat_count += 1;
                                 }
                             }
@@ -7086,6 +7264,54 @@ impl World {
                     o.temp = (c.temp as i32 + REACTION_HEAT as i32).min(5000) as i16;
                     o.flag |= Cell::FLAG_UPDATED;
                     self.cells[i] = o;
+                    break;
+                }
+            }
+        }
+    }
+
+    // F + Water hydrolysis. Real reaction: 2 F₂ + 2 H₂O → 4 HF + O₂.
+    // We can't run this through the normal chemistry engine because
+    // Water's chemistry face (O at valence 6) makes Water-as-donor fail
+    // the donor_v ≤ 4 check. Dedicated pass: F adjacent to Water/Ice/
+    // Steam → F cell becomes derived HF, water cell becomes O. Strongly
+    // exothermic in real life; we add 600°C to both products.
+    fn fluorine_hydrolysis(&mut self) {
+        if !self.has(Element::F)
+            || !(self.has(Element::Water)
+                || self.has(Element::Ice)
+                || self.has(Element::Steam))
+        { return; }
+        const RATE: f32 = 0.50;
+        const REACTION_HEAT: i16 = 600;
+        for y in 0..H as i32 {
+            for x in 0..W as i32 {
+                let i = Self::idx(x, y);
+                if self.cells[i].is_updated() { continue; }
+                let c = self.cells[i];
+                if c.el != Element::F { continue; }
+                for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if !Self::in_bounds(nx, ny) { continue; }
+                    let ni = Self::idx(nx, ny);
+                    if self.cells[ni].is_updated() { continue; }
+                    let n = self.cells[ni];
+                    if !matches!(n.el, Element::Water | Element::Ice | Element::Steam) { continue; }
+                    if rand::gen_range::<f32>(0.0, 1.0) > RATE { continue; }
+                    let Some(hf_id) = derive_or_lookup(Element::H, Element::F)
+                        else { continue; };
+                    // F cell → HF (derived).
+                    let mut hf = Cell::new(Element::Derived);
+                    hf.derived_id = hf_id;
+                    hf.temp = (c.temp as i32 + REACTION_HEAT as i32).min(5000) as i16;
+                    hf.flag |= Cell::FLAG_UPDATED;
+                    self.cells[i] = hf;
+                    // Water cell → O.
+                    let mut o = Cell::new(Element::O);
+                    o.temp = (n.temp as i32 + REACTION_HEAT as i32).min(5000) as i16;
+                    o.flag |= Cell::FLAG_UPDATED;
+                    self.cells[ni] = o;
                     break;
                 }
             }
@@ -8802,7 +9028,13 @@ fn color_rgb(c: Cell) -> [u8; 3] {
         }
         _ => (clamp_u8(r as i16 + v), clamp_u8(g as i16 + v), clamp_u8(b as i16 + v)),
     };
-    if c.moisture > 20 && c.el != Element::Water && c.el != Element::Empty {
+    let is_noble_gas = atom_profile_for(c.el)
+        .map_or(false, |p| matches!(p.category, AtomCategory::NobleGas));
+    if c.moisture > 20
+        && c.el != Element::Water
+        && c.el != Element::Empty
+        && !is_noble_gas
+    {
         let wet = ((c.moisture as f32 - 20.0) / 235.0).clamp(0.0, 1.0) * 0.55;
         r = ((r as f32) * (1.0 - wet)) as u8;
         g = ((g as f32) * (1.0 - wet * 0.9)) as u8;
@@ -8822,11 +9054,25 @@ fn color_rgb(c: Cell) -> [u8; 3] {
         g = ((g as f32) * (1.0 - t) + (sg as f32) * t) as u8;
         b = ((b as f32) * (1.0 - t) + (sb as f32) * t) as u8;
     }
-    if c.temp > 250 && c.el != Element::Fire {
-        // Stage 1: cool → red → orange → yellow (250-1750°C). Models
-        // iron glowing red at ~700°C, orange at ~1100°C, yellow at
-        // ~1500°C. Saturates by 1750°C at RGB(255, 200, 80).
-        let warm_heat = ((c.temp - 250) as f32 / 1500.0).clamp(0.0, 1.0);
+    // Atomic metals stay silvery longer than the generic 250°C ramp
+    // suggests — real molten Al at 660°C is bright silver, real
+    // molten Au at 1064°C is shiny gold, etc. Visible incandescent
+    // glow only kicks in around 800-1000°C+. Without this offset,
+    // freshly-melted metal puddles read as orange-tinted instead of
+    // their proper liquid-metal sheen.
+    let is_atomic_metal = atom_profile_for(c.el).map_or(false, |p|
+        matches!(p.category,
+            AtomCategory::AlkaliMetal
+            | AtomCategory::AlkalineEarth
+            | AtomCategory::TransitionMetal
+            | AtomCategory::PostTransition
+            | AtomCategory::Lanthanide
+            | AtomCategory::Actinide));
+    let warm_start: i16 = if is_atomic_metal { 800 } else { 250 };
+    if c.temp > warm_start && c.el != Element::Fire {
+        // Stage 1: cool → red → orange → yellow. Models iron glowing
+        // red at ~700°C, orange at ~1100°C, yellow at ~1500°C.
+        let warm_heat = ((c.temp - warm_start) as f32 / 1500.0).clamp(0.0, 1.0);
         let warm_mix = warm_heat * 0.8;
         r = ((r as f32) * (1.0 - warm_mix) + 255.0 * warm_mix) as u8;
         g = ((g as f32) * (1.0 - warm_mix) + 200.0 * warm_mix) as u8;
@@ -8871,27 +9117,33 @@ fn color_rgb(c: Cell) -> [u8; 3] {
     // Phase tint for forced (non-native) phases. Molten atoms render darker
     // and warmer; boiled atoms wash toward the background; frozen-out
     // gases/liquids read as a cold bluish-grey. PHASE_NATIVE uses the
-    // element's hand-tuned color with no tint.
-    match c.phase() {
-        PHASE_SOLID => {
-            // shift toward cold bluish grey
-            r = clamp_u8((r as i16) * 7 / 10);
-            g = clamp_u8((g as i16) * 7 / 10);
-            b = clamp_u8((b as i16) * 9 / 10 + 20);
+    // element's hand-tuned color with no tint. Noble gases skip this
+    // entirely — real liquid/solid Ne, Ar, Kr, Xe are essentially
+    // colorless, and the blue-shifted tint turns warm-base noble gases
+    // (orange Ne, red Rn) into dusty purple, which doesn't read as
+    // "frozen colorless" at all.
+    if !is_noble_gas {
+        match c.phase() {
+            PHASE_SOLID => {
+                // shift toward cold bluish grey
+                r = clamp_u8((r as i16) * 7 / 10);
+                g = clamp_u8((g as i16) * 7 / 10);
+                b = clamp_u8((b as i16) * 9 / 10 + 20);
+            }
+            PHASE_LIQUID => {
+                // shift toward red/orange, darken slightly
+                r = clamp_u8((r as i16) * 9 / 10 + 30);
+                g = clamp_u8((g as i16) * 7 / 10 + 15);
+                b = clamp_u8((b as i16) * 5 / 10);
+            }
+            PHASE_GAS => {
+                // wash toward the dark background so gas atoms are faint
+                r = clamp_u8((r as i16) / 2 + 8);
+                g = clamp_u8((g as i16) / 2 + 8);
+                b = clamp_u8((b as i16) / 2 + 12);
+            }
+            _ => {}
         }
-        PHASE_LIQUID => {
-            // shift toward red/orange, darken slightly
-            r = clamp_u8((r as i16) * 9 / 10 + 30);
-            g = clamp_u8((g as i16) * 7 / 10 + 15);
-            b = clamp_u8((b as i16) * 5 / 10);
-        }
-        PHASE_GAS => {
-            // wash toward the dark background so gas atoms are faint
-            r = clamp_u8((r as i16) / 2 + 8);
-            g = clamp_u8((g as i16) / 2 + 8);
-            b = clamp_u8((b as i16) / 2 + 12);
-        }
-        _ => {}
     }
     [r, g, b]
 }
@@ -11003,6 +11255,23 @@ pub async fn run_game() {
                     kind_pix[2] = if c.is_frozen() { 1 } else { 0 };
                     kind_pix[3] = 255;
                     let [mut r, mut g, mut b] = color_rgb(c);
+                    // Liquefied noble gases are essentially colorless in
+                    // real life — liquid Ne, Ar, Kr, Xe are clear/pale
+                    // with at most a faint tint. Desaturate toward
+                    // neutral pale when a noble-gas cell is in Liquid
+                    // phase so it reads as near-transparent rather than
+                    // a vivid colored puddle. Gas-phase keeps its full
+                    // base color (visible cloud) and the energized
+                    // override below replaces with the discharge glow.
+                    if cell_physics(c).kind == Kind::Liquid {
+                        if let Some(profile) = atom_profile_for(c.el) {
+                            if matches!(profile.category, AtomCategory::NobleGas) {
+                                r = ((r as u16 + 220) / 2) as u8;
+                                g = ((g as u16 + 220) / 2) as u8;
+                                b = ((b as u16 + 220) / 2) as u8;
+                            }
+                        }
+                    }
                     // Energized cells get their electrical glow color (noble
                     // gases light up; conducting metals stay their normal
                     // color since glow_color is None for them).
@@ -11057,10 +11326,47 @@ pub async fn run_game() {
                             b = (b as u32 * darken as u32 / 100) as u8;
                         }
                     }
-                    // Gas sidecar: cloud color + density. Hide the discrete
-                    // atom in base so only the blurred cloud halo shows.
+                    // Compute emission early so gas sidecar can use it to
+                    // bake heat into the smooth density blur instead of
+                    // relying on per-cell bloom (which produces stippled
+                    // grids when adjacent gas cells saturate the blur
+                    // kernel).
+                    let mut emission: u32 = if c.temp > 500 {
+                        (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
+                    } else { 0 };
+                    if matches!(c.el, Element::Fire | Element::Lava) {
+                        emission = emission.max(220);
+                    }
+                    if energized_ro[i] && c.el.electrical().glow_color.is_some() {
+                        emission = emission.max(180);
+                    }
                     let is_gas = matches!(cell_physics(c).kind, Kind::Gas);
-                    let (gas_r, gas_g, gas_b) = (r, g, b);
+                    // Gas sidecar: cloud color + density. Hot gas blends
+                    // toward white so the blurred density pass naturally
+                    // carries the glow — a hot N₂ cloud reads as a bright
+                    // pink-warm haze, not pixel-discrete bright cores
+                    // separated by darker gaps. The blend factor is capped
+                    // at 0.75 so the gas keeps some of its base hue even
+                    // at maximum emission.
+                    // Skip warmify for energized cells — the glow color
+                    // is the intended visual; warmifying dilutes vivid
+                    // discharge colors (Ne orange, Ar purple, etc.)
+                    // toward dull peach. Only apply warmify for thermal
+                    // emission (hot gases) where the white-shift is
+                    // physically meaningful.
+                    let (gas_r, gas_g, gas_b) = if is_gas && emission > 0 && !energized_ro[i] {
+                        let warmth = (emission as f32 / 255.0 * 0.75).min(0.75);
+                        let toward_white = |c: u8, w: f32| -> u8 {
+                            (c as f32 + (255.0 - c as f32) * w).round() as u8
+                        };
+                        (
+                            toward_white(r, warmth),
+                            toward_white(g, warmth),
+                            toward_white(b, warmth),
+                        )
+                    } else {
+                        (r, g, b)
+                    };
                     if is_gas {
                         gas_pix[0] = gas_r;
                         gas_pix[1] = gas_g;
@@ -11078,15 +11384,6 @@ pub async fn run_game() {
                     base_pix[2] = b;
                     base_pix[3] = 255;
                     // Bright sidecar: emission-tinted color, inherits cell hue.
-                    let mut emission: u32 = if c.temp > 500 {
-                        (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
-                    } else { 0 };
-                    if matches!(c.el, Element::Fire | Element::Lava) {
-                        emission = emission.max(220);
-                    }
-                    if energized_ro[i] && c.el.electrical().glow_color.is_some() {
-                        emission = emission.max(180);
-                    }
                     if emission == 0 {
                         bright_pix[0] = 0;
                         bright_pix[1] = 0;
@@ -11095,15 +11392,19 @@ pub async fn run_game() {
                     } else {
                         // Source-color for bloom is pre-gas-mask (gas cells
                         // have their atom pixel hidden but should still
-                        // glow if hot enough).
-                        let (br, bg, bb) = if is_gas {
-                            (gas_r as u32, gas_g as u32, gas_b as u32)
+                        // glow if hot enough). Gas cells write a damped
+                        // bloom contribution (1/4) since the warmified gas
+                        // sidecar already carries most of the temperature
+                        // signal — full per-cell bloom would re-introduce
+                        // the stippled-grid look this option is fixing.
+                        let (br, bg, bb, gas_atten) = if is_gas {
+                            (gas_r as u32, gas_g as u32, gas_b as u32, 4u32)
                         } else {
-                            (r as u32, g as u32, b as u32)
+                            (r as u32, g as u32, b as u32, 1u32)
                         };
-                        bright_pix[0] = ((br * emission) / 255).min(255) as u8;
-                        bright_pix[1] = ((bg * emission) / 255).min(255) as u8;
-                        bright_pix[2] = ((bb * emission) / 255).min(255) as u8;
+                        bright_pix[0] = ((br * emission) / (255 * gas_atten)).min(255) as u8;
+                        bright_pix[1] = ((bg * emission) / (255 * gas_atten)).min(255) as u8;
+                        bright_pix[2] = ((bb * emission) / (255 * gas_atten)).min(255) as u8;
                         bright_pix[3] = 255;
                     }
                 });
