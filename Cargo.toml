@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 macroquad = "0.4"
 rayon = "1.10"
+parking_lot = "0.12"
 
 [dev-dependencies]
 serial_test = "3.2.0"

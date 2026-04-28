@@ -13,6 +13,7 @@ name = "alembic"
 version = "0.1.0"
 dependencies = [
  "macroquad",
+ "parking_lot",
  "rayon",
  "serial_test",
 ]

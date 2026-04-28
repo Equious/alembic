@@ -30,7 +30,6 @@ pub enum Element {
     Ice         = 14,
     MoltenGlass = 15,
     Glass       = 16,
-    Charcoal    = 17,
     // --- Atoms (naturally-occurring elements, paintable) ---
     H  = 18, He = 19, C  = 20, N  = 21, O  = 22, F  = 23, Ne = 24,
     Na = 25, Mg = 26, Al = 27, Si = 28, P  = 29, S  = 30, Cl = 31,
@@ -89,8 +88,27 @@ pub enum Element {
     // Caesium — softest, most reactive stable alkali metal (EN 0.79).
     // Melts near body temp, ignites in air, detonates in water.
     Cs = 54,
+    // ---- Periodic-table fill, batch 1: rest of the main table ----
+    // Period 2 missing. Lithium and beryllium.
+    Li = 55,  Be = 56,
+    // Period 4 transition + post-transition + p-block remainders.
+    Sc = 57,  Ti = 58,  V  = 59,  Cr = 60,  Mn = 61,  Co = 62,
+    Ga = 63,  Ge = 64,  As = 65,  Se = 66,  Br = 67,  Kr = 68,
+    // Period 5.
+    Rb = 69,  Sr = 70,  Y  = 71,  Zr = 72,  Nb = 73,  Mo = 74,
+    Tc = 75,  Ru = 76,  Rh = 77,  Pd = 78,  Cd = 79,  In = 80,
+    Sn = 81,  Sb = 82,  Te = 83,  I  = 84,  Xe = 85,
+    // Period 6 main + lanthanides (period 8 in our layout).
+    Ba = 86,
+    La = 87,  Ce = 88,  Pr = 89,  Nd = 90,  Pm = 91,  Sm = 92,
+    Eu = 93,  Gd = 94,  Tb = 95,  Dy = 96,  Ho = 97,  Er = 98,
+    Tm = 99,  Yb = 100, Lu = 101,
+    Hf = 102, Ta = 103, W  = 104, Re = 105, Os = 106, Ir = 107, Pt = 108,
+    Tl = 109, Bi = 110, Po = 111, At = 112, Rn = 113,
+    // Period 7 + actinides (period 9 in our layout).
+    Fr = 114, Ac = 115, Th = 116, Pa = 117,
 }
-const ELEMENT_COUNT: usize = 55;
+const ELEMENT_COUNT: usize = 118;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind { Empty, Solid, Gravel, Powder, Liquid, Gas, Fire }
@@ -103,7 +121,28 @@ pub enum Kind { Empty, Solid, Gravel, Powder, Liquid, Gas, Fire }
 enum ToolMode { Paint, Heat, Vacuum, Pipet, Prefab, Wire }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PrefabKind { Beaker, Box, Battery }
+pub enum PrefabKind { Beaker, Box, Battery, Line, Circle, Bowl }
+const PREFAB_KIND_COUNT: usize = 6;
+const PREFAB_KINDS: [PrefabKind; PREFAB_KIND_COUNT] = [
+    PrefabKind::Beaker,
+    PrefabKind::Box,
+    PrefabKind::Battery,
+    PrefabKind::Line,
+    PrefabKind::Circle,
+    PrefabKind::Bowl,
+];
+impl PrefabKind {
+    fn label(self) -> &'static str {
+        match self {
+            PrefabKind::Beaker  => "Beaker",
+            PrefabKind::Box     => "Box",
+            PrefabKind::Battery => "Battery",
+            PrefabKind::Line    => "Line",
+            PrefabKind::Circle  => "Circle",
+            PrefabKind::Bowl    => "Bowl",
+        }
+    }
+}
 
 impl Kind {
     // "Rigid" matter — solids, stones, and powders — can't be pushed aside by
@@ -232,7 +271,6 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     a[Element::Ice      as usize] = PhysicsProfile { density:   9, kind: Kind::Gravel, viscosity:   0, molar_mass:  0.0 };
     a[Element::MoltenGlass as usize] = PhysicsProfile { density: 15, kind: Kind::Liquid, viscosity: 150, molar_mass:  0.0 };
     a[Element::Glass    as usize] = PhysicsProfile { density:  35, kind: Kind::Gravel, viscosity:   0, molar_mass:  0.0 };
-    a[Element::Charcoal as usize] = PhysicsProfile { density:   5, kind: Kind::Powder, viscosity:   0, molar_mass:  0.0 };
 
     // --- Atoms ---
     // `density` is retained only as a coarse hierarchy signal for rigid/fluid
@@ -290,8 +328,14 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     // tolerance. Used for high-temperature containers (quartz lab
     // glassware, firebrick furnaces). Dense enough to sink through
     // most liquids if un-frozen.
-    a[Element::Quartz    as usize] = PhysicsProfile { density: 33, kind: Kind::Solid, viscosity: 0, molar_mass: 60.1 };
-    a[Element::Firebrick as usize] = PhysicsProfile { density: 42, kind: Kind::Solid, viscosity: 0, molar_mass: 0.0 };
+    // Quartz / Firebrick: Kind::Gravel (was Solid). When frozen as a
+    // wall they're inert anyway, but once an explosion ruptures
+    // them and flips off the FROZEN flag, the loose chunks need to
+    // fall under gravity — Kind::Solid only dispatches to
+    // try_pressure_shove (no gravity path), so chunks were floating
+    // mid-air after the wall broke.
+    a[Element::Quartz    as usize] = PhysicsProfile { density: 33, kind: Kind::Gravel, viscosity: 0, molar_mass: 60.1 };
+    a[Element::Firebrick as usize] = PhysicsProfile { density: 42, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
     // Argon — monatomic noble gas, denser than air (Ar₂O doesn't exist,
     // it's chemically inert). Forms 1% of real atmosphere.
     a[Element::Ar        as usize] = PhysicsProfile { density: -1, kind: Kind::Gas,   viscosity: 0, molar_mass: 40.0 };
@@ -299,6 +343,79 @@ static PHYSICS: [PhysicsProfile; ELEMENT_COUNT] = {
     // Behaves like a wall that injects energy into connected conductors.
     a[Element::BattPos as usize] = PhysicsProfile { density: 60, kind: Kind::Solid, viscosity: 0, molar_mass: 0.0 };
     a[Element::BattNeg as usize] = PhysicsProfile { density: 60, kind: Kind::Solid, viscosity: 0, molar_mass: 0.0 };
+    // ---- Periodic-table fill ----
+    // Density values are real_density × 10 to fit our integer
+    // scale (Stone=100, Iron=79, Mg=17). Negative for gases so the
+    // gas-phase logic correctly buoys/sinks vs ambient air.
+    // Period 2.
+    a[Element::Li as usize] = PhysicsProfile { density:   5, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Be as usize] = PhysicsProfile { density:  19, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    // Period 4 fill.
+    a[Element::Sc as usize] = PhysicsProfile { density:  30, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ti as usize] = PhysicsProfile { density:  45, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::V  as usize] = PhysicsProfile { density:  60, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Cr as usize] = PhysicsProfile { density:  72, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Mn as usize] = PhysicsProfile { density:  72, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Co as usize] = PhysicsProfile { density:  89, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ga as usize] = PhysicsProfile { density:  59, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ge as usize] = PhysicsProfile { density:  53, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::As as usize] = PhysicsProfile { density:  57, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Se as usize] = PhysicsProfile { density:  48, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    // Bromine — only nonmetal liquid at STP besides Hg.
+    a[Element::Br as usize] = PhysicsProfile { density:  31, kind: Kind::Liquid, viscosity: 80, molar_mass: 159.8 };
+    a[Element::Kr as usize] = PhysicsProfile { density:  -2, kind: Kind::Gas,    viscosity: 0, molar_mass: 83.8 };
+    // Period 5.
+    a[Element::Rb as usize] = PhysicsProfile { density:  15, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Sr as usize] = PhysicsProfile { density:  26, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Y  as usize] = PhysicsProfile { density:  45, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Zr as usize] = PhysicsProfile { density:  65, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Nb as usize] = PhysicsProfile { density:  86, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Mo as usize] = PhysicsProfile { density: 103, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Tc as usize] = PhysicsProfile { density: 110, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ru as usize] = PhysicsProfile { density: 124, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Rh as usize] = PhysicsProfile { density: 124, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Pd as usize] = PhysicsProfile { density: 120, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Cd as usize] = PhysicsProfile { density:  87, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::In as usize] = PhysicsProfile { density:  73, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Sn as usize] = PhysicsProfile { density:  73, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Sb as usize] = PhysicsProfile { density:  67, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Te as usize] = PhysicsProfile { density:  62, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::I  as usize] = PhysicsProfile { density:  49, kind: Kind::Gravel, viscosity: 0, molar_mass: 253.8 };
+    a[Element::Xe as usize] = PhysicsProfile { density:  -1, kind: Kind::Gas,    viscosity: 0, molar_mass: 131.3 };
+    // Period 6 main + lanthanides.
+    a[Element::Ba as usize] = PhysicsProfile { density:  35, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::La as usize] = PhysicsProfile { density:  61, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ce as usize] = PhysicsProfile { density:  67, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Pr as usize] = PhysicsProfile { density:  67, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Nd as usize] = PhysicsProfile { density:  70, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Pm as usize] = PhysicsProfile { density:  72, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Sm as usize] = PhysicsProfile { density:  75, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Eu as usize] = PhysicsProfile { density:  52, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Gd as usize] = PhysicsProfile { density:  79, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Tb as usize] = PhysicsProfile { density:  82, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Dy as usize] = PhysicsProfile { density:  86, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ho as usize] = PhysicsProfile { density:  88, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Er as usize] = PhysicsProfile { density:  91, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Tm as usize] = PhysicsProfile { density:  93, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Yb as usize] = PhysicsProfile { density:  70, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Lu as usize] = PhysicsProfile { density:  98, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Hf as usize] = PhysicsProfile { density: 133, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ta as usize] = PhysicsProfile { density: 167, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::W  as usize] = PhysicsProfile { density: 193, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Re as usize] = PhysicsProfile { density: 210, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Os as usize] = PhysicsProfile { density: 226, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ir as usize] = PhysicsProfile { density: 226, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Pt as usize] = PhysicsProfile { density: 215, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Tl as usize] = PhysicsProfile { density: 119, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Bi as usize] = PhysicsProfile { density:  98, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Po as usize] = PhysicsProfile { density:  92, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::At as usize] = PhysicsProfile { density:  64, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Rn as usize] = PhysicsProfile { density:  -2, kind: Kind::Gas,    viscosity: 0, molar_mass: 222.0 };
+    // Period 7 + actinides.
+    a[Element::Fr as usize] = PhysicsProfile { density:  19, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Ac as usize] = PhysicsProfile { density: 100, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Th as usize] = PhysicsProfile { density: 117, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
+    a[Element::Pa as usize] = PhysicsProfile { density: 154, kind: Kind::Gravel, viscosity: 0, molar_mass: 0.0 };
     a
 };
 
@@ -422,12 +539,6 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
         melt_above: Some(ph(1100, Element::MoltenGlass, 300.0)),
         ..base()
     };
-    a[Element::Charcoal as usize] = ThermalProfile {
-        // Solid residue of burned wood. Conducts/insulates more or less like
-        // other powders. Not flammable — already burnt.
-        ambient_rate: 0.003, conductivity: 0.015, heat_capacity: 1.0, ..base()
-    };
-
     // --- Atoms ---
     // Flammable atoms get ignite_above + burn params; everything else uses
     // base(). Melting/boiling transitions left off for now — we don't have
@@ -493,6 +604,48 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
         ambient_rate: 0.025, conductivity: 0.080, heat_capacity: 1.0,
         ignite_above: Some(50), burn_duration: Some(8),
         burn_temp: Some(1400), ..base()
+    };
+    // ---- Periodic-table fill: bespoke thermal behaviour ----
+    // Reactive alkali metals that ignite in air at low temps. Heavier
+    // alkalis (Rb, Fr) react more violently than Na — modeled with a
+    // lower ignition threshold and shorter burn.
+    a[Element::Li as usize] = ThermalProfile {
+        ignite_above: Some(180), burn_duration: Some(60), burn_temp: Some(1200), ..base()
+    };
+    a[Element::Rb as usize] = ThermalProfile {
+        ignite_above: Some(40), burn_duration: Some(70), burn_temp: Some(750), ..base()
+    };
+    a[Element::Fr as usize] = ThermalProfile {
+        // All Fr isotopes are radioactive; in real life nothing has
+        // ever been observed in bulk. We treat it as the most reactive
+        // alkali — ignites essentially on contact.
+        ignite_above: Some(28), burn_duration: Some(8), burn_temp: Some(1400), ..base()
+    };
+    // Strontium and Barium burn with the characteristic flame-test
+    // colours (Sr crimson, Ba green). Magnesium-style ignition.
+    a[Element::Sr as usize] = ThermalProfile {
+        ignite_above: Some(720), burn_duration: Some(80), burn_temp: Some(2000), ..base()
+    };
+    a[Element::Ba as usize] = ThermalProfile {
+        ignite_above: Some(700), burn_duration: Some(80), burn_temp: Some(2000), ..base()
+    };
+    // Beryllium has high mp but burns dazzling-white when finely
+    // divided; let it ignite well below mp.
+    a[Element::Be as usize] = ThermalProfile {
+        ignite_above: Some(900), burn_duration: Some(70), burn_temp: Some(2400), ..base()
+    };
+    // Titanium burns with an intense white flame (used in fireworks).
+    a[Element::Ti as usize] = ThermalProfile {
+        ignite_above: Some(1200), burn_duration: Some(60), burn_temp: Some(2300), ..base()
+    };
+    // Boron — finely divided B powder burns with a vivid green flame
+    // (boric acid + boron itself give the same flame test). Real
+    // amorphous boron auto-ignites in air around 700°C; we set the
+    // threshold a touch lower so it's reachable without a torch on
+    // every sustained heat source. Slow burn (long duration) compared
+    // to Mg's flash, since B combustion in air is more deliberate.
+    a[Element::B as usize] = ThermalProfile {
+        ignite_above: Some(600), burn_duration: Some(80), burn_temp: Some(1800), ..base()
     };
     // Fluorine — no bespoke thermal quirks (it doesn't burn itself; it's
     // the aggressor that oxidizes everything else via the reaction engine).
@@ -569,7 +722,6 @@ static PRESSURE: [PressureProfile; ELEMENT_COUNT] = {
     a[Element::Sand     as usize] = PressureProfile { permeability: 25, compliance: 15, formation_pressure: 0 };
     a[Element::Mud      as usize] = PressureProfile { permeability: 15, compliance:  8, formation_pressure: 0 };
     a[Element::Leaves   as usize] = PressureProfile { permeability: 40, compliance: 30, formation_pressure: 0 };
-    a[Element::Charcoal as usize] = PressureProfile { permeability: 30, compliance: 15, formation_pressure: 0 };
     // Liquids — transmit pressure well, slosh toward lower-pressure neighbors.
     a[Element::Water       as usize] = PressureProfile { permeability: 120, compliance: 60, formation_pressure: 0 };
     a[Element::Oil         as usize] = PressureProfile { permeability: 100, compliance: 50, formation_pressure: 0 };
@@ -633,6 +785,77 @@ static PRESSURE: [PressureProfile; ELEMENT_COUNT] = {
     a[Element::B  as usize] = PressureProfile { permeability: 20, compliance:  0, formation_pressure: 0 };
     a[Element::Ra as usize] = PressureProfile { permeability: 0, compliance: 20, formation_pressure: 0 };
     a[Element::Cs as usize] = PressureProfile { permeability: 0, compliance: 30, formation_pressure: 0 };
+    // ---- Periodic-table fill ----
+    // Soft alkali/alkaline-earth metals (Li/Rb/Sr/Ba/Fr) get higher
+    // compliance — they yield easily under blast pressure. Hard
+    // transition metals (Ti/Cr/W/Re/Os/Ir/Pt) get low compliance — like
+    // Fe/Pt. Post-transition (Sn/Tl/Bi) and lanthanides land in between.
+    a[Element::Li as usize] = PressureProfile { permeability: 0, compliance: 32, formation_pressure: 0 };
+    a[Element::Be as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Sc as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Ti as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::V  as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Cr as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Mn as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::Co as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::Ga as usize] = PressureProfile { permeability: 0, compliance: 25, formation_pressure: 0 };
+    a[Element::Ge as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::As as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::Se as usize] = PressureProfile { permeability: 0, compliance: 18, formation_pressure: 0 };
+    // Bromine — liquid, transmits pressure like other liquids.
+    a[Element::Br as usize] = PressureProfile { permeability: 100, compliance: 50, formation_pressure: 0 };
+    // Krypton/Xenon/Radon — gases.
+    a[Element::Kr as usize] = PressureProfile { permeability: 230, compliance: 200, formation_pressure: 0 };
+    a[Element::Xe as usize] = PressureProfile { permeability: 230, compliance: 200, formation_pressure: 0 };
+    a[Element::Rn as usize] = PressureProfile { permeability: 230, compliance: 200, formation_pressure: 0 };
+    a[Element::Rb as usize] = PressureProfile { permeability: 0, compliance: 32, formation_pressure: 0 };
+    a[Element::Sr as usize] = PressureProfile { permeability: 0, compliance: 22, formation_pressure: 0 };
+    a[Element::Y  as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Zr as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Nb as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Mo as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Tc as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Ru as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Rh as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Pd as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::Cd as usize] = PressureProfile { permeability: 0, compliance: 18, formation_pressure: 0 };
+    a[Element::In as usize] = PressureProfile { permeability: 0, compliance: 22, formation_pressure: 0 };
+    a[Element::Sn as usize] = PressureProfile { permeability: 0, compliance: 22, formation_pressure: 0 };
+    a[Element::Sb as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::Te as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
+    a[Element::I  as usize] = PressureProfile { permeability: 20, compliance: 18, formation_pressure: 0 };
+    a[Element::Ba as usize] = PressureProfile { permeability: 0, compliance: 20, formation_pressure: 0 };
+    // Lanthanides — modest compliance (similar across the series).
+    a[Element::La as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Ce as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Pr as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Nd as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Pm as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Sm as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Eu as usize] = PressureProfile { permeability: 0, compliance: 18, formation_pressure: 0 };
+    a[Element::Gd as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Tb as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Dy as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Ho as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Er as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Tm as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Yb as usize] = PressureProfile { permeability: 0, compliance: 18, formation_pressure: 0 };
+    a[Element::Lu as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Hf as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Ta as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::W  as usize] = PressureProfile { permeability: 0, compliance:  8, formation_pressure: 0 };
+    a[Element::Re as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Os as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Ir as usize] = PressureProfile { permeability: 0, compliance: 10, formation_pressure: 0 };
+    a[Element::Pt as usize] = PressureProfile { permeability: 0, compliance: 12, formation_pressure: 0 };
+    a[Element::Tl as usize] = PressureProfile { permeability: 0, compliance: 22, formation_pressure: 0 };
+    a[Element::Bi as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Po as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::At as usize] = PressureProfile { permeability: 0, compliance: 18, formation_pressure: 0 };
+    a[Element::Fr as usize] = PressureProfile { permeability: 0, compliance: 32, formation_pressure: 0 };
+    a[Element::Ac as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Th as usize] = PressureProfile { permeability: 0, compliance: 16, formation_pressure: 0 };
+    a[Element::Pa as usize] = PressureProfile { permeability: 0, compliance: 14, formation_pressure: 0 };
     a
 };
 
@@ -671,6 +894,69 @@ static ELECTRICAL: [ElectricalProfile; ELEMENT_COUNT] = {
     a[Element::Pb as usize] = ElectricalProfile { conductivity: 0.08, glow_color: None };
     a[Element::Ra as usize] = ElectricalProfile { conductivity: 0.15, glow_color: None };
     a[Element::Cs as usize] = ElectricalProfile { conductivity: 0.18, glow_color: None };
+    // ---- Periodic-table fill ----
+    // Conductivity values keyed to the real-world ordering Ag > Cu > Au
+    // > Al > Ca > Be > W > Mo > Mg > Zn > Co > Ni > Fe > Pt > Sn > Pb,
+    // mapped onto our 0–1 sandbox scale.
+    a[Element::Li as usize] = ElectricalProfile { conductivity: 0.32, glow_color: None };
+    a[Element::Be as usize] = ElectricalProfile { conductivity: 0.55, glow_color: None };
+    a[Element::Sc as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Ti as usize] = ElectricalProfile { conductivity: 0.12, glow_color: None };
+    a[Element::V  as usize] = ElectricalProfile { conductivity: 0.12, glow_color: None };
+    a[Element::Cr as usize] = ElectricalProfile { conductivity: 0.40, glow_color: None };
+    a[Element::Mn as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Co as usize] = ElectricalProfile { conductivity: 0.32, glow_color: None };
+    a[Element::Ga as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Ge as usize] = ElectricalProfile { conductivity: 0.04, glow_color: None };
+    // As/Se/Te are metalloids/nonmetals; near-insulating.
+    a[Element::Rb as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    a[Element::Sr as usize] = ElectricalProfile { conductivity: 0.18, glow_color: None };
+    a[Element::Y  as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Zr as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Nb as usize] = ElectricalProfile { conductivity: 0.30, glow_color: None };
+    a[Element::Mo as usize] = ElectricalProfile { conductivity: 0.55, glow_color: None };
+    a[Element::Tc as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    a[Element::Ru as usize] = ElectricalProfile { conductivity: 0.40, glow_color: None };
+    a[Element::Rh as usize] = ElectricalProfile { conductivity: 0.55, glow_color: None };
+    a[Element::Pd as usize] = ElectricalProfile { conductivity: 0.40, glow_color: None };
+    a[Element::Cd as usize] = ElectricalProfile { conductivity: 0.25, glow_color: None };
+    a[Element::In as usize] = ElectricalProfile { conductivity: 0.30, glow_color: None };
+    a[Element::Sn as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    a[Element::Sb as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Ba as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    // Lanthanides — generally ~0.06–0.16 sim units (modest conductors).
+    a[Element::La as usize] = ElectricalProfile { conductivity: 0.07, glow_color: None };
+    a[Element::Ce as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Pr as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Nd as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Pm as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Sm as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Eu as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Gd as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Tb as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Dy as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Ho as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Er as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
+    a[Element::Tm as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Yb as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Lu as usize] = ElectricalProfile { conductivity: 0.06, glow_color: None };
+    a[Element::Hf as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Ta as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    a[Element::W  as usize] = ElectricalProfile { conductivity: 0.50, glow_color: None };
+    a[Element::Re as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    a[Element::Os as usize] = ElectricalProfile { conductivity: 0.30, glow_color: None };
+    a[Element::Ir as usize] = ElectricalProfile { conductivity: 0.40, glow_color: None };
+    a[Element::Pt as usize] = ElectricalProfile { conductivity: 0.40, glow_color: None };
+    a[Element::Tl as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Bi as usize] = ElectricalProfile { conductivity: 0.02, glow_color: None };
+    // Po/At — modest semiconductor-ish.
+    a[Element::Fr as usize] = ElectricalProfile { conductivity: 0.18, glow_color: None };
+    a[Element::Ac as usize] = ElectricalProfile { conductivity: 0.10, glow_color: None };
+    a[Element::Th as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    a[Element::Pa as usize] = ElectricalProfile { conductivity: 0.20, glow_color: None };
+    // Noble gases get glow colors (neon-tube behaviour) when energized.
+    // Krypton: pale white-blue. Xenon: deep blue. Radon: same family —
+    // but radon is so rare in the sim we skip glow.
     // Boron — metalloid, near-insulator at STP (semiconductor strictly).
     a[Element::B  as usize] = ElectricalProfile { conductivity: 0.01, glow_color: None };
     a[Element::Si as usize] = ElectricalProfile { conductivity: 0.05, glow_color: None };
@@ -689,6 +975,21 @@ static ELECTRICAL: [ElectricalProfile; ELEMENT_COUNT] = {
     };
     a[Element::He as usize] = ElectricalProfile {
         conductivity: 0.0, glow_color: Some((255, 160, 150)),
+    };
+    // Nitrogen — discharge tubes glow pink-orange / red-violet from
+    // the broad N₂ band emission. Real "neon" novelty signs that look
+    // pink are actually nitrogen, not neon.
+    a[Element::N as usize] = ElectricalProfile {
+        conductivity: 0.0, glow_color: Some((255, 130, 160)),
+    };
+    // Krypton — pale white with a faint blue. Real Kr discharge tubes
+    // are off-white from the broad multi-line emission spectrum.
+    a[Element::Kr as usize] = ElectricalProfile {
+        conductivity: 0.0, glow_color: Some((220, 230, 255)),
+    };
+    // Xenon — deep blue-violet, classic Xe-arc lamp colour.
+    a[Element::Xe as usize] = ElectricalProfile {
+        conductivity: 0.0, glow_color: Some((90, 120, 255)),
     };
     // Battery — high conductivity so current flows out of it freely;
     // acts as a voltage source in the energized flood.
@@ -825,8 +1126,20 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         notes: "inert noble gas; rises in air; does not react" },
 
     // ---- Period 2 ----
-    stub(3,  "Li", "Lithium",   2,  1, AlkaliMetal,    6.94,   SSolid),
-    stub(4,  "Be", "Beryllium", 2,  2, AlkalineEarth,  9.012,  SSolid),
+    AtomProfile { number: 3, symbol: "Li", name: "Lithium",
+        period: 2, group: 1, stp_state: SSolid, category: AlkaliMetal,
+        atomic_mass: 6.94, melting_point: 180, boiling_point: 1342, density_stp: 0.534,
+        electronegativity: 0.98, valence_electrons: 1,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "lightest metal; reactive alkali; ignites in air; lithium battery anode" },
+    AtomProfile { number: 4, symbol: "Be", name: "Beryllium",
+        period: 2, group: 2, stp_state: SSolid, category: AlkalineEarth,
+        atomic_mass: 9.012, melting_point: 1287, boiling_point: 2469, density_stp: 1.85,
+        electronegativity: 1.57, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "toxic; very high mp for a light metal; copper-beryllium alloys" },
     AtomProfile { number: 5, symbol: "B", name: "Boron",
         period: 2, group: 13, stp_state: SSolid, category: Metalloid,
         atomic_mass: 10.81, melting_point: 2076, boiling_point: 3927, density_stp: 2.08,
@@ -943,11 +1256,41 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "soft silvery metal; major constituent of limestone, shells, bone" },
-    stub(21, "Sc", "Scandium",   4,  3, TransitionMetal, 44.956, SSolid),
-    stub(22, "Ti", "Titanium",   4,  4, TransitionMetal, 47.867, SSolid),
-    stub(23, "V",  "Vanadium",   4,  5, TransitionMetal, 50.942, SSolid),
-    stub(24, "Cr", "Chromium",   4,  6, TransitionMetal, 51.996, SSolid),
-    stub(25, "Mn", "Manganese",  4,  7, TransitionMetal, 54.938, SSolid),
+    AtomProfile { number: 21, symbol: "Sc", name: "Scandium",
+        period: 4, group: 3, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 44.956, melting_point: 1541, boiling_point: 2836, density_stp: 2.985,
+        electronegativity: 1.36, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "rare-earth-adjacent transition metal; aerospace alloy additive" },
+    AtomProfile { number: 22, symbol: "Ti", name: "Titanium",
+        period: 4, group: 4, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 47.867, melting_point: 1668, boiling_point: 3287, density_stp: 4.506,
+        electronegativity: 1.54, valence_electrons: 4,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "strong, light, corrosion-resistant; aerospace and implants" },
+    AtomProfile { number: 23, symbol: "V", name: "Vanadium",
+        period: 4, group: 5, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 50.942, melting_point: 1910, boiling_point: 3407, density_stp: 6.0,
+        electronegativity: 1.63, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "hard transition metal; steel additive for spring/tool steels" },
+    AtomProfile { number: 24, symbol: "Cr", name: "Chromium",
+        period: 4, group: 6, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 51.996, melting_point: 1907, boiling_point: 2671, density_stp: 7.19,
+        electronegativity: 1.66, valence_electrons: 6,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "lustrous corrosion-resistant; chrome plating, stainless-steel additive" },
+    AtomProfile { number: 25, symbol: "Mn", name: "Manganese",
+        period: 4, group: 7, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 54.938, melting_point: 1246, boiling_point: 2061, density_stp: 7.21,
+        electronegativity: 1.55, valence_electrons: 7,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "hard brittle transition metal; steel alloying, batteries" },
     AtomProfile { number: 26, symbol: "Fe", name: "Iron",
         period: 4, group: 8, stp_state: SSolid, category: TransitionMetal,
         atomic_mass: 55.845, melting_point: 1538, boiling_point: 2862, density_stp: 7.874,
@@ -955,7 +1298,13 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "workhorse metal; rusts in moist air (Fe + O + H2O); magnetic" },
-    stub(27, "Co", "Cobalt",     4,  9, TransitionMetal, 58.933, SSolid),
+    AtomProfile { number: 27, symbol: "Co", name: "Cobalt",
+        period: 4, group: 9, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 58.933, melting_point: 1495, boiling_point: 2927, density_stp: 8.90,
+        electronegativity: 1.88, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "ferromagnetic; classic blue-pigment metal; superalloy and battery cathodes" },
     AtomProfile { number: 28, symbol: "Ni", name: "Nickel",
         period: 4, group: 10, stp_state: SSolid, category: TransitionMetal,
         atomic_mass: 58.693, melting_point: 1455, boiling_point: 2913, density_stp: 8.91,
@@ -977,24 +1326,120 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "reactive metal; Zn+HCl fizzes H₂; textbook galvanic anode vs Cu" },
-    stub(31, "Ga", "Gallium",    4, 13, PostTransition,  69.723, SSolid),
-    stub(32, "Ge", "Germanium",  4, 14, Metalloid,       72.630, SSolid),
-    stub(33, "As", "Arsenic",    4, 15, Metalloid,       74.922, SSolid),
-    stub(34, "Se", "Selenium",   4, 16, Nonmetal,        78.971, SSolid),
-    stub(35, "Br", "Bromine",    4, 17, Halogen,         79.904, SLiquid),
-    stub(36, "Kr", "Krypton",    4, 18, NobleGas,        83.798, SGas),
+    AtomProfile { number: 31, symbol: "Ga", name: "Gallium",
+        period: 4, group: 13, stp_state: SSolid, category: PostTransition,
+        atomic_mass: 69.723, melting_point: 30, boiling_point: 2204, density_stp: 5.91,
+        electronegativity: 1.81, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "famously melts in your hand (mp ~30°C); semiconductor; embrittles aluminum" },
+    AtomProfile { number: 32, symbol: "Ge", name: "Germanium",
+        period: 4, group: 14, stp_state: SSolid, category: Metalloid,
+        atomic_mass: 72.630, melting_point: 938, boiling_point: 2833, density_stp: 5.32,
+        electronegativity: 2.01, valence_electrons: 4,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "metalloid semiconductor; precursor to silicon in early transistors" },
+    AtomProfile { number: 33, symbol: "As", name: "Arsenic",
+        period: 4, group: 15, stp_state: SSolid, category: Metalloid,
+        atomic_mass: 74.922, melting_point: 817, boiling_point: 614, density_stp: 5.73,
+        electronegativity: 2.18, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "toxic metalloid; sublimes (bp < mp at 1 atm); historical poison" },
+    AtomProfile { number: 34, symbol: "Se", name: "Selenium",
+        period: 4, group: 16, stp_state: SSolid, category: Nonmetal,
+        atomic_mass: 78.971, melting_point: 221, boiling_point: 685, density_stp: 4.81,
+        electronegativity: 2.55, valence_electrons: 6,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "nonmetal; semiconductor used in xerography and red glass tints" },
+    AtomProfile { number: 35, symbol: "Br", name: "Bromine",
+        period: 4, group: 17, stp_state: SLiquid, category: Halogen,
+        atomic_mass: 79.904, melting_point: -7, boiling_point: 59, density_stp: 3.10,
+        electronegativity: 2.96, valence_electrons: 7,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "only nonmetal liquid at STP besides Hg; toxic red-brown; reacts with metals" },
+    AtomProfile { number: 36, symbol: "Kr", name: "Krypton",
+        period: 4, group: 18, stp_state: SGas, category: NobleGas,
+        atomic_mass: 83.798, melting_point: -157, boiling_point: -153, density_stp: 0.003733,
+        electronegativity: 0.0, valence_electrons: 8,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "noble gas; whitish glow when energized; inert to everything except F at extremes" },
 
     // ---- Period 5 ----
-    stub(37, "Rb", "Rubidium",    5,  1, AlkaliMetal,     85.468, SSolid),
-    stub(38, "Sr", "Strontium",   5,  2, AlkalineEarth,   87.62,  SSolid),
-    stub(39, "Y",  "Yttrium",     5,  3, TransitionMetal, 88.906, SSolid),
-    stub(40, "Zr", "Zirconium",   5,  4, TransitionMetal, 91.224, SSolid),
-    stub(41, "Nb", "Niobium",     5,  5, TransitionMetal, 92.906, SSolid),
-    stub(42, "Mo", "Molybdenum",  5,  6, TransitionMetal, 95.95,  SSolid),
-    stub(43, "Tc", "Technetium",  5,  7, TransitionMetal, 98.0,   SSolid),
-    stub(44, "Ru", "Ruthenium",   5,  8, TransitionMetal,101.07,  SSolid),
-    stub(45, "Rh", "Rhodium",     5,  9, TransitionMetal,102.91,  SSolid),
-    stub(46, "Pd", "Palladium",   5, 10, TransitionMetal,106.42,  SSolid),
+    AtomProfile { number: 37, symbol: "Rb", name: "Rubidium",
+        period: 5, group: 1, stp_state: SSolid, category: AlkaliMetal,
+        atomic_mass: 85.468, melting_point: 39, boiling_point: 688, density_stp: 1.532,
+        electronegativity: 0.82, valence_electrons: 1,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "very low-mp alkali; ignites on contact with air; atomic clocks" },
+    AtomProfile { number: 38, symbol: "Sr", name: "Strontium",
+        period: 5, group: 2, stp_state: SSolid, category: AlkalineEarth,
+        atomic_mass: 87.62, melting_point: 777, boiling_point: 1382, density_stp: 2.64,
+        electronegativity: 0.95, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "burns crimson-red in flame tests; signal flares and fireworks" },
+    AtomProfile { number: 39, symbol: "Y", name: "Yttrium",
+        period: 5, group: 3, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 88.906, melting_point: 1526, boiling_point: 2930, density_stp: 4.472,
+        electronegativity: 1.22, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "rare-earth-adjacent; YBCO superconductor compound" },
+    AtomProfile { number: 40, symbol: "Zr", name: "Zirconium",
+        period: 5, group: 4, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 91.224, melting_point: 1855, boiling_point: 4377, density_stp: 6.52,
+        electronegativity: 1.33, valence_electrons: 4,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "low neutron absorption; nuclear fuel rod cladding (Zircaloy)" },
+    AtomProfile { number: 41, symbol: "Nb", name: "Niobium",
+        period: 5, group: 5, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 92.906, melting_point: 2477, boiling_point: 4744, density_stp: 8.57,
+        electronegativity: 1.6, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "superconducting alloys; jet-engine superalloys" },
+    AtomProfile { number: 42, symbol: "Mo", name: "Molybdenum",
+        period: 5, group: 6, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 95.95, melting_point: 2623, boiling_point: 4639, density_stp: 10.28,
+        electronegativity: 2.16, valence_electrons: 6,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "very high mp; high-strength steel additive (Mo steel)" },
+    AtomProfile { number: 43, symbol: "Tc", name: "Technetium",
+        period: 5, group: 7, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 98.0, melting_point: 2157, boiling_point: 4265, density_stp: 11.0,
+        electronegativity: 1.9, valence_electrons: 7,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "first synthetically-produced element; all isotopes radioactive (Tc-99 sim-stable)" },
+    AtomProfile { number: 44, symbol: "Ru", name: "Ruthenium",
+        period: 5, group: 8, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 101.07, melting_point: 2334, boiling_point: 4150, density_stp: 12.45,
+        electronegativity: 2.2, valence_electrons: 8,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "platinum-group metal; corrosion-resistant; hardens Pt/Pd alloys" },
+    AtomProfile { number: 45, symbol: "Rh", name: "Rhodium",
+        period: 5, group: 9, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 102.91, melting_point: 1964, boiling_point: 3695, density_stp: 12.41,
+        electronegativity: 2.28, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "platinum-group; catalytic converters; one of the rarest stable metals" },
+    AtomProfile { number: 46, symbol: "Pd", name: "Palladium",
+        period: 5, group: 10, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 106.42, melting_point: 1555, boiling_point: 2963, density_stp: 12.023,
+        electronegativity: 2.20, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "absorbs hydrogen up to 900× its volume; catalysis, fuel cells" },
     AtomProfile { number: 47, symbol: "Ag", name: "Silver",
         period: 5, group: 11, stp_state: SSolid, category: TransitionMetal,
         atomic_mass: 107.87, melting_point: 962, boiling_point: 2162, density_stp: 10.49,
@@ -1002,13 +1447,55 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "highest electrical/thermal conductivity of any metal" },
-    stub(48, "Cd", "Cadmium",     5, 12, TransitionMetal,112.41,  SSolid),
-    stub(49, "In", "Indium",      5, 13, PostTransition, 114.82,  SSolid),
-    stub(50, "Sn", "Tin",         5, 14, PostTransition, 118.71,  SSolid),
-    stub(51, "Sb", "Antimony",    5, 15, Metalloid,      121.76,  SSolid),
-    stub(52, "Te", "Tellurium",   5, 16, Metalloid,      127.60,  SSolid),
-    stub(53, "I",  "Iodine",      5, 17, Halogen,        126.90,  SSolid),
-    stub(54, "Xe", "Xenon",       5, 18, NobleGas,       131.29,  SGas),
+    AtomProfile { number: 48, symbol: "Cd", name: "Cadmium",
+        period: 5, group: 12, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 112.41, melting_point: 321, boiling_point: 767, density_stp: 8.65,
+        electronegativity: 1.69, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "toxic; nickel-cadmium batteries; electroplating" },
+    AtomProfile { number: 49, symbol: "In", name: "Indium",
+        period: 5, group: 13, stp_state: SSolid, category: PostTransition,
+        atomic_mass: 114.82, melting_point: 156, boiling_point: 2072, density_stp: 7.31,
+        electronegativity: 1.78, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "soft, low-mp metal; ITO touchscreens; low-temp solder" },
+    AtomProfile { number: 50, symbol: "Sn", name: "Tin",
+        period: 5, group: 14, stp_state: SSolid, category: PostTransition,
+        atomic_mass: 118.71, melting_point: 232, boiling_point: 2602, density_stp: 7.265,
+        electronegativity: 1.96, valence_electrons: 4,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "low-mp post-transition; bronze with Cu, pewter, classic solder" },
+    AtomProfile { number: 51, symbol: "Sb", name: "Antimony",
+        period: 5, group: 15, stp_state: SSolid, category: Metalloid,
+        atomic_mass: 121.76, melting_point: 631, boiling_point: 1587, density_stp: 6.685,
+        electronegativity: 2.05, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "metalloid; flame retardants; lead-acid battery additive" },
+    AtomProfile { number: 52, symbol: "Te", name: "Tellurium",
+        period: 5, group: 16, stp_state: SSolid, category: Metalloid,
+        atomic_mass: 127.60, melting_point: 449, boiling_point: 988, density_stp: 6.232,
+        electronegativity: 2.10, valence_electrons: 6,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "metalloid; thermoelectric and rewritable optical media (CdTe, GeSbTe)" },
+    AtomProfile { number: 53, symbol: "I", name: "Iodine",
+        period: 5, group: 17, stp_state: SSolid, category: Halogen,
+        atomic_mass: 126.90, melting_point: 113, boiling_point: 184, density_stp: 4.93,
+        electronegativity: 2.66, valence_electrons: 7,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "halogen; sublimes to a violet vapor; antiseptic, thyroid biochemistry" },
+    AtomProfile { number: 54, symbol: "Xe", name: "Xenon",
+        period: 5, group: 18, stp_state: SGas, category: NobleGas,
+        atomic_mass: 131.29, melting_point: -111, boiling_point: -108, density_stp: 0.005887,
+        electronegativity: 2.6, valence_electrons: 8,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "noble gas; bright blue-white discharge lamps; first noble to form compounds" },
 
     // ---- Period 6 (main row skips lanthanides 57-71) ----
     AtomProfile { number: 55, symbol: "Cs", name: "Caesium",
@@ -1018,33 +1505,149 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "most reactive stable alkali; melts at body temp; detonates in water" },
-    stub(56, "Ba", "Barium",      6,  2, AlkalineEarth,  137.33,  SSolid),
+    AtomProfile { number: 56, symbol: "Ba", name: "Barium",
+        period: 6, group: 2, stp_state: SSolid, category: AlkalineEarth,
+        atomic_mass: 137.33, melting_point: 727, boiling_point: 1845, density_stp: 3.51,
+        electronegativity: 0.89, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true,
+        notes: "burns vivid green in flame tests; barium sulfate radio contrast" },
 
     // ---- Period 8 row: Lanthanides (57-71) ----
-    stub(57, "La", "Lanthanum",    8,  3, Lanthanide, 138.91, SSolid),
-    stub(58, "Ce", "Cerium",       8,  4, Lanthanide, 140.12, SSolid),
-    stub(59, "Pr", "Praseodymium", 8,  5, Lanthanide, 140.91, SSolid),
-    stub(60, "Nd", "Neodymium",    8,  6, Lanthanide, 144.24, SSolid),
-    stub(61, "Pm", "Promethium",   8,  7, Lanthanide, 145.0,  SSolid),
-    stub(62, "Sm", "Samarium",     8,  8, Lanthanide, 150.36, SSolid),
-    stub(63, "Eu", "Europium",     8,  9, Lanthanide, 151.96, SSolid),
-    stub(64, "Gd", "Gadolinium",   8, 10, Lanthanide, 157.25, SSolid),
-    stub(65, "Tb", "Terbium",      8, 11, Lanthanide, 158.93, SSolid),
-    stub(66, "Dy", "Dysprosium",   8, 12, Lanthanide, 162.50, SSolid),
-    stub(67, "Ho", "Holmium",      8, 13, Lanthanide, 164.93, SSolid),
-    stub(68, "Er", "Erbium",       8, 14, Lanthanide, 167.26, SSolid),
-    stub(69, "Tm", "Thulium",      8, 15, Lanthanide, 168.93, SSolid),
-    stub(70, "Yb", "Ytterbium",    8, 16, Lanthanide, 173.05, SSolid),
-    stub(71, "Lu", "Lutetium",     8, 17, Lanthanide, 174.97, SSolid),
+    AtomProfile { number: 57, symbol: "La", name: "Lanthanum",
+        period: 8, group: 3, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 138.91, melting_point: 920, boiling_point: 3464, density_stp: 6.145,
+        electronegativity: 1.10, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare-earth; namesake of the lanthanide series; nickel-metal-hydride batteries" },
+    AtomProfile { number: 58, symbol: "Ce", name: "Cerium",
+        period: 8, group: 4, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 140.12, melting_point: 798, boiling_point: 3443, density_stp: 6.770,
+        electronegativity: 1.12, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "most abundant rare earth; flint sparks (mischmetal)" },
+    AtomProfile { number: 59, symbol: "Pr", name: "Praseodymium",
+        period: 8, group: 5, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 140.91, melting_point: 931, boiling_point: 3520, density_stp: 6.773,
+        electronegativity: 1.13, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare earth; yellow-green pigments and welding goggles" },
+    AtomProfile { number: 60, symbol: "Nd", name: "Neodymium",
+        period: 8, group: 6, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 144.24, melting_point: 1024, boiling_point: 3074, density_stp: 7.007,
+        electronegativity: 1.14, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare earth; world's strongest permanent magnets (NdFeB)" },
+    AtomProfile { number: 61, symbol: "Pm", name: "Promethium",
+        period: 8, group: 7, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 145.0, melting_point: 1042, boiling_point: 3000, density_stp: 7.26,
+        electronegativity: 1.13, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "only radioactive lanthanide; longest isotope ~17.7 yr" },
+    AtomProfile { number: 62, symbol: "Sm", name: "Samarium",
+        period: 8, group: 8, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 150.36, melting_point: 1072, boiling_point: 1794, density_stp: 7.520,
+        electronegativity: 1.17, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare earth; SmCo high-temperature magnets" },
+    AtomProfile { number: 63, symbol: "Eu", name: "Europium",
+        period: 8, group: 9, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 151.96, melting_point: 822, boiling_point: 1529, density_stp: 5.243,
+        electronegativity: 1.20, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "softest lanthanide; red phosphor in CRT displays and Euro banknotes" },
+    AtomProfile { number: 64, symbol: "Gd", name: "Gadolinium",
+        period: 8, group: 10, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 157.25, melting_point: 1313, boiling_point: 3273, density_stp: 7.895,
+        electronegativity: 1.20, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "ferromagnetic near room temp; MRI contrast agents; high neutron capture" },
+    AtomProfile { number: 65, symbol: "Tb", name: "Terbium",
+        period: 8, group: 11, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 158.93, melting_point: 1356, boiling_point: 3230, density_stp: 8.229,
+        electronegativity: 1.20, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare earth; green phosphor and magnetostrictive alloys" },
+    AtomProfile { number: 66, symbol: "Dy", name: "Dysprosium",
+        period: 8, group: 12, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 162.50, melting_point: 1412, boiling_point: 2567, density_stp: 8.55,
+        electronegativity: 1.22, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare earth; high-temperature stability for neodymium magnets" },
+    AtomProfile { number: 67, symbol: "Ho", name: "Holmium",
+        period: 8, group: 13, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 164.93, melting_point: 1474, boiling_point: 2700, density_stp: 8.795,
+        electronegativity: 1.23, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "highest magnetic permeability of any element; medical lasers" },
+    AtomProfile { number: 68, symbol: "Er", name: "Erbium",
+        period: 8, group: 14, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 167.26, melting_point: 1529, boiling_point: 2868, density_stp: 9.066,
+        electronegativity: 1.24, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "fiber-optic amplifiers (EDFA); pink-tinted ceramics" },
+    AtomProfile { number: 69, symbol: "Tm", name: "Thulium",
+        period: 8, group: 15, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 168.93, melting_point: 1545, boiling_point: 1950, density_stp: 9.321,
+        electronegativity: 1.25, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "least abundant naturally-occurring lanthanide; portable X-ray sources" },
+    AtomProfile { number: 70, symbol: "Yb", name: "Ytterbium",
+        period: 8, group: 16, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 173.05, melting_point: 819, boiling_point: 1196, density_stp: 6.965,
+        electronegativity: 1.10, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare earth; atomic clocks (Yb-171); stainless-steel additive" },
+    AtomProfile { number: 71, symbol: "Lu", name: "Lutetium",
+        period: 8, group: 17, stp_state: SSolid, category: Lanthanide,
+        atomic_mass: 174.97, melting_point: 1663, boiling_point: 3402, density_stp: 9.841,
+        electronegativity: 1.27, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "densest lanthanide; petroleum cracking catalyst" },
 
     // ---- Period 6 resumes (72-86) ----
-    stub(72, "Hf", "Hafnium",      6,  4, TransitionMetal, 178.49, SSolid),
-    stub(73, "Ta", "Tantalum",     6,  5, TransitionMetal, 180.95, SSolid),
-    stub(74, "W",  "Tungsten",     6,  6, TransitionMetal, 183.84, SSolid),
-    stub(75, "Re", "Rhenium",      6,  7, TransitionMetal, 186.21, SSolid),
-    stub(76, "Os", "Osmium",       6,  8, TransitionMetal, 190.23, SSolid),
-    stub(77, "Ir", "Iridium",      6,  9, TransitionMetal, 192.22, SSolid),
-    stub(78, "Pt", "Platinum",     6, 10, TransitionMetal, 195.08, SSolid),
+    AtomProfile { number: 72, symbol: "Hf", name: "Hafnium",
+        period: 6, group: 4, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 178.49, melting_point: 2233, boiling_point: 4603, density_stp: 13.31,
+        electronegativity: 1.3, valence_electrons: 4,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "very high mp; high neutron-capture, opposite Zr — nuclear control rods" },
+    AtomProfile { number: 73, symbol: "Ta", name: "Tantalum",
+        period: 6, group: 5, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 180.95, melting_point: 3017, boiling_point: 5458, density_stp: 16.65,
+        electronegativity: 1.5, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "extremely corrosion-resistant; capacitors, surgical implants" },
+    AtomProfile { number: 74, symbol: "W", name: "Tungsten",
+        period: 6, group: 6, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 183.84, melting_point: 3422, boiling_point: 5555, density_stp: 19.25,
+        electronegativity: 2.36, valence_electrons: 6,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "highest melting point of any pure element; lamp filaments, armor-piercing rounds" },
+    AtomProfile { number: 75, symbol: "Re", name: "Rhenium",
+        period: 6, group: 7, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 186.21, melting_point: 3186, boiling_point: 5596, density_stp: 21.02,
+        electronegativity: 1.9, valence_electrons: 7,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "third-highest mp; jet-engine superalloys" },
+    AtomProfile { number: 76, symbol: "Os", name: "Osmium",
+        period: 6, group: 8, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 190.23, melting_point: 3033, boiling_point: 5012, density_stp: 22.59,
+        electronegativity: 2.2, valence_electrons: 8,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "densest natural element; fountain pen tips, electrical contacts" },
+    AtomProfile { number: 77, symbol: "Ir", name: "Iridium",
+        period: 6, group: 9, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 192.22, melting_point: 2466, boiling_point: 4428, density_stp: 22.56,
+        electronegativity: 2.2, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "most corrosion-resistant metal; spark-plug tips; Cretaceous boundary marker" },
+    AtomProfile { number: 78, symbol: "Pt", name: "Platinum",
+        period: 6, group: 10, stp_state: SSolid, category: TransitionMetal,
+        atomic_mass: 195.08, melting_point: 1768, boiling_point: 3825, density_stp: 21.45,
+        electronegativity: 2.28, valence_electrons: 2,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "noble metal catalyst; jewelry; resists oxidation completely" },
     AtomProfile { number: 79, symbol: "Au", name: "Gold",
         period: 6, group: 11, stp_state: SSolid, category: TransitionMetal,
         atomic_mass: 196.967, melting_point: 1064, boiling_point: 2856, density_stp: 19.30,
@@ -1059,7 +1662,12 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "only metal that is liquid at room temperature; toxic vapor" },
-    stub(81, "Tl", "Thallium",     6, 13, PostTransition, 204.38, SSolid),
+    AtomProfile { number: 81, symbol: "Tl", name: "Thallium",
+        period: 6, group: 13, stp_state: SSolid, category: PostTransition,
+        atomic_mass: 204.38, melting_point: 304, boiling_point: 1473, density_stp: 11.85,
+        electronegativity: 1.62, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "infamously toxic; rat poison; low-mp post-transition" },
     AtomProfile { number: 82, symbol: "Pb", name: "Lead",
         period: 6, group: 14, stp_state: SSolid, category: PostTransition,
         atomic_mass: 207.2, melting_point: 327, boiling_point: 1749, density_stp: 11.34,
@@ -1067,13 +1675,38 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
         implemented: true,
         notes: "heavy, soft, unreactive; future radiation shielding material" },
-    stub(83, "Bi", "Bismuth",      6, 15, PostTransition, 208.98, SSolid),
-    stub(84, "Po", "Polonium",     6, 16, Metalloid,      209.0,  SSolid),
-    stub(85, "At", "Astatine",     6, 17, Halogen,        210.0,  SSolid),
-    stub(86, "Rn", "Radon",        6, 18, NobleGas,       222.0,  SGas),
+    AtomProfile { number: 83, symbol: "Bi", name: "Bismuth",
+        period: 6, group: 15, stp_state: SSolid, category: PostTransition,
+        atomic_mass: 208.98, melting_point: 271, boiling_point: 1564, density_stp: 9.78,
+        electronegativity: 2.02, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "low-toxicity heavy metal; pink iridescent crystals; stomach medicine, fishing weights" },
+    AtomProfile { number: 84, symbol: "Po", name: "Polonium",
+        period: 6, group: 16, stp_state: SSolid, category: Metalloid,
+        atomic_mass: 209.0, melting_point: 254, boiling_point: 962, density_stp: 9.20,
+        electronegativity: 2.0, valence_electrons: 6,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "intensely radioactive alpha emitter; discovered by the Curies" },
+    AtomProfile { number: 85, symbol: "At", name: "Astatine",
+        period: 6, group: 17, stp_state: SSolid, category: Halogen,
+        atomic_mass: 210.0, melting_point: 302, boiling_point: 337, density_stp: 6.35,
+        electronegativity: 2.2, valence_electrons: 7,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rarest natural element; all isotopes radioactive; theorized targeted-alpha cancer therapy" },
+    AtomProfile { number: 86, symbol: "Rn", name: "Radon",
+        period: 6, group: 18, stp_state: SGas, category: NobleGas,
+        atomic_mass: 222.0, melting_point: -71, boiling_point: -62, density_stp: 0.00973,
+        electronegativity: 0.0, valence_electrons: 8,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "radioactive noble gas; basement-air carcinogen; daughter of radium decay" },
 
     // ---- Period 7 (main row stops at Ra; actinides go to strip) ----
-    stub(87, "Fr", "Francium",     7,  1, AlkaliMetal,    223.0,  SSolid),
+    AtomProfile { number: 87, symbol: "Fr", name: "Francium",
+        period: 7, group: 1, stp_state: SSolid, category: AlkaliMetal,
+        atomic_mass: 223.0, melting_point: 27, boiling_point: 677, density_stp: 1.87,
+        electronegativity: 0.7, valence_electrons: 1,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "most reactive alkali metal; shortest half-life (~22 min) of any natural isotope" },
     AtomProfile { number: 88, symbol: "Ra", name: "Radium",
         period: 7, group: 2, stp_state: SSolid, category: AlkalineEarth,
         atomic_mass: 226.0, melting_point: 700, boiling_point: 1737, density_stp: 5.5,
@@ -1089,9 +1722,24 @@ static ATOMS: [AtomProfile; ATOM_COUNT] = [
         notes: "naturally radioactive alkaline earth; the headline atom for the decay phase" },
 
     // ---- Period 9 row: Actinides (89-92, naturals) ----
-    stub(89, "Ac", "Actinium",     9,  3, Actinide, 227.0,  SSolid),
-    stub(90, "Th", "Thorium",      9,  4, Actinide, 232.04, SSolid),
-    stub(91, "Pa", "Protactinium", 9,  5, Actinide, 231.04, SSolid),
+    AtomProfile { number: 89, symbol: "Ac", name: "Actinium",
+        period: 9, group: 3, stp_state: SSolid, category: Actinide,
+        atomic_mass: 227.0, melting_point: 1050, boiling_point: 3198, density_stp: 10.07,
+        electronegativity: 1.1, valence_electrons: 3,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "namesake of the actinide series; intensely radioactive; glows blue from self-ionized air" },
+    AtomProfile { number: 90, symbol: "Th", name: "Thorium",
+        period: 9, group: 4, stp_state: SSolid, category: Actinide,
+        atomic_mass: 232.04, melting_point: 1750, boiling_point: 4788, density_stp: 11.7,
+        electronegativity: 1.3, valence_electrons: 4,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "weakly radioactive; alternative nuclear fuel cycle; gas-mantle filaments historically" },
+    AtomProfile { number: 91, symbol: "Pa", name: "Protactinium",
+        period: 9, group: 5, stp_state: SSolid, category: Actinide,
+        atomic_mass: 231.04, melting_point: 1568, boiling_point: 4027, density_stp: 15.37,
+        electronegativity: 1.5, valence_electrons: 5,
+        half_life_frames: 0, decay_product: Element::Empty, decay_heat: 0,
+        implemented: true, notes: "rare radioactive actinide; intermediate in the U-235 to Ac-227 decay chain" },
     AtomProfile { number: 92, symbol: "U", name: "Uranium",
         period: 9, group: 6, stp_state: SSolid, category: Actinide,
         atomic_mass: 238.029, melting_point: 1135, boiling_point: 4131, density_stp: 19.05,
@@ -1183,6 +1831,30 @@ enum InferredProduct {
 // synthesizes a new compound from the constituents — so Au + F → AuF with
 // derived color/density, Cu + O → CuO, Mg + Cl → MgCl₂, etc. Inspect a
 // derived cell and you'll see its formula in the tooltip.
+fn is_waterish(el: Element) -> bool {
+    matches!(el, Element::Water | Element::Ice | Element::Steam)
+}
+
+fn is_water_reactive_metal(el: Element) -> bool {
+    matches!(el, Element::Li | Element::Na | Element::K
+        | Element::Rb | Element::Cs | Element::Fr)
+}
+
+// Explicit list of metal+halogen pairs that detonate violently rather
+// than just forming a hot ionic salt. Real K/Rb/Cs/Fr fluorination is
+// effectively explosive — adiabatic flame temps >3000°C, the bulk of
+// the reactant flash-vaporizes — but Li/Na fluorination, while very
+// exothermic, doesn't produce a macroscopic blast in the same tier.
+// Keeping LiF/NaF out of this set lets the user actually inspect the
+// formed salt without it being shockwaved out of existence.
+fn is_violent_halide_pair(donor: Element, acceptor: Element) -> bool {
+    matches!((donor, acceptor),
+        (Element::K,  Element::F)
+        | (Element::Rb, Element::F)
+        | (Element::Cs, Element::F)
+        | (Element::Fr, Element::F))
+}
+
 fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Option<InferredProduct> {
     let has_water = catalysts.iter().any(|&c|
         matches!(c, Element::Water | Element::Ice | Element::Steam));
@@ -1206,6 +1878,33 @@ fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Op
     };
     if let Some(el) = bespoke {
         return Some(InferredProduct::Bespoke(el));
+    }
+    // Water-first hydrolysis guard: a water-reactive alkali touching
+    // water/ice/steam should ALWAYS resolve to the H+Steam bespoke
+    // path, never fall through to the derived registry to produce an
+    // oxide. The bespoke match above already handles this for atoms
+    // with EN < 1.4 and valence ≤ 2 — this is defense in depth for
+    // any future low-EN metal that doesn't match those exact bounds.
+    if is_waterish(acceptor) && is_water_reactive_metal(donor) {
+        return Some(InferredProduct::Bespoke(Element::H));
+    }
+    // Water-passivation block: Be does NOT react with water at any
+    // temperature in real life — the BeO surface layer protects it.
+    // Without this gate, the derived registry happily produces BeO
+    // when Be touches water, since Water exposes O's chemistry face.
+    // Block at the product level so the Be cell stays Be.
+    if is_waterish(acceptor) && donor == Element::Be {
+        return None;
+    }
+    // Nitride block: only Li reacts with N₂ at room temperature to form
+    // Li₃N. Real Na/K/Rb/Cs/Fr do NOT form nitrides under normal
+    // conditions — Li⁺ has uniquely high charge density (small ion)
+    // that stabilizes the nitride lattice; the heavier alkalis don't.
+    // Without this gate the emergent engine produces Na₃N, K₃N, etc.
+    if acceptor == Element::N && matches!(donor,
+        Element::Na | Element::K | Element::Rb | Element::Cs | Element::Fr)
+    {
+        return None;
     }
     // Fallback — derive a new compound from the constituents.
     derive_or_lookup(donor, acceptor).map(InferredProduct::Derived)
@@ -1251,7 +1950,11 @@ fn try_emergent_reaction(
     if ea == 0.0 || eb == 0.0 { return None; } // noble / inert
 
     let delta_e = (ea - eb).abs();
-    if delta_e < 0.4 { return None; } // too alike, no bond forms
+    // 0.35 threshold (was 0.4) so H + S (Δe = 0.38) can actually
+    // form H₂S — the previous bar barely excluded it. Other sub-0.4
+    // pairs in our table are all same-period nonmetal/metalloid
+    // mismatches that wouldn't form interesting compounds anyway.
+    if delta_e < 0.35 { return None; }
 
     // Donor is lower-electronegativity (gives electrons); acceptor pulls.
     let (donor_el, donor_v, acceptor_el, acceptor_v) = if ea < eb {
@@ -1262,7 +1965,18 @@ fn try_emergent_reaction(
     // Valence compatibility — donor should want to lose, acceptor to gain.
     // Donor ≤4 permits carbon (v=4) to participate in covalent bonds; the
     // acceptor still needs a half-full-or-more outer shell to attract.
-    if donor_v > 4 || acceptor_v < 5 { return None; }
+    // Hydrogen is special: real metal hydrides (LiH, NaH, CaH₂, …) have
+    // H acting as the H⁻ anion — effectively "needs 1 to fill" like a
+    // halogen. Treat H-as-acceptor with effective valence 7 so the
+    // metal-hydride pair passes this filter.
+    let effective_acceptor_v = if acceptor_el == Element::H { 7 } else { acceptor_v };
+    // Nitrogen as donor is also special: N has 5 valence electrons but
+    // can act as a donor when paired with O/F/Cl (NO, NF₃, NCl₃). Its
+    // chemistry treats it as donating 2-3 electrons to those acceptors,
+    // not all 5. Use effective donor valence 2 so the donor_v ≤ 4 check
+    // doesn't silently bar all N-as-donor reactions.
+    let effective_donor_v = if donor_el == Element::N { 2 } else { donor_v };
+    if effective_donor_v > 4 || effective_acceptor_v < 5 { return None; }
 
     // Activation energy scales inversely with Δelectronegativity — strongly
     // polar pairs (F+metal) fire cold; marginal pairs (H+O, C+O) need
@@ -1291,17 +2005,44 @@ fn try_emergent_reaction(
     // 800°C. With 0.9 it drops into the 400°C bucket, and with Cl's
     // acceptor bonus lands around 200°C — matching real-world synthesis
     // temperatures for H + Cl → HCl.
+    // [0.35, 0.9) bucket dropped from 800 → 200 so weak-polar pairs
+    // can actually fire before their constituents start burning. H+S
+    // (Δe 0.38) needs to react before S ignites at 232°C, otherwise
+    // S just burns to CO₂ and never sees the H. Same for H+Br /
+    // H+I — they sit in this bucket and need to fire before H itself
+    // hits 500°C ignition.
     let mut activation: i16 = if delta_e >= 2.5 { -200 }
         else if delta_e >= 1.6 { 100 }
         else if delta_e >= 0.9 { 400 }
-        else { 800 };
+        else { 200 };
     activation -= acceptor_bonus;
     activation -= donor_metal_bonus;
     if has_electrolyte { activation -= 200; }
-    if a_temp < activation || b_temp < activation { return None; }
 
     // Product lookup via donor/acceptor stoichiometry.
     let inferred = infer_product(donor_el, acceptor_el, catalysts)?;
+
+    // Carbon combustion needs a real ignition kick. Δe 0.89 + O's
+    // acceptor bonus would land C+O activation at -82°C, so a C pile
+    // would smoulder in ambient air at room temperature. Real charcoal
+    // auto-ignition is ~250-400°C — without a torch or hot surface,
+    // C should not burn. Force a 400°C floor on bespoke CO₂ formation.
+    if matches!(inferred, InferredProduct::Bespoke(Element::CO2)) {
+        activation = activation.max(400);
+    }
+    // Nitrogen activation floor — N₂'s triple bond is the strongest in
+    // common chemistry. Real N₂ reactions need very high activation:
+    // Haber NH₃ ~400°C, Mg₃N₂ ~700°C, NOx >1000°C. Without this floor
+    // the engine would form NH₃ at 38°C and Mg₃N₂ at room temp from
+    // the generic activation math. Li is the lone exception — Li⁺'s
+    // small ionic radius lets it crack N₂ at room temperature, which
+    // is the textbook anomaly we want to preserve.
+    if (donor_el == Element::N || acceptor_el == Element::N)
+        && donor_el != Element::Li
+    {
+        activation = activation.max(500);
+    }
+    if a_temp < activation || b_temp < activation { return None; }
 
     // Rate: base on reactivity, amplified by catalysts.
     let mut rate: f32 = (delta_e * 0.2).min(1.0);
@@ -1341,15 +2082,14 @@ fn try_emergent_reaction(
         // play the slow-corrosion tune we use for Fe+O tarnish.
         rate = (rate * 18.0).min(0.99);
     }
-    // Violent tier — extreme EN gap (>= 2.8) crossed with a low-EN
-    // donor (< 1.0). Catches halogen+alkali/alkaline-earth combos like
-    // Cs+F, Na+F, K+F, Li+F, Cs+O, Na+O. Real-world adiabatic flame
-    // temperatures for these reactions are >3000°C; the bulk of the
-    // reactant flash-vaporizes rather than passivating with a stable
-    // coating, so per-contact rate approaches 100%. Bypass the
-    // derived-product slowdown that would otherwise cap these at
-    // surface-corrosion timescales.
-    if delta_e >= 2.8 && donor_e < 1.0 && matches!(inferred, InferredProduct::Derived(_)) {
+    // Violent halide pairs — explicit list of K/Rb/Cs/Fr + F. Bypass
+    // the derived-product slowdown that would otherwise cap these at
+    // surface-corrosion timescales. Li/Na fluorination is hot but not
+    // detonation-class, so LiF/NaF form via the slow path and stay
+    // inspectable instead of getting shockwaved out of existence.
+    if is_violent_halide_pair(donor_el, acceptor_el)
+        && matches!(inferred, InferredProduct::Derived(_))
+    {
         rate = rate.max(0.85);
     }
 
@@ -1360,7 +2100,14 @@ fn try_emergent_reaction(
     // Anything that should cascade into a fireball (hydrogen, carbon) needs
     // to be listed as bespoke with a tuned heat release.
     let mut delta_temp: i16 = match inferred {
-        // Hydrogen combustion — massive, drives cascading ignition.
+        // Hydrogen combustion — full thermodynamic release. The
+        // reaction is gated at ~118°C activation, so it never
+        // fires at ambient; the user has to heat the H + O mix to
+        // trigger it. Once it does fire, the temp-scaling cubic
+        // ramps from a tiny trickle near activation to the full
+        // 1800°C release as the reaction zone heats further,
+        // crossing the 1200°C shockwave threshold for the proper
+        // detonation.
         InferredProduct::Bespoke(Element::Water)  => 1800,
         // Carbon combustion — hot but less dramatic.
         InferredProduct::Bespoke(Element::CO2)  => 900,
@@ -1375,12 +2122,18 @@ fn try_emergent_reaction(
         // burning reaction, hand-tune it as bespoke.
         _ => (delta_e * 30.0).min(80.0) as i16,
     };
-    // Hyper-reactive alkali (Cs EN 0.79) reactions aren't tarnish — they're
+    // Hyper-reactive alkali (Cs/Fr) reactions aren't tarnish — they're
     // full combustion. Real Cs + O₂ releases enough heat to self-ignite
     // neighbors; the derived-oxide 80°C cap would make the whole pile read
     // as quiet evaporation instead of the visibly-burning spray of oxide
-    // and fire you see in lab footage.
-    if donor_e < 0.85 && matches!(inferred, InferredProduct::Derived(_)) {
+    // and fire you see in lab footage. Restricted to Cs/Fr by explicit
+    // match — using donor_e < 0.85 also swept in K (0.82) and Rb (0.82),
+    // and the 450°C heat dump pushed those past their ignite_above
+    // threshold on first contact with O, making them auto-ignite at
+    // ambient temperature when real K/Rb just tarnish.
+    if matches!(donor_el, Element::Cs | Element::Fr)
+        && matches!(inferred, InferredProduct::Derived(_))
+    {
         // 450°C: below the 500°C mp floor for derived oxides, so Cs₂O
         // stays solid instead of phase-liquefying into a weird puddle
         // while it waits to cool. The actual drama comes from the burn
@@ -1398,7 +2151,9 @@ fn try_emergent_reaction(
     // mechanic, the freshly-formed product coats the reactant and
     // throttles the reaction to surface-only single-pass conversion.
     //   Cs+F: ~3210°C, F+Na: ~3070°C, F+K: ~3180°C, O+Cs: ~2650°C.
-    if delta_e >= 2.8 && donor_e < 1.0 && matches!(inferred, InferredProduct::Derived(_)) {
+    if is_violent_halide_pair(donor_el, acceptor_el)
+        && matches!(inferred, InferredProduct::Derived(_))
+    {
         delta_temp = (delta_e * 1000.0) as i16;
     }
 
@@ -1454,9 +2209,41 @@ struct DerivedCompound {
     decomposes_above: Option<i16>,
 }
 
-thread_local! {
-    static DERIVED_COMPOUNDS: std::cell::RefCell<Vec<DerivedCompound>> =
-        std::cell::RefCell::new(Vec::new());
+// Process-global derived-compound registry. Two storage tiers:
+//
+// * `DERIVED_COMPOUNDS` — the authoritative store, holds the full
+//   compound data (formula String, constituents Vec, etc.). Behind
+//   parking_lot::RwLock because writes mutate the Vec on registration.
+//   Touched on the cold paths only (UI, chemistry classification).
+//
+// * `DERIVED_HOT` — a lock-free per-id cache of the fields that hot
+//   paths read constantly: physics profile, color, mp/bp, decomp
+//   threshold. Each slot is `OnceLock`, so reads are a single atomic
+//   load. Writes are one-shot at registration time. Without this,
+//   the parallel byte-build, pressure pass, motion pass, and can_enter
+//   all hammer the same RwLock cache line millions of times per frame
+//   when derived cells are on the grid, tanking the framerate.
+//
+// Must not be thread_local — rayon worker threads need to see the
+// same data the main thread registered.
+static DERIVED_COMPOUNDS: parking_lot::RwLock<Vec<DerivedCompound>> =
+    parking_lot::RwLock::new(Vec::new());
+
+#[derive(Clone, Copy)]
+struct DerivedHot {
+    physics: PhysicsProfile,
+    color: (u8, u8, u8),
+    melting_point: i16,
+    boiling_point: i16,
+    decomposes_above: Option<i16>,
+}
+
+static DERIVED_HOT: [std::sync::OnceLock<DerivedHot>; 256] =
+    [const { std::sync::OnceLock::new() }; 256];
+
+#[inline]
+fn derived_hot(idx: u8) -> Option<&'static DerivedHot> {
+    DERIVED_HOT[idx as usize].get()
 }
 
 // Builds a formula string from constituent atoms with subscripts. Uses real
@@ -1538,8 +2325,8 @@ fn alloy_or_lookup(a: Element, b: Element) -> Option<u8> {
     };
     let constituents: Vec<(Element, u8)> = vec![(a, 1), (b, 1)];
     let formula = format_formula(&constituents);
-    DERIVED_COMPOUNDS.with(|r| {
-        let mut reg = r.borrow_mut();
+    {
+        let mut reg = DERIVED_COMPOUNDS.write();
         if let Some(idx) = reg.iter().position(|c| c.formula == formula) {
             return Some(idx as u8);
         }
@@ -1598,8 +2385,16 @@ fn alloy_or_lookup(a: Element, b: Element) -> Option<u8> {
             boiling_point,
             decomposes_above: None,
         });
-        Some((reg.len() - 1) as u8)
-    })
+        let new_idx = (reg.len() - 1) as u8;
+        // Mirror the hot-read fields into the lock-free cache so
+        // every per-cell read in pressure / motion / render bypasses
+        // the RwLock entirely.
+        let _ = DERIVED_HOT[new_idx as usize].set(DerivedHot {
+            physics, color, melting_point, boiling_point,
+            decomposes_above: None,
+        });
+        Some(new_idx)
+    }
 }
 
 fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
@@ -1621,8 +2416,8 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
     ];
     let formula = format_formula(&constituents);
 
-    DERIVED_COMPOUNDS.with(|r| {
-        let mut reg = r.borrow_mut();
+    {
+        let mut reg = DERIVED_COMPOUNDS.write();
         if let Some(idx) = reg.iter().position(|c| c.formula == formula) {
             return Some(idx as u8);
         }
@@ -1634,30 +2429,47 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         let mix = |a: u8, wa: u8, b: u8, wb: u8| -> u8 {
             (((a as u16 * wa as u16) + (b as u16 * wb as u16)) / total as u16) as u8
         };
-        // Weight the dominant (more numerous) atom's color. Add a brown-ish
-        // tint so derived compounds read as "weathered" / "oxidized" and
-        // don't get mistaken for pure atoms.
-        let r_mix = mix(donor_color.0, donor_count, acceptor_color.0, acceptor_count);
-        let g_mix = mix(donor_color.1, donor_count, acceptor_color.1, acceptor_count);
-        let b_mix = mix(donor_color.2, donor_count, acceptor_color.2, acceptor_count);
-        let color = (
-            ((r_mix as u16 * 3 + 150) / 4) as u8,
-            ((g_mix as u16 * 3 + 120) / 4) as u8,
-            ((b_mix as u16 * 3 + 100) / 4) as u8,
-        );
-        // Kind heuristic: consider both atoms' STP states.
-        //   * Gas + Gas → Gas. Covers HCl, H₂S, NO, etc. — the compound
-        //     would be a gas at room temp, not a powder pile.
-        //   * Solid donor → Gravel. Metal oxides/halides/fluorides coat
-        //     the parent metal and don't flake — Cu₂O patina, Au-F, Al₂O₃.
-        //   * Liquid donor → Liquid.
-        //   * Gas donor with solid/liquid acceptor → Powder. Rare edge
-        //     case (e.g. H + S), defaults to a soft powder.
-        let kind = match (da.stp_state, aa.stp_state) {
-            (AtomState::Gas, AtomState::Gas) => Kind::Gas,
-            (AtomState::Solid, _)            => Kind::Gravel,
-            (AtomState::Liquid, _)           => Kind::Liquid,
-            (AtomState::Gas, _)              => Kind::Powder,
+        // Color mix. For hydrogen-as-donor compounds (HCl, HBr, HI,
+        // H₂S, …) H's near-white color drowns out the partner atom's
+        // identity in a flat 50/50 average. Weight the acceptor 4×
+        // when donor is H so the halogen/chalcogen colour dominates
+        // — HBr reads as bromine red-brown, HI reads as iodine
+        // purple. Other compounds keep the standard stoichiometric
+        // mix.
+        let (r_mix, g_mix, b_mix) = if donor == Element::H {
+            let blend = |d: u8, a: u8| -> u8 {
+                ((d as u32 + a as u32 * 4) / 5) as u8
+            };
+            (
+                blend(donor_color.0, acceptor_color.0),
+                blend(donor_color.1, acceptor_color.1),
+                blend(donor_color.2, acceptor_color.2),
+            )
+        } else {
+            let r_mix = mix(donor_color.0, donor_count, acceptor_color.0, acceptor_count);
+            let g_mix = mix(donor_color.1, donor_count, acceptor_color.1, acceptor_count);
+            let b_mix = mix(donor_color.2, donor_count, acceptor_color.2, acceptor_count);
+            (r_mix, g_mix, b_mix)
+        };
+        let color = (r_mix, g_mix, b_mix);
+        // Kind heuristic. Earlier version used STP-state of the
+        // constituents only — H (gas) + Br (liquid) hit (Gas, _)
+        // → Powder, even though HBr is a textbook gas. Augment with
+        // a "molecular gas" detection: small light-element compounds
+        // whose averaged boiling point is near-or-below room temp
+        // should render as a gas regardless of constituent phases.
+        let avg_mp_pre = (da.melting_point as i32 + aa.melting_point as i32) / 2;
+        let avg_bp_pre = (da.boiling_point as i32 + aa.boiling_point as i32) / 2;
+        let molecular_gas = avg_bp_pre < 100;
+        let kind = if molecular_gas {
+            Kind::Gas
+        } else {
+            match (da.stp_state, aa.stp_state) {
+                (AtomState::Gas, AtomState::Gas) => Kind::Gas,
+                (AtomState::Solid, _)            => Kind::Gravel,
+                (AtomState::Liquid, _)           => Kind::Liquid,
+                (AtomState::Gas, _)              => Kind::Powder,
+            }
         };
         // Density averaged from donor + acceptor native density. Gas-kind
         // compounds get a small negative value so their liquid form
@@ -1668,7 +2480,18 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
             -1
         } else {
             let da_d = donor.physics().density.max(0) as i32;
-            let aa_d = acceptor.physics().density.max(0) as i32;
+            // Oxide-specific O density: O's gas density (-1) clamped to 0
+            // makes every solid oxide read lighter than its parent metal,
+            // which is wrong — real metal oxides are typically denser than
+            // the metal (BeO 3.01 vs Be 1.85, MgO 3.58 vs Mg 1.74). Using
+            // a representative bound-oxide value (~20, ≈2 g/cm³) for O
+            // pulls oxide densities up to where they belong, so e.g. BeO
+            // sinks in water instead of floating.
+            let aa_d = if acceptor == Element::O {
+                20
+            } else {
+                acceptor.physics().density.max(0) as i32
+            };
             let total_d = da_d * donor_count as i32 + aa_d * acceptor_count as i32;
             (total_d / total as i32).clamp(1, 200) as i16
         };
@@ -1692,8 +2515,8 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         // legitimately stay in the gas phase at room temperature. The
         // floor would wrongly keep HCl liquid/solid at 1500°C. Skip it
         // when both atoms are gaseous at STP.
-        let avg_mp = (da.melting_point as i32 + aa.melting_point as i32) / 2;
-        let avg_bp = (da.boiling_point as i32 + aa.boiling_point as i32) / 2;
+        let avg_mp = avg_mp_pre;
+        let avg_bp = avg_bp_pre;
         let gas_gas = da.stp_state == AtomState::Gas
             && aa.stp_state == AtomState::Gas;
         // Refractory oxides (Al₂O₃ ~2072°C, MgO ~2852°C) shouldn't be
@@ -1706,7 +2529,10 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         } else {
             500
         };
-        let (melting_point, boiling_point) = if gas_gas {
+        // Molecular gases (HCl/HBr/HI/H₂S/NH₃/etc.) keep their real
+        // sub-zero boiling points — flooring them to 1500 °C would
+        // wrongly hold them solid up through any reasonable temp.
+        let (melting_point, boiling_point) = if gas_gas || molecular_gas {
             (avg_mp as i16, avg_bp as i16)
         } else {
             (avg_mp.max(oxide_mp_floor) as i16, avg_bp.max(1500) as i16)
@@ -1760,8 +2586,12 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
             boiling_point,
             decomposes_above,
         });
-        Some((reg.len() - 1) as u8)
-    })
+        let new_idx = (reg.len() - 1) as u8;
+        let _ = DERIVED_HOT[new_idx as usize].set(DerivedHot {
+            physics, color, melting_point, boiling_point, decomposes_above,
+        });
+        Some(new_idx)
+    }
 }
 
 #[inline]
@@ -1776,28 +2606,22 @@ fn gcd_u8(mut a: u8, mut b: u8) -> u8 {
 
 // Accessor helpers — return properties for a derived cell from the registry,
 // falling back to something safe if the index is invalid.
+// Hot path: lock-free atomic load via DERIVED_HOT.
 fn derived_physics_of(idx: u8) -> PhysicsProfile {
-    DERIVED_COMPOUNDS.with(|r| {
-        r.borrow().get(idx as usize)
-            .map(|c| c.physics)
-            .unwrap_or(PhysicsProfile {
-                density: 20, kind: Kind::Powder, viscosity: 0, molar_mass: 0.0
-            })
+    derived_hot(idx).map(|h| h.physics).unwrap_or(PhysicsProfile {
+        density: 20, kind: Kind::Powder, viscosity: 0, molar_mass: 0.0,
     })
 }
 
 fn derived_color_of(idx: u8) -> (u8, u8, u8) {
-    DERIVED_COMPOUNDS.with(|r| {
-        r.borrow().get(idx as usize).map(|c| c.color).unwrap_or((160, 130, 140))
-    })
+    derived_hot(idx).map(|h| h.color).unwrap_or((160, 130, 140))
 }
 
 fn derived_formula_of(idx: u8) -> String {
-    DERIVED_COMPOUNDS.with(|r| {
-        r.borrow().get(idx as usize)
-            .map(|c| c.formula.clone())
-            .unwrap_or_else(|| "?".to_string())
-    })
+    let reg = DERIVED_COMPOUNDS.read();
+    reg.get(idx as usize)
+        .map(|c| c.formula.clone())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 // First metal constituent of a derived compound. Used by electrolysis to
@@ -1805,14 +2629,12 @@ fn derived_formula_of(idx: u8) -> String {
 // FeCl → Fe, NaCl → Na). Returns None for compounds that have no metal
 // in their composition.
 fn compound_metal_component(idx: u8) -> Option<Element> {
-    DERIVED_COMPOUNDS.with(|r| {
-        let b = r.borrow();
-        let c = b.get(idx as usize)?;
-        for &(el, _) in &c.constituents {
-            if is_atomic_metal(el) { return Some(el); }
-        }
-        None
-    })
+    let reg = DERIVED_COMPOUNDS.read();
+    let c = reg.get(idx as usize)?;
+    for &(el, _) in &c.constituents {
+        if is_atomic_metal(el) { return Some(el); }
+    }
+    None
 }
 
 // Ionic metal-halide / metal-halogen compounds dissolve in water. Predicate
@@ -1820,19 +2642,17 @@ fn compound_metal_component(idx: u8) -> Option<Element> {
 // solute. Atom categories are what make a compound "a salt" — if the
 // constituents include a metal and a halogen, it's one.
 fn derived_is_soluble_salt(idx: u8) -> bool {
-    DERIVED_COMPOUNDS.with(|r| {
-        let b = r.borrow();
-        let Some(c) = b.get(idx as usize) else { return false; };
-        let mut has_metal = false;
-        let mut has_halogen = false;
-        for &(el, _) in &c.constituents {
-            if is_atomic_metal(el) { has_metal = true; }
-            if let Some(a) = atom_profile_for(el) {
-                if matches!(a.category, AtomCategory::Halogen) { has_halogen = true; }
-            }
+    let reg = DERIVED_COMPOUNDS.read();
+    let Some(c) = reg.get(idx as usize) else { return false; };
+    let mut has_metal = false;
+    let mut has_halogen = false;
+    for &(el, _) in &c.constituents {
+        if is_atomic_metal(el) { has_metal = true; }
+        if let Some(a) = atom_profile_for(el) {
+            if matches!(a.category, AtomCategory::Halogen) { has_halogen = true; }
         }
-        has_metal && has_halogen
-    })
+    }
+    has_metal && has_halogen
 }
 
 // Map an atom (by index into ATOMS) to its corresponding paintable Element.
@@ -1869,6 +2689,70 @@ fn atom_to_element(atom_idx: usize) -> Option<Element> {
         88 => Element::Ra,
          5 => Element::B,
         92 => Element::U,
+        // Periodic-table fill.
+         3 => Element::Li,
+         4 => Element::Be,
+        21 => Element::Sc,
+        22 => Element::Ti,
+        23 => Element::V,
+        24 => Element::Cr,
+        25 => Element::Mn,
+        27 => Element::Co,
+        31 => Element::Ga,
+        32 => Element::Ge,
+        33 => Element::As,
+        34 => Element::Se,
+        35 => Element::Br,
+        36 => Element::Kr,
+        37 => Element::Rb,
+        38 => Element::Sr,
+        39 => Element::Y,
+        40 => Element::Zr,
+        41 => Element::Nb,
+        42 => Element::Mo,
+        43 => Element::Tc,
+        44 => Element::Ru,
+        45 => Element::Rh,
+        46 => Element::Pd,
+        48 => Element::Cd,
+        49 => Element::In,
+        50 => Element::Sn,
+        51 => Element::Sb,
+        52 => Element::Te,
+        53 => Element::I,
+        54 => Element::Xe,
+        56 => Element::Ba,
+        57 => Element::La,
+        58 => Element::Ce,
+        59 => Element::Pr,
+        60 => Element::Nd,
+        61 => Element::Pm,
+        62 => Element::Sm,
+        63 => Element::Eu,
+        64 => Element::Gd,
+        65 => Element::Tb,
+        66 => Element::Dy,
+        67 => Element::Ho,
+        68 => Element::Er,
+        69 => Element::Tm,
+        70 => Element::Yb,
+        71 => Element::Lu,
+        72 => Element::Hf,
+        73 => Element::Ta,
+        74 => Element::W,
+        75 => Element::Re,
+        76 => Element::Os,
+        77 => Element::Ir,
+        78 => Element::Pt,
+        81 => Element::Tl,
+        83 => Element::Bi,
+        84 => Element::Po,
+        85 => Element::At,
+        86 => Element::Rn,
+        87 => Element::Fr,
+        89 => Element::Ac,
+        90 => Element::Th,
+        91 => Element::Pa,
         _  => return None,
     })
 }
@@ -1889,6 +2773,29 @@ fn atom_profile_for(el: Element) -> Option<&'static AtomProfile> {
         Element::B  => 5,
         Element::Ni => 28,  Element::Zn => 30,  Element::Ag => 47,
         Element::Cs => 55,  Element::Pb => 82,  Element::Ra => 88,
+        // Periodic-table fill.
+        Element::Li => 3,   Element::Be => 4,
+        Element::Sc => 21,  Element::Ti => 22,  Element::V  => 23,
+        Element::Cr => 24,  Element::Mn => 25,  Element::Co => 27,
+        Element::Ga => 31,  Element::Ge => 32,  Element::As => 33,
+        Element::Se => 34,  Element::Br => 35,  Element::Kr => 36,
+        Element::Rb => 37,  Element::Sr => 38,  Element::Y  => 39,
+        Element::Zr => 40,  Element::Nb => 41,  Element::Mo => 42,
+        Element::Tc => 43,  Element::Ru => 44,  Element::Rh => 45,
+        Element::Pd => 46,  Element::Cd => 48,  Element::In => 49,
+        Element::Sn => 50,  Element::Sb => 51,  Element::Te => 52,
+        Element::I  => 53,  Element::Xe => 54,  Element::Ba => 56,
+        Element::La => 57,  Element::Ce => 58,  Element::Pr => 59,
+        Element::Nd => 60,  Element::Pm => 61,  Element::Sm => 62,
+        Element::Eu => 63,  Element::Gd => 64,  Element::Tb => 65,
+        Element::Dy => 66,  Element::Ho => 67,  Element::Er => 68,
+        Element::Tm => 69,  Element::Yb => 70,  Element::Lu => 71,
+        Element::Hf => 72,  Element::Ta => 73,  Element::W  => 74,
+        Element::Re => 75,  Element::Os => 76,  Element::Ir => 77,
+        Element::Pt => 78,  Element::Tl => 81,  Element::Bi => 83,
+        Element::Po => 84,  Element::At => 85,  Element::Rn => 86,
+        Element::Fr => 87,  Element::Ac => 89,  Element::Th => 90,
+        Element::Pa => 91,
         _ => return None,
     };
     // ATOMS is indexed by atomic number − 1 (ordered H=1 at index 0 through
@@ -1912,16 +2819,14 @@ fn atom_profile_for(el: Element) -> Option<&'static AtomProfile> {
 // a compound can be selectively stripped by acid.
 fn alloy_constituents(cell: Cell) -> Option<Vec<Element>> {
     if cell.el != Element::Derived { return None; }
-    DERIVED_COMPOUNDS.with(|r| {
-        let reg = r.borrow();
-        let cd = reg.get(cell.derived_id as usize)?;
-        let elements: Vec<Element> =
-            cd.constituents.iter().map(|(e, _)| *e).collect();
-        for e in &elements {
-            if !is_atomic_metal(*e) { return None; }
-        }
-        Some(elements)
-    })
+    let reg = DERIVED_COMPOUNDS.read();
+    let cd = reg.get(cell.derived_id as usize)?;
+    let elements: Vec<Element> =
+        cd.constituents.iter().map(|(e, _)| *e).collect();
+    for e in &elements {
+        if !is_atomic_metal(*e) { return None; }
+    }
+    Some(elements)
 }
 
 // Basic-oxide classification. A metal-oxide compound (M + O) acts as a
@@ -1932,17 +2837,15 @@ fn alloy_constituents(cell: Cell) -> Option<Vec<Element>> {
 // displacement's metal reactivity).
 fn basic_oxide_signature(cell: Cell) -> Option<(Element, f32)> {
     if cell.el != Element::Derived { return None; }
-    DERIVED_COMPOUNDS.with(|r| {
-        let reg = r.borrow();
-        let cd = reg.get(cell.derived_id as usize)?;
-        if cd.constituents.len() < 2 { return None; }
-        let (d_el, _) = cd.constituents[0];
-        let (a_el, _) = cd.constituents[1];
-        if a_el != Element::O { return None; }
-        let d_e = atom_profile_for(d_el)?.electronegativity;
-        if d_e <= 0.0 || d_e >= 2.0 { return None; }
-        Some((d_el, 2.0 - d_e))
-    })
+    let reg = DERIVED_COMPOUNDS.read();
+    let cd = reg.get(cell.derived_id as usize)?;
+    if cd.constituents.len() < 2 { return None; }
+    let (d_el, _) = cd.constituents[0];
+    let (a_el, _) = cd.constituents[1];
+    if a_el != Element::O { return None; }
+    let d_e = atom_profile_for(d_el)?.electronegativity;
+    if d_e <= 0.0 || d_e >= 2.0 { return None; }
+    Some((d_el, 2.0 - d_e))
 }
 
 // Acid classification. A derived compound is proton-donor (acidic) when
@@ -1954,18 +2857,16 @@ fn basic_oxide_signature(cell: Cell) -> Option<(Element, f32)> {
 // would need their own compound handling later.
 fn acid_signature(cell: Cell) -> Option<(Element, f32)> {
     if cell.el != Element::Derived { return None; }
-    DERIVED_COMPOUNDS.with(|r| {
-        let reg = r.borrow();
-        let cd = reg.get(cell.derived_id as usize)?;
-        if cd.constituents.len() < 2 { return None; }
-        let (d_el, _) = cd.constituents[0];
-        if d_el != Element::H { return None; }
-        let (a_el, _) = cd.constituents[1];
-        if !matches!(a_el, Element::F | Element::Cl) { return None; }
-        let a_e = atom_profile_for(a_el)?.electronegativity;
-        let strength = (a_e - 2.20).max(0.0);
-        Some((a_el, strength))
-    })
+    let reg = DERIVED_COMPOUNDS.read();
+    let cd = reg.get(cell.derived_id as usize)?;
+    if cd.constituents.len() < 2 { return None; }
+    let (d_el, _) = cd.constituents[0];
+    if d_el != Element::H { return None; }
+    let (a_el, _) = cd.constituents[1];
+    if !matches!(a_el, Element::F | Element::Cl) { return None; }
+    let a_e = atom_profile_for(a_el)?.electronegativity;
+    let strength = (a_e - 2.20).max(0.0);
+    Some((a_el, strength))
 }
 
 // Unified decomposition lookup. If a cell's element should break apart on
@@ -1984,13 +2885,17 @@ fn decomposition_of(cell: Cell) -> Option<(i16, Element, Element)> {
         // under direct extreme user heat, leaving the thermite
         // cascade as the dominant Rust-consumer.
         Element::Rust => Some((3500, Element::Fe, Element::O)),
-        Element::Derived => DERIVED_COMPOUNDS.with(|r| {
-            let reg = r.borrow();
+        Element::Derived => {
+            // decomposition_of needs both the (cold) constituents AND the
+            // (hot) decompose threshold — but most callers hit the early
+            // None when there's no decomposes_above, so test that first
+            // via the hot cache to avoid taking the lock.
+            let thr = derived_hot(cell.derived_id)?.decomposes_above?;
+            let reg = DERIVED_COMPOUNDS.read();
             let cd = reg.get(cell.derived_id as usize)?;
-            let thr = cd.decomposes_above?;
             if cd.constituents.len() < 2 { return None; }
             Some((thr, cd.constituents[0].0, cd.constituents[1].0))
-        }),
+        }
         _ => None,
     }
 }
@@ -2003,23 +2908,15 @@ fn element_phase_points(cell: Cell) -> Option<(i16, i16, AtomState)> {
         // Bespoke-transition compounds are *not* listed here.
         Element::Salt  => Some((801, 1465, AtomState::Solid)),
         Element::Derived => {
-            DERIVED_COMPOUNDS.with(|r| {
-                r.borrow().get(cell.derived_id as usize).map(|c| {
-                    // stp_state tracks the compound's natural phase so
-                    // phase transitions can correctly flag PHASE_SOLID /
-                    // PHASE_LIQUID / PHASE_GAS when the temp moves off
-                    // its native state. Without this, gas-kind compounds
-                    // (HCl, NO) would read as solid-native and the phase
-                    // logic would never force them into PHASE_SOLID at
-                    // cryogenic temperatures — they'd render as gas even
-                    // below their freezing point.
-                    let stp_state = match c.physics.kind {
-                        Kind::Gas | Kind::Fire => AtomState::Gas,
-                        Kind::Liquid => AtomState::Liquid,
-                        _ => AtomState::Solid,
-                    };
-                    (c.melting_point, c.boiling_point, stp_state)
-                })
+            // Hot-path lookup: physics + mp/bp all live in the
+            // lock-free hot cache.
+            derived_hot(cell.derived_id).map(|h| {
+                let stp_state = match h.physics.kind {
+                    Kind::Gas | Kind::Fire => AtomState::Gas,
+                    Kind::Liquid => AtomState::Liquid,
+                    _ => AtomState::Solid,
+                };
+                (h.melting_point, h.boiling_point, stp_state)
             })
         }
         _ => None,
@@ -2045,6 +2942,10 @@ fn flame_color(el: Element) -> Option<(u8, u8, u8)> {
         Element::Mg   => Some((255, 255, 255)), // brilliant white
         Element::B    => Some((130, 220, 100)), // bright green
         Element::Salt => Some((255, 220, 80)),  // NaCl → Na yellow
+        Element::Li   => Some((220,  60,  80)), // crimson
+        Element::Rb   => Some((200,  80, 140)), // red-violet
+        Element::Cs   => Some((130,  90, 220)), // blue-violet
+        Element::Fr   => Some((150, 110, 240)), // extrapolated, bluer
         _ => None,
     }
 }
@@ -2091,6 +2992,36 @@ fn cell_physics(c: Cell) -> PhysicsProfile {
     }
 }
 
+// Phase-aware pressure profile lookup. Atoms/compounds keep their hand-
+// tuned static profiles, but Element::Derived has no static entry —
+// without this helper, every derived compound (HCl, MgO, CuCl, …) would
+// inherit the default `permeability: 0` which the pressure-diffusion
+// pass treats as a wall. Result: derived gases sit rigid in their spawn
+// shape because flux can't propagate through them. This routes derived
+// cells through a kind-appropriate template (Gas → high perm, Liquid →
+// medium, Solid → wall) so HCl wafts like Steam, MgO behaves like
+// Stone, and so on.
+fn cell_pressure_p(c: Cell) -> PressureProfile {
+    if c.el != Element::Derived {
+        return *c.el.pressure_p();
+    }
+    match cell_physics(c).kind {
+        // Bumped to 70 (between atomic gas's 20-30 and Steam's 80)
+        // so heavier-than-air derived gases like HCl get a visible
+        // initial puff before gravity wins out and pools them on
+        // the floor. Trade: slightly louder initial venting in
+        // closed containers — matches the v0.1 "Steam vents the
+        // kettle" pattern.
+        Kind::Gas    => PressureProfile { permeability: 230, compliance: 200, formation_pressure: 70 },
+        Kind::Fire   => PressureProfile { permeability: 230, compliance: 200, formation_pressure: 0 },
+        Kind::Liquid => PressureProfile { permeability: 100, compliance:  50, formation_pressure: 0 },
+        Kind::Powder => PressureProfile { permeability:  25, compliance:  15, formation_pressure: 0 },
+        Kind::Gravel => PressureProfile { permeability:   0, compliance:  15, formation_pressure: 0 },
+        Kind::Solid  => PressureProfile { permeability:   0, compliance:  25, formation_pressure: 0 },
+        Kind::Empty  => PressureProfile { permeability: 255, compliance:   0, formation_pressure: 0 },
+    }
+}
+
 fn atom_category_color(cat: AtomCategory) -> (u8, u8, u8) {
     match cat {
         Hydrogen        => (230, 220, 160),
@@ -2134,7 +3065,6 @@ impl Element {
             Element::Ice      => (175, 215, 240),
             Element::MoltenGlass => (230, 180, 110),
             Element::Glass    => (200, 230, 235),
-            Element::Charcoal => (38, 32, 30),
             // Atoms — rough real-world appearances.
             Element::H  => (220, 240, 255),
             Element::He => (240, 230, 180),
@@ -2169,8 +3099,11 @@ impl Element {
             Element::Derived => (160, 130, 140),
             // Gunpowder: near-black with a slight purple tint.
             Element::Gunpowder => (35, 30, 40),
-            // Quartz: translucent pale grey — reads like lab glass.
-            Element::Quartz    => (210, 220, 225),
+            // Quartz: smoky cool grey — clearly darker than Glass
+            // (200,230,235) and distinct from the silver BattNeg
+            // (~200,210,225) so battery casings don't blend into
+            // their negative terminal.
+            Element::Quartz    => (138, 150, 170),
             // Firebrick: warm rust-orange, matches real furnace brick.
             Element::Firebrick => (170, 85, 55),
             // Argon: very pale lavender tint when unenergized; bright
@@ -2197,6 +3130,79 @@ impl Element {
             // atom cloud are mostly 852 nm (near-IR) so the visible color
             // is subtle warm-silver.
             Element::Cs => (230, 215, 150),
+            // ---- Periodic-table fill ----
+            // Pushed harder than literal "silvery gray" so each tile
+            // reads distinctly through the edge shading + AO. Still
+            // anchored to real-world appearance: cool tints for left-
+            // side metals (alkali / group-3 / 4 / 5), warm for the
+            // right (Cu/Au/Bi), green-blue for Co/Os/Ir/Ta. Lanthanides
+            // get a hue walk through colours their salts/oxides
+            // actually take (Pr green, Nd lilac, Sm pale yellow, Eu
+            // peach, Er pink, Tm green-blue) so the f-block isn't 15
+            // identical silver tiles.
+            Element::Li => (190, 205, 230),  // cool silver-blue
+            Element::Be => (225, 215, 180),  // warm silver
+            Element::Sc => (200, 215, 220),  // pale cool
+            Element::Ti => (175, 185, 215),  // cool blue-grey
+            Element::V  => (155, 160, 220),  // distinctly blue
+            Element::Cr => (170, 215, 230),  // cyan-silver
+            Element::Mn => (165, 130, 110),  // brownish (real Mn)
+            Element::Co => (110, 145, 230),  // strong cobalt blue
+            Element::Ga => (210, 220, 245),  // pale cool
+            Element::Ge => (170, 195, 215),  // cool grey-blue
+            Element::As => (130, 115, 110),  // dark warm grey
+            Element::Se => (175,  60,  55),  // selenium red
+            Element::Br => (160,  50,  35),  // red-brown halogen
+            Element::Kr => (210, 225, 235),  // pale noble
+            Element::Rb => (210, 200, 230),  // pale lavender
+            Element::Sr => (230, 230, 175),  // warm gold-silver
+            Element::Y  => (180, 210, 215),  // cool silver
+            Element::Zr => (160, 200, 220),  // cool blue
+            Element::Nb => (175, 170, 235),  // distinct lavender
+            Element::Mo => (180, 195, 230),  // cool blue-silver
+            Element::Tc => (215, 200, 165),  // warm yellow tint
+            Element::Ru => (170, 175, 210),  // cool blue
+            Element::Rh => (235, 240, 245),  // bright silver-white
+            Element::Pd => (210, 220, 220),  // pale silver
+            Element::Cd => (165, 200, 220),  // cool blue-silver
+            Element::In => (200, 220, 245),  // pale blue
+            Element::Sn => (220, 210, 215),  // pinkish silver
+            Element::Sb => (140, 165, 215),  // cool blue
+            Element::Te => (130, 110,  85),  // dark brown
+            Element::I  => ( 90,  45, 130),  // purple halogen
+            Element::Xe => (170, 195, 240),  // cool noble blue
+            Element::Ba => (210, 235, 195),  // green-tinted (Ba flame)
+            Element::La => (215, 220, 230),  // pale silver
+            Element::Ce => (225, 220, 195),  // warm tan
+            Element::Pr => (180, 220, 175),  // green (real Pr glass)
+            Element::Nd => (210, 175, 220),  // lilac (real Nd glass)
+            Element::Pm => (220, 180, 195),  // pale pink
+            Element::Sm => (225, 220, 165),  // pale yellow
+            Element::Eu => (235, 215, 195),  // peach
+            Element::Gd => (200, 215, 220),  // cool silver
+            Element::Tb => (190, 220, 195),  // pale green
+            Element::Dy => (220, 215, 180),  // warm silver
+            Element::Ho => (220, 195, 200),  // pinkish
+            Element::Er => (225, 175, 195),  // pink (real Er salts)
+            Element::Tm => (175, 220, 215),  // green-blue
+            Element::Yb => (215, 215, 185),  // warm silver
+            Element::Lu => (215, 220, 220),  // pale silver
+            Element::Hf => (175, 195, 220),  // cool blue-grey
+            Element::Ta => (160, 195, 230),  // distinct cool blue
+            Element::W  => (175, 190, 220),  // cool grey
+            Element::Re => (180, 185, 205),  // cool grey
+            Element::Os => (115, 130, 195),  // strong osmium blue
+            Element::Ir => (215, 235, 245),  // bright cool silver
+            Element::Pt => (230, 225, 200),  // slight warm silver
+            Element::Tl => (220, 220, 210),  // pale silver
+            Element::Bi => (230, 165, 180),  // pink iridescent (real)
+            Element::Po => (180, 145, 120),  // warm brown
+            Element::At => (110,  80, 105),  // dark muted purple
+            Element::Rn => (190, 175, 230),  // pale lavender
+            Element::Fr => (220, 195, 220),  // pale pink-silver
+            Element::Ac => (215, 220, 190),  // warm pale
+            Element::Th => (220, 215, 195),  // warm silver
+            Element::Pa => (165, 175, 230),  // cool blue
         }
     }
     fn name(self) -> &'static str {
@@ -2218,7 +3224,6 @@ impl Element {
             Element::Ice      => "Ice",
             Element::MoltenGlass => "Molten Glass",
             Element::Glass    => "Glass",
-            Element::Charcoal => "Charcoal",
             Element::H  => "Hydrogen",
             Element::He => "Helium",
             Element::C  => "Carbon",
@@ -2258,6 +3263,69 @@ impl Element {
             Element::B  => "Boron",
             Element::Ra => "Radium",
             Element::Cs => "Caesium",
+            Element::Li => "Lithium",
+            Element::Be => "Beryllium",
+            Element::Sc => "Scandium",
+            Element::Ti => "Titanium",
+            Element::V  => "Vanadium",
+            Element::Cr => "Chromium",
+            Element::Mn => "Manganese",
+            Element::Co => "Cobalt",
+            Element::Ga => "Gallium",
+            Element::Ge => "Germanium",
+            Element::As => "Arsenic",
+            Element::Se => "Selenium",
+            Element::Br => "Bromine",
+            Element::Kr => "Krypton",
+            Element::Rb => "Rubidium",
+            Element::Sr => "Strontium",
+            Element::Y  => "Yttrium",
+            Element::Zr => "Zirconium",
+            Element::Nb => "Niobium",
+            Element::Mo => "Molybdenum",
+            Element::Tc => "Technetium",
+            Element::Ru => "Ruthenium",
+            Element::Rh => "Rhodium",
+            Element::Pd => "Palladium",
+            Element::Cd => "Cadmium",
+            Element::In => "Indium",
+            Element::Sn => "Tin",
+            Element::Sb => "Antimony",
+            Element::Te => "Tellurium",
+            Element::I  => "Iodine",
+            Element::Xe => "Xenon",
+            Element::Ba => "Barium",
+            Element::La => "Lanthanum",
+            Element::Ce => "Cerium",
+            Element::Pr => "Praseodymium",
+            Element::Nd => "Neodymium",
+            Element::Pm => "Promethium",
+            Element::Sm => "Samarium",
+            Element::Eu => "Europium",
+            Element::Gd => "Gadolinium",
+            Element::Tb => "Terbium",
+            Element::Dy => "Dysprosium",
+            Element::Ho => "Holmium",
+            Element::Er => "Erbium",
+            Element::Tm => "Thulium",
+            Element::Yb => "Ytterbium",
+            Element::Lu => "Lutetium",
+            Element::Hf => "Hafnium",
+            Element::Ta => "Tantalum",
+            Element::W  => "Tungsten",
+            Element::Re => "Rhenium",
+            Element::Os => "Osmium",
+            Element::Ir => "Iridium",
+            Element::Pt => "Platinum",
+            Element::Tl => "Thallium",
+            Element::Bi => "Bismuth",
+            Element::Po => "Polonium",
+            Element::At => "Astatine",
+            Element::Rn => "Radon",
+            Element::Fr => "Francium",
+            Element::Ac => "Actinium",
+            Element::Th => "Thorium",
+            Element::Pa => "Protactinium",
         }
     }
 
@@ -2386,6 +3454,34 @@ pub struct World {
     pub history_count: usize,
     pub rewind_offset: usize,
     pub shockwaves: Vec<Shockwave>,
+    // Per-frame chemistry-blast accumulator. Every detonation-class
+    // reaction (delta_temp ≥ 1200) pushes its energy + position into
+    // this bucket; flush_chem_blast at the end of chemical_reactions
+    // emits ONE shockwave at the energy-weighted centroid with
+    // sublinear yield scaling. Replaces the old per-reaction shockwave
+    // emit, which produced a ring stack as the cloud chain-reacted
+    // across many frames.
+    chem_blast_x: f32,
+    chem_blast_y: f32,
+    chem_blast_energy: f32,
+    chem_blast_count: u32,
+    // Per-element count in `cells`, refreshed at the start of each
+    // step(). Lets systems early-out in O(1) when their required
+    // element isn't on the grid — sand-only scenes skip ~10 systems
+    // entirely instead of full-grid scanning each one for nothing.
+    pub present_count: [u32; ELEMENT_COUNT],
+    // True if any cell's temp exceeds the bloom threshold (500°C).
+    // Refreshed alongside `present_count`. Used by the render path
+    // to gate the bloom GPU passes — sand-only scenes have no hot
+    // cells, so uploading the bright sidecar + running 2 blur
+    // passes for an all-zero image is pure waste.
+    pub any_hot: bool,
+    // True if any cell is currently in the Gas phase (via
+    // cell_physics, which is phase-aware) — covers static gases
+    // like Steam/CO2 and derived gas compounds like HCl plus boiled
+    // metal vapors. The render path uses this to gate the volumetric
+    // gas-cloud blur.
+    pub any_gas: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2435,11 +3531,173 @@ impl World {
             history_count: 0,
             rewind_offset: 0,
             shockwaves: Vec::new(),
+            chem_blast_x: 0.0,
+            chem_blast_y: 0.0,
+            chem_blast_energy: 0.0,
+            chem_blast_count: 0,
+            present_count: [0; ELEMENT_COUNT],
+            any_hot: false,
+            any_gas: false,
         }
     }
 
+    // Cheap O(N) presence rebuild: zeros the count array, then walks
+    // every cell once. Run at the start of step() so each system can
+    // gate on `self.has(Element::X)` before doing any work. The count
+    // is "as of start of this frame" — systems that create new
+    // elements mid-step (thermal igniting Wood into Fire) will be
+    // visible to next frame's gates, which is fine for visual systems
+    // and acceptable for chemistry chains (one-frame lag).
+    #[inline]
+    fn has(&self, el: Element) -> bool {
+        self.present_count[el as usize] > 0
+    }
+    // True if any element with a chemistry profile (atom 18..ELEMENT_COUNT,
+    // or Water/Ice/Steam/Oil) is on the grid. Gates `chemical_reactions`.
+    #[inline]
+    fn has_reactive_chem(&self) -> bool {
+        for el_id in 18..ELEMENT_COUNT {
+            if self.present_count[el_id] > 0 { return true; }
+        }
+        self.present_count[Element::Water as usize] > 0
+            || self.present_count[Element::Ice as usize] > 0
+            || self.present_count[Element::Steam as usize] > 0
+            || self.present_count[Element::Oil as usize] > 0
+    }
+    // Total atomic-metal cells on the grid. Gates alloy / acid /
+    // base systems that all require at least one metal to do
+    // anything. Hardcoded list — these are the 16 paintable atomic
+    // metals; updating it costs nothing per frame and beats a
+    // dynamic is_atomic_metal probe inside the loop.
+    #[inline]
+    fn atomic_metal_count(&self) -> u32 {
+        // Includes every element categorized AlkaliMetal, AlkalineEarth,
+        // TransitionMetal, PostTransition, Lanthanide, Actinide. Updated
+        // to cover the periodic-table fill — galvanic detection now sees
+        // any pair of the new metals as candidates.
+        const METALS: [Element; 67] = [
+            // Originals
+            Element::Na, Element::Mg, Element::Al, Element::K, Element::Ca,
+            Element::Fe, Element::Cu, Element::Au, Element::Hg, Element::U,
+            Element::Zn, Element::Ag, Element::Ni, Element::Pb, Element::Ra,
+            Element::Cs,
+            // Period 2/4 fill
+            Element::Li, Element::Be,
+            Element::Sc, Element::Ti, Element::V, Element::Cr, Element::Mn,
+            Element::Co, Element::Ga,
+            // Period 5
+            Element::Rb, Element::Sr, Element::Y, Element::Zr, Element::Nb,
+            Element::Mo, Element::Tc, Element::Ru, Element::Rh, Element::Pd,
+            Element::Cd, Element::In, Element::Sn,
+            // Period 6 main + lanthanides
+            Element::Ba,
+            Element::La, Element::Ce, Element::Pr, Element::Nd, Element::Pm,
+            Element::Sm, Element::Eu, Element::Gd, Element::Tb, Element::Dy,
+            Element::Ho, Element::Er, Element::Tm, Element::Yb, Element::Lu,
+            Element::Hf, Element::Ta, Element::W, Element::Re, Element::Os,
+            Element::Ir, Element::Pt, Element::Tl, Element::Bi,
+            // Period 7 + actinides
+            Element::Fr, Element::Ac, Element::Th, Element::Pa,
+        ];
+        let mut total = 0u32;
+        for &m in METALS.iter() {
+            total += self.present_count[m as usize];
+        }
+        total
+    }
+    fn refresh_presence(&mut self) {
+        for v in self.present_count.iter_mut() { *v = 0; }
+        let mut any_hot = false;
+        let mut any_gas = false;
+        for c in &self.cells {
+            self.present_count[c.el as usize] += 1;
+            if c.temp > 500 { any_hot = true; }
+            if cell_physics(*c).kind == Kind::Gas { any_gas = true; }
+        }
+        self.any_hot = any_hot;
+        self.any_gas = any_gas;
+    }
+    // True if anything on the grid currently glows: hot cells
+    // (temp > 500), Fire, Lava, or energized noble gases (active
+    // EMF > 0 means a circuit is closed and noble-gas glow_color
+    // pixels light up). Gates the bloom GPU passes.
+    pub fn has_emission(&self) -> bool {
+        self.has(Element::Fire)
+            || self.has(Element::Lava)
+            || self.active_emf > 0.0
+            || self.any_hot
+    }
+    // True if any cell is currently in the Gas phase — covers
+    // static gases (Steam/CO2/H/etc.), derived gas compounds (HCl,
+    // NH3 …) and boiled-off vapors. Gates the volumetric blur
+    // passes; without this the gas pipeline would freeze for
+    // anything that isn't hard-coded as a static gas element.
+    pub fn has_any_gas(&self) -> bool { self.any_gas }
+
     pub fn spawn_shockwave(&mut self, cx: i32, cy: i32, yield_p: f32) {
         self.spawn_shockwave_capped(cx, cy, yield_p, 50000.0);
+    }
+
+    // Dump the current cell grid + ambient offset to disk. Format is a
+    // tiny custom binary: 4-byte magic, u32 cell count, i16 ambient,
+    // then the raw Cell bytes. No serde/bincode — the file is tied to
+    // this exact build's Cell layout, which is fine for "F11 save my
+    // testing scene; F12 reload it" usage.
+    pub fn save_state(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(b"ALEM")?;
+        f.write_all(&(self.cells.len() as u32).to_le_bytes())?;
+        f.write_all(&self.ambient_offset.to_le_bytes())?;
+        let cell_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.cells.as_ptr() as *const u8,
+                std::mem::size_of::<Cell>() * self.cells.len(),
+            )
+        };
+        f.write_all(cell_bytes)?;
+        Ok(())
+    }
+
+    // Restore a saved scene. Replaces cells and ambient_offset, clears
+    // transient runtime state (shockwaves, history, chem-blast bucket)
+    // so the loaded scene starts fresh rather than inheriting whatever
+    // was mid-flight. Refuses to load if magic/length doesn't match.
+    pub fn load_state(&mut self, path: &str) -> std::io::Result<()> {
+        use std::io::{Read, ErrorKind};
+        let mut f = std::fs::File::open(path)?;
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        if &magic != b"ALEM" {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "bad magic"));
+        }
+        let mut cnt_buf = [0u8; 4];
+        f.read_exact(&mut cnt_buf)?;
+        let cnt = u32::from_le_bytes(cnt_buf) as usize;
+        if cnt != self.cells.len() {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "cell count mismatch"));
+        }
+        let mut amb_buf = [0u8; 2];
+        f.read_exact(&mut amb_buf)?;
+        let ambient = i16::from_le_bytes(amb_buf);
+        let bytes_needed = std::mem::size_of::<Cell>() * cnt;
+        let cell_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.cells.as_mut_ptr() as *mut u8,
+                bytes_needed,
+            )
+        };
+        f.read_exact(cell_bytes)?;
+        self.ambient_offset = ambient;
+        self.shockwaves.clear();
+        self.chem_blast_x = 0.0;
+        self.chem_blast_y = 0.0;
+        self.chem_blast_energy = 0.0;
+        self.chem_blast_count = 0;
+        self.history_count = 0;
+        self.history_write = 0;
+        self.rewind_offset = 0;
+        Ok(())
     }
 
     // Custom-cap variant for nuclear ground-zero blasts, which need
@@ -2471,6 +3729,101 @@ impl World {
             radius: 0.0,
             yield_p: yield_p.min(max_pool),
         });
+    }
+
+    // Push a detonation event into this frame's chemistry-blast bucket.
+    // Position is energy-weighted so the eventual centroid sits at the
+    // mass of the reaction, not at whichever cell happened to fire first.
+    fn add_chem_blast(&mut self, x: i32, y: i32, energy: f32) {
+        if energy <= 0.0 { return; }
+        self.chem_blast_x += x as f32 * energy;
+        self.chem_blast_y += y as f32 * energy;
+        self.chem_blast_energy += energy;
+        self.chem_blast_count += 1;
+    }
+
+    // Emit ONE shockwave for everything that detonated this frame.
+    // Sublinear yield scaling (sqrt) so a 50-cell H cloud produces a
+    // bigger blast than a 5-cell pocket without going hyperbolic.
+    fn flush_chem_blast(&mut self) {
+        if self.chem_blast_count == 0 || self.chem_blast_energy <= 0.0 {
+            self.chem_blast_x = 0.0;
+            self.chem_blast_y = 0.0;
+            self.chem_blast_energy = 0.0;
+            self.chem_blast_count = 0;
+            return;
+        }
+        let cx = (self.chem_blast_x / self.chem_blast_energy).round() as i32;
+        let cy = (self.chem_blast_y / self.chem_blast_energy).round() as i32;
+        // Punchier yield curve. powf(0.58) gives bigger clouds more
+        // authority than sqrt without going fully linear; the 2500
+        // floor makes even small ignitions hit harder than the old
+        // 1200 + sqrt*140 baseline. 180k cap holds back the absurd
+        // upper end while still letting a full H/O room dwarf a small
+        // pocket.
+        let e = self.chem_blast_energy;
+        let yield_p = (2500.0 + e.powf(0.58) * 105.0).min(180_000.0);
+        self.spawn_shockwave(cx, cy, yield_p);
+        self.chem_blast_x = 0.0;
+        self.chem_blast_y = 0.0;
+        self.chem_blast_energy = 0.0;
+        self.chem_blast_count = 0;
+    }
+
+    // Push neighbor H/O cells over their activation threshold so an
+    // ignition front actually consumes the cloud instead of crawling
+    // cell-by-cell over many frames. Only targets H and O (so stone
+    // walls and unrelated cells aren't heated), and plants Fire in a
+    // fraction of nearby Empty cells for visible flame. The temp bump
+    // is loud enough (+450) that even a 220°C ambient cloud crosses
+    // the H+O activation in one tick once the flame front arrives.
+    fn flash_ignite_h_o_neighbors(&mut self, cx: i32, cy: i32, radius: i32) {
+        let r2 = radius * radius;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy > r2 { continue; }
+                let x = cx + dx;
+                let y = cy + dy;
+                if !Self::in_bounds(x, y) { continue; }
+                let i = Self::idx(x, y);
+                let el = self.cells[i].el;
+                if matches!(el, Element::H | Element::O) {
+                    let t = self.cells[i].temp as i32 + 450;
+                    self.cells[i].temp = t.clamp(-273, 5000) as i16;
+                } else if el == Element::Empty
+                    && rand::gen_range::<f32>(0.0, 1.0) < 0.18
+                {
+                    let mut f = Cell::new(Element::Fire);
+                    f.temp = 1600;
+                    f.flag |= Cell::FLAG_UPDATED;
+                    self.cells[i] = f;
+                }
+            }
+        }
+    }
+
+    // Local pressure shove right at the reaction site. Complements the
+    // expanding shockwave ring with an immediate "gut punch" — matter
+    // adjacent to the detonation gets accelerated outward this frame
+    // instead of waiting for the wave's annulus to sweep over it.
+    // Pressure falls off linearly with squared-distance / r².
+    fn inject_pressure_disc(&mut self, cx: i32, cy: i32, radius: i32, amount: i16) {
+        let r2 = (radius * radius).max(1);
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let dist2 = dx * dx + dy * dy;
+                if dist2 > r2 { continue; }
+                let x = cx + dx;
+                let y = cy + dy;
+                if !Self::in_bounds(x, y) { continue; }
+                let i = Self::idx(x, y);
+                let falloff = 1.0 - (dist2 as f32 / r2 as f32);
+                let add = (amount as f32 * falloff).round() as i32;
+                let p = self.cells[i].pressure as i32 + add;
+                self.cells[i].pressure =
+                    p.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            }
+        }
     }
 
     // Advance every active shockwave by one step. Apply effects inside the
@@ -2877,6 +4230,7 @@ impl World {
     }
 
     fn decay(&mut self) {
+        if !self.has(Element::U) { return; }
         self.compute_u_components();
         // Clear stale commit flags from previous frames: any cell that
         // isn't currently U can't be mid-cascade, so its flag is
@@ -3307,6 +4661,25 @@ impl World {
     }
 
     fn compute_energized(&mut self) {
+        // No battery and no possible galvanic cell — nothing on the
+        // grid can drive current, so all the seed/BFS scans are a
+        // no-op. Reset state cheaply and bail. (Galvanic needs at
+        // least 2 different metals on Water; we approximate with
+        // metals + Water both present, then let the inner logic
+        // confirm. With sand-only neither is true.)
+        let battery = self.has(Element::BattPos) || self.has(Element::BattNeg);
+        let galvanic_possible = self.has(Element::Water)
+            && self.atomic_metal_count() >= 2;
+        if !battery && !galvanic_possible {
+            for v in self.energized.iter_mut() { *v = false; }
+            for v in self.cathode_mask.iter_mut() { *v = false; }
+            for v in self.anode_mask.iter_mut() { *v = false; }
+            self.galvanic_voltage = 0.0;
+            self.active_emf = 0.0;
+            self.galvanic_cathode_el = None;
+            self.galvanic_anode_el = None;
+            return;
+        }
         for v in self.energized.iter_mut() { *v = false; }
         for v in self.cathode_mask.iter_mut() { *v = false; }
         for v in self.anode_mask.iter_mut() { *v = false; }
@@ -3617,6 +4990,9 @@ impl World {
         self.frame = self.frame.wrapping_add(1);
         // Clear only the per-frame "updated" bit; preserve FROZEN.
         for c in self.cells.iter_mut() { c.flag &= !Cell::FLAG_UPDATED; }
+        // Refresh per-element presence so each system can gate on
+        // "is my required element on the grid" before scanning.
+        self.refresh_presence();
         if wind.length_squared() > 0.0001 {
             self.compute_wind_exposure();
         }
@@ -3655,6 +5031,7 @@ impl World {
         self.color_fires();
         self.thermal();
         self.chemical_reactions();
+        self.flush_chem_blast();
         self.acid_displacement();
         self.alloy_acid_leach();
         self.base_neutralization();
@@ -3741,16 +5118,30 @@ impl World {
     // changes and in-place combustion. Generic — every element is driven by
     // the same rules through its property methods.
     fn thermal(&mut self) {
-        // 1) Diffusion + ambient (double-buffered).
-        for y in 0..H as i32 {
-            for x in 0..W as i32 {
-                let i = Self::idx(x, y);
-                let c = self.cells[i];
+        // 1) Diffusion + ambient (double-buffered, parallelized over rows).
+        // Pure read of `cells` + write to disjoint `temp_scratch` slots —
+        // race-free under rayon. Stochastic rounding uses a deterministic
+        // per-cell-and-frame hash instead of a thread-local RNG so the
+        // result is reproducible (rewind-determinism tests rely on it)
+        // and fast (no atomic-RNG contention across worker threads).
+        use rayon::prelude::*;
+        let cells = &self.cells;
+        let ambient_offset = self.ambient_offset;
+        let frame = self.frame;
+        self.temp_scratch.par_chunks_mut(W).enumerate().for_each(|(yu, row)| {
+            let y = yu as i32;
+            for xu in 0..W {
+                let x = xu as i32;
+                let i = yu * W + xu;
+                let c = cells[i];
                 let my_k = c.el.thermal().conductivity;
                 let mut delta: f32 = 0.0;
-                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                    if !Self::in_bounds(x + dx, y + dy) { continue; }
-                    let n = self.cells[Self::idx(x + dx, y + dy)];
+                for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || nx >= W as i32 || ny < 0 || ny >= H as i32 { continue; }
+                    let ni = (ny as usize) * W + nx as usize;
+                    let n = cells[ni];
                     let k = my_k.min(n.el.thermal().conductivity);
                     delta += k * (n.temp as f32 - c.temp as f32);
                 }
@@ -3762,35 +5153,44 @@ impl World {
                     1.0
                 } else {
                     let mut diff = 0.0f32;
-                    for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                        let nx = x + dx; let ny = y + dy;
-                        if !Self::in_bounds(nx, ny) { diff += 1.0; continue; }
-                        if self.cells[Self::idx(nx, ny)].el != c.el { diff += 1.0; }
+                    for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                        let nx = x + dx;
+                        let ny = y + dy;
+                        if nx < 0 || nx >= W as i32 || ny < 0 || ny >= H as i32 {
+                            diff += 1.0;
+                            continue;
+                        }
+                        let ni = (ny as usize) * W + nx as usize;
+                        if cells[ni].el != c.el { diff += 1.0; }
                     }
                     diff / 4.0
                 };
                 // 10% baseline even for fully-interior cells — nothing is
                 // perfectly insulated, and it lets slow gradients develop.
                 let amb_factor = 0.10 + 0.90 * exposure;
-                let ambient_t = c.el.thermal().ambient_temp as i32 + self.ambient_offset as i32;
+                let ambient_t = c.el.thermal().ambient_temp as i32 + ambient_offset as i32;
                 delta += c.el.thermal().ambient_rate * amb_factor
                     * (ambient_t as f32 - c.temp as f32);
                 // Stochastic rounding: temp is an integer, but per-frame
                 // changes can be well under 1°. Round up with probability
-                // equal to the fractional part, so the expected drift
-                // matches the true rate over many frames.
+                // equal to the fractional part. Using a (frame, i) hash
+                // instead of rand::gen_range to keep the closure thread-
+                // safe and deterministic.
                 let exact = c.temp as f32 + delta / c.el.thermal().heat_capacity;
                 let floor = exact.floor();
                 let frac = exact - floor;
-                let roll = rand::gen_range::<u16>(0, 10_000) as f32 / 10_000.0;
+                let h = frame.wrapping_mul(0x9E3779B1)
+                    .wrapping_add((i as u32).wrapping_mul(0x85EBCA77));
+                let h = h ^ (h >> 13);
+                let roll = (h & 0xFFFF) as f32 / 65536.0;
                 let stepped = if roll < frac { floor + 1.0 } else { floor };
                 // Absolute zero is -273°C — the physical floor. Upper limit
                 // stays at 4000°C, comfortably above any metal's boiling
                 // point we'd plausibly simulate.
                 let new_t = stepped.clamp(-273.0, 4000.0) as i16;
-                self.temp_scratch[i] = new_t;
+                row[xu] = new_t;
             }
-        }
+        });
         for i in 0..(W * H) {
             self.cells[i].temp = self.temp_scratch[i];
         }
@@ -3975,6 +5375,36 @@ impl World {
                                 }
                             }
                         }
+                        // Francium — same chain detonation behavior as
+                        // Cs, with all energy values bumped 5% to reflect
+                        // its position as the most reactive alkali.
+                        // Shockwave 945 (vs Cs 900), thermal burn temp
+                        // 1470 (vs Cs 1400). Ignition threshold lower
+                        // (28 vs 50) is in the thermal profile, so a Fr
+                        // pile pops harder and earlier than a Cs pile.
+                        if c.el == Element::Fr {
+                            self.spawn_shockwave(x, y, 945.0);
+                            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                                let nx = x + dx;
+                                let ny = y + dy;
+                                if !Self::in_bounds(nx, ny) { continue; }
+                                let ni = Self::idx(nx, ny);
+                                if self.cells[ni].el == Element::Fr
+                                    && self.cells[ni].burn == 0
+                                {
+                                    if let Some(dur) =
+                                        Element::Fr.thermal().burn_duration
+                                    {
+                                        self.cells[ni].burn = dur;
+                                        self.cells[ni].moisture = 0;
+                                        let t = self.cells[i].temp;
+                                        if self.cells[ni].temp < t {
+                                            self.cells[ni].temp = t;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     if self.cells[i].burn > 0 {
                         // Drowning: enough moisture means water has been in
@@ -4001,15 +5431,16 @@ impl World {
                             else              { 1 };
                         self.cells[i].burn = self.cells[i].burn.saturating_sub(burn_decrement);
                         if self.cells[i].burn == 0 {
-                            // Fuel consumed. Wood leaves charcoal residue
-                            // ~30% of the time (a real fire drops ash/char);
-                            // otherwise the cell becomes hot smoke. Other
-                            // flammables (leaves/oil/seed) vanish to smoke
-                            // only — no substantial solid left.
+                            // Fuel consumed. Wood leaves carbon residue
+                            // ~30% of the time (a real fire drops ash/
+                            // char, which is mostly elemental carbon);
+                            // otherwise the cell becomes hot smoke.
+                            // Other flammables (leaves/oil/seed) vanish
+                            // to smoke only — no substantial solid left.
                             let leaves_char =
                                 c.el == Element::Wood && rand::gen_range::<u8>(0, 10) < 3;
                             if leaves_char {
-                                let mut ch = Cell::new(Element::Charcoal);
+                                let mut ch = Cell::new(Element::C);
                                 ch.temp = 450;
                                 self.cells[i] = ch;
                             } else {
@@ -4386,11 +5817,15 @@ impl World {
         }
 
         // Compute per-cell TARGET pressure into the scratch buffer.
-        // Pass 1: thermal component.
+        // Pass 1: thermal component. cell_physics is phase-aware so a
+        // derived gas cell (HCl, HF, NH₃) is correctly recognized as
+        // Gas-kind here — `cell.el.physics()` would return the static
+        // Powder stub for Element::Derived and zero out the thermal
+        // contribution.
         for i in 0..self.cells.len() {
             let cell = self.cells[i];
-            let phys = cell.el.physics();
-            let thermal = if matches!(phys.kind, Kind::Gas | Kind::Fire) {
+            let kind = cell_physics(cell).kind;
+            let thermal = if matches!(kind, Kind::Gas | Kind::Fire) {
                 ((cell.temp as i32 - 20) * 5).clamp(-300, 4000)
             } else {
                 0
@@ -4421,7 +5856,7 @@ impl World {
                     // pressure. The kind-based check missed iron entirely.
                     let is_wall = cell.is_frozen()
                         && !matches!(
-                            cell.el.physics().kind,
+                            cell_physics(cell).kind,
                             Kind::Empty | Kind::Gas | Kind::Fire | Kind::Liquid,
                         );
                     if is_wall {
@@ -4437,7 +5872,46 @@ impl World {
                         // any stuck pressure they inherited).
                         col_p = 0.0;
                     } else {
-                        col_p += Self::cell_weight(cell.el) * g;
+                        // Only RESTING solids contribute hydrostatic
+                        // weight. A grain in free-fall isn't pressing on
+                        // the column — even an unbroken stream of
+                        // touching falling grains is in zero-internal-
+                        // stress free-fall (a falling rod feels no
+                        // weight along its length). Two checks:
+                        //   1. is_updated() — the cell moved THIS frame
+                        //      via the motion pass that ran just before
+                        //      pressure_sources. A moving cell is by
+                        //      definition not in static equilibrium.
+                        //   2. directly-below cell is rigid — backstop
+                        //      for grains that happened not to move
+                        //      this frame (probabilistic gravity etc.)
+                        //      but are still resting on something solid.
+                        let kind = cell_physics(cell).kind;
+                        let is_solid_mass = matches!(
+                            kind,
+                            Kind::Solid | Kind::Gravel | Kind::Powder,
+                        );
+                        let count_weight = if is_solid_mass {
+                            if cell.is_updated() {
+                                false
+                            } else {
+                                let by = y + 1;
+                                if by >= H as i32 {
+                                    true
+                                } else {
+                                    let below = self.cells[Self::idx(x, by)];
+                                    below.is_frozen() || matches!(
+                                        cell_physics(below).kind,
+                                        Kind::Solid | Kind::Gravel | Kind::Powder,
+                                    )
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if count_weight {
+                            col_p += Self::cell_weight(cell.el) * g;
+                        }
                         let p_clamped = col_p.clamp(-4000.0, 4000.0) as i32;
                         let combined = (self.pressure_scratch[i] as i32 + p_clamped)
                             .clamp(-4000, 4000);
@@ -4465,7 +5939,12 @@ impl World {
             let current = self.cells[i].pressure as i32;
             let target = self.pressure_scratch[i] as i32;
             let delta = target - current;
-            let k = self.cells[i].el.physics().kind;
+            // Phase-aware kind: el.physics() returns Kind::Powder for
+            // Element::Derived, which would mark a derived gas (HCl,
+            // HF, NH₃) as non-pressurizable and blend its overpressure
+            // away each frame — capping the user's hold-paint stack
+            // at the 4000 clamp instead of letting it accumulate.
+            let k = cell_physics(self.cells[i]).kind;
             let is_pressurizable_matter = matches!(k, Kind::Gas | Kind::Fire);
             if delta > 0 {
                 let step = ((delta * UP_NUM) / UP_DEN).max(1);
@@ -4494,23 +5973,30 @@ impl World {
         // per-neighbor transfer 255/2048 ≈ 12% (well under the 25% forward-
         // Euler stability ceiling for 4-neighborhood diffusion). Multiple
         // iterations per frame effectively multiply propagation speed.
+        // Each iteration's inner pass is parallelized over rows — pure
+        // read of cells + write to disjoint pressure_scratch slots, so
+        // race-free under rayon.
+        use rayon::prelude::*;
         const DIFF_SCALE: i32 = 2048;
         const ITERS: usize = 6;
         for _iter in 0..ITERS {
-            for y in 0..H as i32 {
-                for x in 0..W as i32 {
-                    let i = Self::idx(x, y);
-                    let me_perm = self.cells[i].el.pressure_p().permeability as i32;
-                    let me_p = self.cells[i].pressure as i32;
+            let cells = &self.cells;
+            self.pressure_scratch.par_chunks_mut(W).enumerate().for_each(|(yu, row)| {
+                let y = yu as i32;
+                for xu in 0..W {
+                    let x = xu as i32;
+                    let i = yu * W + xu;
+                    let me_perm = cell_pressure_p(cells[i]).permeability as i32;
+                    let me_p = cells[i].pressure as i32;
                     // Walls (perm=0) can't diffuse — no neighbor flux would
                     // pass min_perm=0 gate anyway. Skip the 4-neighbor
                     // scan entirely and just carry pressure through.
                     if me_perm == 0 {
-                        self.pressure_scratch[i] = me_p as i16;
+                        row[xu] = me_p as i16;
                         continue;
                     }
                     let mut new_p = me_p;
-                    for (dx, dy) in [(-1, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
                         let nx = x + dx;
                         let ny = y + dy;
                         // Boundary conditions:
@@ -4520,11 +6006,12 @@ impl World {
                         //     play space from acting as a sealed box that
                         //     permanently accumulates everything painted.
                         //   - Vertical out-of-bounds → sealed (ceiling / floor).
-                        let (n_p, n_perm): (i32, i32) = if Self::in_bounds(nx, ny) {
-                            let ni = Self::idx(nx, ny);
+                        let in_bounds = nx >= 0 && nx < W as i32 && ny >= 0 && ny < H as i32;
+                        let (n_p, n_perm): (i32, i32) = if in_bounds {
+                            let ni = (ny as usize) * W + nx as usize;
                             (
-                                self.cells[ni].pressure as i32,
-                                self.cells[ni].el.pressure_p().permeability as i32,
+                                cells[ni].pressure as i32,
+                                cell_pressure_p(cells[ni]).permeability as i32,
                             )
                         } else if dy != 0 {
                             continue;
@@ -4536,9 +6023,9 @@ impl World {
                         let diff = n_p - me_p;
                         new_p += diff * min_perm / DIFF_SCALE;
                     }
-                    self.pressure_scratch[i] = new_p as i16;
+                    row[xu] = new_p as i16;
                 }
-            }
+            });
             for i in 0..self.cells.len() {
                 self.cells[i].pressure = self.pressure_scratch[i];
             }
@@ -4561,6 +6048,7 @@ impl World {
     // rate scaled by world.ambient_oxygen — so Fe rusts in open air, C
     // burns, flammables ignite without needing O painted explicitly.
     fn chemical_reactions(&mut self) {
+        if !self.has_reactive_chem() { return; }
         let neighbors: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
         // Scratch buffer for catalyst scanning — avoids allocating each call.
         let mut catalysts: [Element; 12] = [Element::Empty; 12];
@@ -4632,9 +6120,19 @@ impl World {
                     // Only fires when we didn't already resolve a real gas
                     // partner via the ray scan above — prefer real chemistry
                     // when available, fall back to the oxygen reservoir.
+                    //
+                    // Hydrogen is excluded: real H₂ in air is inert at any
+                    // temperature reachable by ambient drift (needs a literal
+                    // spark), and the cubic temp-ramp wasn't enough to
+                    // contain the cascade — once even a single trace water
+                    // formed from virtual O, its delta_temp heated neighbors
+                    // past the 318°C full-rate threshold and the whole H
+                    // cloud detonated. The user has to paint explicit O for
+                    // H+O to react.
                     let virtual_o = gas_mix_distance == 0
                         && n.el == Element::Empty
                         && ambient_o > 0.0
+                        && c.el != Element::H
                         && rand::gen_range::<f32>(0.0, 1.0) < ambient_o;
                     let eff_n_el = if virtual_o { Element::O } else { n.el };
                     // Neighbor-side chemistry early-out: same reason, much
@@ -4691,8 +6189,20 @@ impl World {
                     //     fire at a meaningful rate. Without this, stratified
                     //     H+Cl in a container would never meet cardinal-
                     //     adjacent and the reaction would never fire.
+                    //   * Ignited H+O override: once both cells are hot
+                    //     enough to be in the detonation regime, drop the
+                    //     gas-distance damping so the flame front rips
+                    //     through the mixed cloud in 1-2 frames instead
+                    //     of crawling at 1/(d+1) and stretching the
+                    //     reaction across many frames (= ring stack).
+                    let water_product = matches!(r.products[0].el, Element::Water)
+                        || matches!(r.products[1].el, Element::Water);
+                    let hot_h_o = water_product
+                        && c.temp.max(n_temp) >= 350;
                     let mut eff_rate = if virtual_o {
                         r.rate * 0.1
+                    } else if hot_h_o {
+                        (r.rate * 0.75).max(0.50)
                     } else if gas_mix_distance > 0 {
                         r.rate / (gas_mix_distance as f32 + 1.0)
                     } else {
@@ -4763,16 +6273,36 @@ impl World {
                             }
                         }
                     }
-                    // Highly-exothermic reactions detonate — emit a shockwave
-                    // scaled to the energy released in this single step.
+                    // Highly-exothermic reactions feed an accumulator
+                    // instead of spawning their own shockwave. One blast
+                    // gets emitted at end-of-pass at the energy-weighted
+                    // centroid, so a chained H+O cloud produces ONE big
+                    // ring rather than a ring per ignition cell.
                     // Threshold is set high enough that ordinary combustion
-                    // (C+O at ΔT=900) DOESN'T spawn a blast; only detonation-
+                    // (C+O at ΔT=900) DOESN'T contribute; only detonation-
                     // class chemistry like H+O (1800) clears the bar.
                     if r.delta_temp as i32 >= 1200 {
-                        let dt = r.delta_temp as f32;
-                        let yield_p = ((dt - 400.0) * 6.0).min(6000.0);
-                        if yield_p > 500.0 {
-                            self.spawn_shockwave(x, y, yield_p);
+                        // All detonation-class reactions feed the global
+                        // blast accumulator so K+F / Cs+F / Fr+F still
+                        // detonate. The violent-tier check upstream
+                        // (donor_e < 0.85) excludes Li/Na so their salt
+                        // formation never reaches this delta_temp and
+                        // they just glow hot without detonating —
+                        // letting the user actually see the LiF salt.
+                        let water_product = matches!(pa.el, Element::Water)
+                            || matches!(pb.el, Element::Water);
+                        let e = if water_product {
+                            // 2.5× pressure multiplier on a lower 300
+                            // baseline — H+O punches harder than its
+                            // 1800°C heat would suggest.
+                            (r.delta_temp as f32 - 300.0).max(0.0) * 2.5
+                        } else {
+                            (r.delta_temp as f32 - 400.0).max(0.0)
+                        };
+                        self.add_chem_blast(x, y, e);
+                        if water_product {
+                            self.flash_ignite_h_o_neighbors(x, y, 3);
+                            self.inject_pressure_disc(x, y, 4, 1200);
                         }
                     }
                     break;
@@ -4794,6 +6324,7 @@ impl World {
     // aggressively while HCl nibbles Cu slowly. Au (E above H) never
     // reacts — matches the real reactivity series.
     fn acid_displacement(&mut self) {
+        if self.atomic_metal_count() == 0 { return; }
         // Threshold matches the real reactivity series: metals ABOVE H
         // (Mg=1.31, Al=1.61, Zn=1.65, Fe=1.83) react with dilute acid;
         // metals BELOW H (Cu=1.90, Ag=1.93, Au=2.54) don't. Because
@@ -4870,6 +6401,7 @@ impl World {
     //
     //     2 Al + Fe₂O₃  →  Al₂O₃ + 2 Fe + huge exotherm
     fn thermite(&mut self) {
+        if !self.has(Element::Rust) || !self.has(Element::Al) { return; }
         const BURN_DURATION: u8 = 30;
         const BURN_TEMP: i16 = 2500;
         // 1700°C — hot enough that the products glow visibly orange/red
@@ -4996,6 +6528,22 @@ impl World {
     // doesn't double-spawn fires for things like burning Mg, which
     // has its own dedicated magnesium_burn() pass.
     fn flame_test_emission(&mut self) {
+        // This function CREATES Fire cells from hot metal salts —
+        // a flame is the OUTPUT, not a precondition. So we gate on
+        // "any flame-coloring source is present" (the elements
+        // flame_color() returns Some for), not on has(Fire). The
+        // earlier has(Fire) gate broke "Cu on lava" — Cu sitting in
+        // a flame-less hot environment should still emit its own
+        // green flame, but the gate skipped the function until some
+        // OTHER fire happened to exist.
+        if !self.has(Element::Cu)
+            && !self.has(Element::Na)
+            && !self.has(Element::K)
+            && !self.has(Element::Ca)
+            && !self.has(Element::Mg)
+            && !self.has(Element::B)
+            && !self.has(Element::Salt)
+        { return; }
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5004,10 +6552,37 @@ impl World {
                 if c.burn > 0 { continue; }
                 if c.temp < 600 { continue; }
                 if flame_color(c.el).is_none() { continue; }
-                // 40% chance per tick to emit a colored Fire cell into
-                // a random adjacent Empty. Visually reads as a steady
-                // fountain of colored flame off the hot salt.
-                if rand::gen_range::<f32>(0.0, 1.0) > 0.40 { continue; }
+                // Flame-color emission isn't combustion — it's the
+                // tint hot metal vapor adds to an existing flame. So
+                // gate it on either real oxygen presence (a flame
+                // could exist here) or an already-burning Fire cell
+                // adjacent (a flame already exists here). At 0%
+                // ambient O₂ in vacuum, hot Na should glow but not
+                // spawn Fire cells — that was producing visible
+                // "flames" with no oxidizer present.
+                let local_o2 = self.oxygen_available(x, y);
+                let adjacent_fire = [
+                    (1i32, 0i32), (-1, 0), (0, 1), (0, -1),
+                    (1, 1), (1, -1), (-1, 1), (-1, -1),
+                ].iter().any(|&(dx, dy)| {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if !Self::in_bounds(nx, ny) { return false; }
+                    self.cells[Self::idx(nx, ny)].el == Element::Fire
+                });
+                if local_o2 <= 0.01 && !adjacent_fire { continue; }
+                // Emission probability scales with oxygen. With an
+                // adjacent flame, the floor is 10% so the tint is
+                // visible even in low-O₂ pockets near an existing
+                // fire. Without adjacent flame, fully proportional
+                // to local O₂.
+                let o2_factor = local_o2.clamp(0.0, 1.0);
+                let emit_p = if adjacent_fire {
+                    0.10 + 0.30 * o2_factor
+                } else {
+                    0.40 * o2_factor
+                };
+                if rand::gen_range::<f32>(0.0, 1.0) > emit_p { continue; }
                 let order = rand::gen_range::<u8>(0, 4);
                 for k in 0..4 {
                     let (dx, dy) = match (order + k) % 4 {
@@ -5045,6 +6620,7 @@ impl World {
     // burn site will pick up the color independently from their
     // own neighbors at spawn time.
     fn color_fires(&mut self) {
+        if !self.has(Element::Fire) { return; }
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5078,6 +6654,7 @@ impl World {
     }
 
     fn magnesium_burn(&mut self) {
+        if !self.has(Element::Mg) { return; }
         const BURN_DURATION: u8 = 50;
         const BURN_TEMP: i16 = 3000;
         const FINAL_TEMP: i16 = 1700;
@@ -5344,6 +6921,7 @@ impl World {
     // both cells in PHASE_LIQUID — the SOLID metal dissolves into Hg's
     // liquid phase. (2) skips ferrous metals (Fe, Ni) which don't amalgamate.
     fn hg_amalgamation(&mut self) {
+        if !self.has(Element::Hg) { return; }
         // Slow reaction so the user sees a gradual amalgam spread,
         // not a flash conversion of the entire contact line.
         const RATE: f32 = 0.05;
@@ -5400,6 +6978,7 @@ impl World {
     // this models F + (metal-Cl salt) → (metal-F salt) + Cl gas. Targets
     // both Element::Salt (bespoke NaCl) and any derived metal-Cl compound.
     fn halogen_displacement(&mut self) {
+        if !self.has(Element::F) { return; }
         const RATE: f32 = 0.30;
         const REACTION_HEAT: i16 = 200;
         for y in 0..H as i32 {
@@ -5419,16 +6998,17 @@ impl World {
                     let metal_el: Element = match n.el {
                         Element::Salt => Element::Na,
                         Element::Derived => {
-                            let m = DERIVED_COMPOUNDS.with(|r| {
-                                let reg = r.borrow();
-                                let cd = reg.get(n.derived_id as usize)?;
-                                if cd.constituents.len() != 2 { return None; }
-                                let (e0, _) = cd.constituents[0];
-                                let (e1, _) = cd.constituents[1];
-                                if e0 == Element::Cl { Some(e1) }
-                                else if e1 == Element::Cl { Some(e0) }
-                                else { None }
-                            });
+                            let m = {
+                                let reg = DERIVED_COMPOUNDS.read();
+                                reg.get(n.derived_id as usize).and_then(|cd| {
+                                    if cd.constituents.len() != 2 { return None; }
+                                    let (e0, _) = cd.constituents[0];
+                                    let (e1, _) = cd.constituents[1];
+                                    if e0 == Element::Cl { Some(e1) }
+                                    else if e1 == Element::Cl { Some(e0) }
+                                    else { None }
+                                })
+                            };
                             match m {
                                 Some(metal) => metal,
                                 None => continue,
@@ -5473,6 +7053,7 @@ impl World {
     // Frozen (build-mode) Glass etches 50× slower so a glass window
     // doesn't vanish in the instant a single F atom drifts into it.
     fn glass_etching(&mut self) {
+        if !self.has(Element::F) || !self.has(Element::Glass) { return; }
         const ETCH_RATE: f32 = 0.20;
         const REACTION_HEAT: i16 = 800;
         for y in 0..H as i32 {
@@ -5519,6 +7100,7 @@ impl World {
     // This is how you purify copper out of a CuFe alloy: drop it in HCl,
     // iron dissolves away as FeCl₂ + H₂, copper is left behind.
     fn alloy_acid_leach(&mut self) {
+        if self.atomic_metal_count() == 0 { return; }
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5596,6 +7178,7 @@ impl World {
     // than either pure metal would. Since alloys are derived compounds,
     // they participate in the normal phase system and other chemistry.
     fn alloy_formation(&mut self) {
+        if self.atomic_metal_count() < 2 { return; }
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5644,6 +7227,7 @@ impl World {
     // modestly exothermic — warms the salt and water but not enough to
     // cascade into combustion.
     fn base_neutralization(&mut self) {
+        if self.atomic_metal_count() == 0 { return; }
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5696,6 +7280,7 @@ impl World {
     // Phase 1 scope: Salt in Water. Other soluble solids will be added
     // as the predicate grows.
     fn dissolve(&mut self) {
+        if !self.has(Element::Water) { return; }
         // Water with room (solute_amt < ABSORB_THRESHOLD) will fill up to
         // 255 on contact with a salt neighbor, consuming the salt cell.
         // Diffusion (diffuse_solute) lowers saturation over time so fresh
@@ -5741,6 +7326,7 @@ impl World {
     }
 
     fn diffuse_solute(&mut self) {
+        if !self.has(Element::Water) { return; }
         // Solute_amt equalizes between adjacent water cells carrying the
         // same solute (concentration gradient → diffusion). This is what
         // breaks the interface-saturation stall: without it the layer of
@@ -5795,6 +7381,7 @@ impl World {
     }
 
     fn reactions(&mut self) {
+        if !self.has(Element::Water) { return; }
         // Only moisture-chemistry reactions live here now. Heat-driven effects
         // (ignition, boiling, lava→obsidian, mud drying) are all in thermal().
         for y in 0..H as i32 {
@@ -6424,7 +8011,7 @@ impl World {
         // per frame — each hop recomputes the gradient from the new
         // position, so gas accelerates as it approaches the low-P center
         // (the gradient gets steeper the closer it gets).
-        let my_compl = me.pressure_p().compliance as i32;
+        let my_compl = cell_pressure_p(me_cell).compliance as i32;
         if my_compl > 0 {
             let grad_dirs: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
             const MAX_HOPS: u8 = 8;
@@ -6521,7 +8108,11 @@ impl World {
         // stratification still emerges because lighter gases have a higher
         // rise probability than heavier ones, so they migrate past each
         // other over time.
-        let my_mass = me.physics().molar_mass;
+        // cell_physics is phase-aware AND looks through the derived
+        // registry — `me.physics()` (the static fallback) returns the
+        // Element::Derived stub with molar_mass=0, killing buoyancy
+        // entirely for every derived gas (HCl, HF, NH₃, etc.).
+        let my_mass = cell_physics(me_cell).molar_mass;
         if my_mass > 0.0 && self.gravity > 0.0 {
             let air_mass = AMBIENT_AIR.molar_mass;
             let bias = (air_mass - my_mass) / air_mass * 255.0
@@ -6579,7 +8170,7 @@ impl World {
     // Threshold prevents ordinary hydrostatic variations from rearranging
     // sand piles; only explosion-scale net force pushes matter.
     fn try_pressure_shove(&mut self, x: i32, y: i32, me_cell: Cell) -> bool {
-        let compliance = me_cell.el.pressure_p().compliance as i32;
+        let compliance = cell_pressure_p(me_cell).compliance as i32;
         if compliance == 0 { return false; }
         // Compute net pressure force vector across the cell.
         let mut net_x: i32 = 0;
@@ -6839,7 +8430,19 @@ impl World {
         // asymmetries (Beaker's open top, Battery's terminal placement)
         // also shift by reinterpreting which edge is which.
         let rot = rotation & 3;
-        let (bw, bh) = if rot == 1 || rot == 3 { (h, w) } else { (w, h) };
+        // Per-kind canonical bounding box. Line is a horizontal bar
+        // (length × thickness) before rotation; Circle is a square
+        // bbox using max(w, h) so the ring is round-ish; the rest
+        // use the user-provided width × height directly.
+        let (canon_w, canon_h) = match kind {
+            PrefabKind::Line => (w.max(1), thickness.max(1)),
+            PrefabKind::Circle => {
+                let d = w.max(h).max(2);
+                (d, d)
+            }
+            _ => (w, h),
+        };
+        let (bw, bh) = if rot == 1 || rot == 3 { (canon_h, canon_w) } else { (canon_w, canon_h) };
         let x0 = cx - bw / 2;
         let y0 = cy - bh / 2;
         let x1 = x0 + bw;
@@ -6896,6 +8499,65 @@ impl World {
                             stamp(self, x, y, Element::BattNeg);
                         } else {
                             stamp(self, x, y, el);
+                        }
+                    }
+                    PrefabKind::Line => {
+                        // Solid bar — fill the entire bbox. Rotation
+                        // already produced the right bw/bh, so every
+                        // cell in the box is part of the line.
+                        stamp(self, x, y, el);
+                    }
+                    PrefabKind::Circle => {
+                        // Hollow ring of `thickness` width inside the
+                        // square bbox. Use canonical (rotation-invariant)
+                        // distance from centre — circles look the same
+                        // at any rotation, so rotation doesn't affect
+                        // the stamping.
+                        let lx = x - x0;
+                        let ly = y - y0;
+                        let cxc = bw / 2;
+                        let cyc = bh / 2;
+                        let dx = (lx - cxc) as f32;
+                        let dy = (ly - cyc) as f32;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let outer_r = (bw.min(bh) as f32) * 0.5;
+                        let inner_r = (outer_r - thickness as f32).max(0.0);
+                        if dist <= outer_r && dist >= inner_r {
+                            stamp(self, x, y, el);
+                        }
+                    }
+                    PrefabKind::Bowl => {
+                        // Lower half of an ellipse. Open at the top
+                        // edge of the bbox. Wall is `thickness` cells
+                        // thick. Rotation rotates the open face — a
+                        // bowl rotated 180° opens downward.
+                        let lx = x - x0;
+                        let ly = y - y0;
+                        // Map screen-relative position to canonical
+                        // (top-open) bowl coordinates so rotation works.
+                        let (u_pos, v_pos, u_max, v_max) = match rot {
+                            0 => (lx, ly,           bw, bh),  // canonical: open top
+                            1 => (ly, bw - 1 - lx, bh, bw),  // open right (rotated 90° CW)
+                            2 => (lx, bh - 1 - ly, bw, bh),  // open bottom
+                            3 => (ly, lx,           bh, bw),  // open left
+                            _ => (lx, ly,           bw, bh),
+                        };
+                        // u along the open edge (0..u_max), v from
+                        // open edge inward (0..v_max). Lower half of
+                        // ellipse has v >= 0 from top-centre.
+                        let cu = (u_max / 2) as f32;
+                        let du = u_pos as f32 - cu;
+                        let dv = v_pos as f32;
+                        let a_outer = (u_max as f32 * 0.5).max(1.0);
+                        let b_outer = (v_max as f32).max(1.0);
+                        let outer = (du / a_outer).powi(2) + (dv / b_outer).powi(2);
+                        if dv >= 0.0 && outer <= 1.0 {
+                            let a_inner = (a_outer - thickness as f32).max(0.5);
+                            let b_inner = (b_outer - thickness as f32).max(0.5);
+                            let inner = (du / a_inner).powi(2) + (dv / b_inner).powi(2);
+                            if inner > 1.0 {
+                                stamp(self, x, y, el);
+                            }
                         }
                     }
                 }
@@ -6967,28 +8629,30 @@ impl World {
     }
 
     pub fn paint(&mut self, cx: i32, cy: i32, radius: i32, el: Element, derived_id: u8, frozen: bool) {
-        let painting_solid = matches!(el.physics().kind, Kind::Solid | Kind::Gravel);
-        // Liquids paint as scattered drops, not a solid fill. 1-in-50 per
-        // frame per brush cell reads as a natural pour/rainfall and avoids
-        // the "packed mass falling apart" visual that solid-fill liquids
-        // produced (especially Hg/Lava). In build mode we paint solidly
-        // regardless.
+        // Phase-aware kind resolution: el.physics() returns the static
+        // table, which for Element::Derived is the (Kind::Powder, 0)
+        // stub. So all the per-kind paint logic below — sparsity for
+        // liquids, overpaint-pressure for gases — silently treated
+        // every derived compound as a powder. Result: holding paint
+        // on derived gases (HCl, HF, NH₃) added zero stacking pressure
+        // → no rapid expansion, no smoke ring, just a flat blob.
+        let resolved_kind = if el == Element::Derived {
+            derived_hot(derived_id)
+                .map(|h| h.physics.kind)
+                .unwrap_or(Kind::Powder)
+        } else {
+            el.physics().kind
+        };
+        let painting_solid = matches!(resolved_kind, Kind::Solid | Kind::Gravel);
         let sparsity: u16 = if frozen {
             1
         } else {
-            match el.physics().kind {
+            match resolved_kind {
                 Kind::Liquid => 50,
                 _ => 1,
             }
         };
-        // Over-paint pressure boost. Holding the paint button on existing
-        // gas/liquid cells stacks pressure so sealed volumes genuinely
-        // pressurize. *Fresh* spawns don't get this boost — they just use
-        // the element's formation_pressure (see Cell::new). Without that
-        // distinction, heavy gases painted into an open container jet out
-        // the opening instead of settling, because the 400 paint pressure
-        // overwhelms their weight-driven buoyancy.
-        let overpaint_pressure: i16 = match el.physics().kind {
+        let overpaint_pressure: i16 = match resolved_kind {
             Kind::Gas | Kind::Fire => 400,
             Kind::Liquid           => 200,
             _                      => 0,
@@ -7028,8 +8692,16 @@ impl World {
                     // Derived-compound spawn: tag with the caller-provided
                     // registry index so the cell maps to the right
                     // compound entry (color, phase points, reactivity).
+                    // Re-set formation_pressure here too — Cell::new
+                    // pulled it from el.pressure_p() which for
+                    // Element::Derived is the static (perm=0, form=0)
+                    // fallback. Phase-aware cell_pressure_p gives a
+                    // derived gas the same ~30 spawn pressure that
+                    // atomic gases get, so it actually puffs out
+                    // instead of sitting in a rigid blob.
                     if el == Element::Derived {
                         c.derived_id = derived_id;
+                        c.pressure = cell_pressure_p(c).formation_pressure;
                     }
                     if frozen && el != Element::Empty {
                         c.flag |= Cell::FLAG_FROZEN;
@@ -7275,7 +8947,77 @@ const PANEL_BUTTON_PREFAB: usize = 4;
 // parent button when that tool is active. Push the buttons below them
 // (and everything after) down by this amount so the content fits.
 fn prefab_dropdown_height(open: bool) -> f32 {
-    if open { 232.0 } else { 0.0 }
+    if open { 240.0 } else { 0.0 }
+}
+
+// Width-row label varies by shape — "Width" for box-style shapes,
+// "Length" for line, "Diameter" for circle.
+fn param_width_label(kind: PrefabKind) -> &'static str {
+    match kind {
+        PrefabKind::Line => "Length",
+        PrefabKind::Circle => "Diameter",
+        _ => "Width",
+    }
+}
+
+// Tiny shape glyph for the kind selector and option list. Drawn with
+// macroquad primitives at ~16-18 px so it reads at panel size without
+// needing a sprite sheet.
+fn draw_prefab_icon(kind: PrefabKind, x: f32, y: f32, size: f32) {
+    let stroke = (size * 0.10).max(1.5);
+    let col = Color::from_rgba(220, 220, 230, 255);
+    match kind {
+        PrefabKind::Beaker => {
+            // U-shape: left, right, bottom.
+            draw_line(x, y, x, y + size, stroke, col);
+            draw_line(x + size, y, x + size, y + size, stroke, col);
+            draw_line(x, y + size, x + size, y + size, stroke, col);
+        }
+        PrefabKind::Box => {
+            draw_rectangle_lines(x, y, size, size, stroke, col);
+        }
+        PrefabKind::Battery => {
+            let body_y = y + size * 0.15;
+            let body_h = size * 0.70;
+            draw_rectangle_lines(x, body_y, size, body_h, stroke, col);
+            // + terminal bump on top
+            let nub = size * 0.25;
+            draw_rectangle(
+                x + size * 0.5 - nub * 0.5, y, nub, size * 0.15, col,
+            );
+            // − band on bottom
+            draw_rectangle(
+                x + size * 0.2, y + size * 0.92, size * 0.6, size * 0.08, col,
+            );
+        }
+        PrefabKind::Line => {
+            // Diagonal line so it reads as a line and not a rect side.
+            draw_line(x, y + size, x + size, y, stroke, col);
+        }
+        PrefabKind::Circle => {
+            draw_circle_lines(
+                x + size * 0.5, y + size * 0.5, size * 0.45, stroke, col,
+            );
+        }
+        PrefabKind::Bowl => {
+            // Approximate U-curve with a polyline.
+            let cx = x + size * 0.5;
+            let cy = y;
+            let r = size * 0.5;
+            let segs = 14;
+            let mut prev = (x, y);
+            for i in 0..=segs {
+                let t = i as f32 / segs as f32;
+                let ang = std::f32::consts::PI * t;
+                let px = cx - r * ang.cos();
+                let py = cy + r * ang.sin();
+                if i > 0 {
+                    draw_line(prev.0, prev.1, px, py, stroke, col);
+                }
+                prev = (px, py);
+            }
+        }
+    }
 }
 fn wire_dropdown_height(open: bool) -> f32 {
     if open { 110.0 } else { 0.0 }
@@ -7363,32 +9105,33 @@ fn wind_reset_rect(prefab_open: bool, wire_open: bool) -> (f32, f32, f32, f32) {
 }
 
 // Prefab tool dropdown — appears inline between the Prefab button and
-// the Build button when Prefab is the active tool. Two kind-select
-// buttons and three hover-scroll rows for thickness, width, and height.
+// the Build button when Prefab is the active tool. Layout: kind-picker
+// dropdown selector at the top, then T/W/H (and Voltage for Battery)
+// hover-scroll rows, then the Material picker.
 const PREFAB_ROW_COUNT: usize = 4;
-fn prefab_kind_rects() -> [(f32, f32, f32, f32); 3] {
-    // Anchored to the Prefab button's unshifted position (dropdown lives
-    // right below it). Use `false` so we get the Prefab button position
-    // regardless of dropdown state.
+const PREFAB_KIND_OPTION_HEIGHT: f32 = 26.0;
+fn prefab_kind_selector_rect() -> (f32, f32, f32, f32) {
     let prefab_btn = panel_button_rects(false, false)[4];
     let y = prefab_btn.1 + prefab_btn.3 + 10.0;
-    let row_w = prefab_btn.2;
-    let gap = 4.0;
-    let each = (row_w - gap * 2.0) / 3.0;
-    let h = 26.0;
-    [
-        (prefab_btn.0, y, each, h),
-        (prefab_btn.0 + (each + gap), y, each, h),
-        (prefab_btn.0 + (each + gap) * 2.0, y, each, h),
-    ]
+    (prefab_btn.0, y, prefab_btn.2, 30.0)
+}
+fn prefab_kind_option_rects() -> [(f32, f32, f32, f32); PREFAB_KIND_COUNT] {
+    let sel = prefab_kind_selector_rect();
+    let mut out = [(0.0, 0.0, 0.0, 0.0); PREFAB_KIND_COUNT];
+    let mut y = sel.1 + sel.3 + 2.0;
+    for i in 0..PREFAB_KIND_COUNT {
+        out[i] = (sel.0, y, sel.2, PREFAB_KIND_OPTION_HEIGHT);
+        y += PREFAB_KIND_OPTION_HEIGHT + 2.0;
+    }
+    out
 }
 fn prefab_slider_rects() -> [(f32, f32, f32, f32); PREFAB_ROW_COUNT] {
-    let kr = prefab_kind_rects();
-    let x = kr[0].0;
-    let w = panel_button_rects(false, false)[4].2;
+    let sel = prefab_kind_selector_rect();
+    let x = sel.0;
+    let w = sel.2;
     let h = 26.0;
     let gap = 5.0;
-    let mut y = kr[0].1 + kr[0].3 + 10.0;
+    let mut y = sel.1 + sel.3 + 10.0;
     let mut out = [(0.0, 0.0, 0.0, 0.0); PREFAB_ROW_COUNT];
     for i in 0..PREFAB_ROW_COUNT {
         out[i] = (x, y, w, h);
@@ -7873,12 +9616,459 @@ fn draw_periodic_table(
     }
 }
 
+// ---- GPU post-process shaders ----
+// Bloom + gas-cloud blur live on the GPU as four separable triangle-blur
+// passes (h+v for each effect) feeding a composite shader that adds them
+// onto the base sim texture. Replacing the CPU rayon path here is what
+// makes the idle frame budget viable — the CPU was spending 10+ ms/frame
+// blurring 100k pixels with 37-tap and 17-tap kernels every frame even
+// when there was nothing to blur.
+
+const POST_VERT_SRC: &str = r#"#version 100
+attribute vec3 position;
+attribute vec2 texcoord;
+attribute vec4 color0;
+varying lowp vec2 uv;
+uniform mat4 Model;
+uniform mat4 Projection;
+void main() {
+    gl_Position = Projection * Model * vec4(position, 1.0);
+    uv = texcoord;
+}
+"#;
+
+// Triangle-kernel separable blur, hardcoded radius 18 (37 taps).
+// Direction = (1,0) for horizontal pass, (0,1) for vertical.
+const BLUR_BLOOM_FRAG_SRC: &str = r#"#version 100
+precision highp float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 inv_size;
+uniform vec2 direction;
+void main() {
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int k = -18; k <= 18; k++) {
+        float w = 19.0 - abs(float(k));
+        vec2 off = direction * float(k) * inv_size;
+        sum += texture2D(Texture, uv + off) * w;
+        total += w;
+    }
+    gl_FragColor = sum / total;
+}
+"#;
+
+// Same kernel structure, radius 8 (17 taps). Smaller halo for gas
+// clouds — tighter than bloom's giant glow.
+const BLUR_GAS_FRAG_SRC: &str = r#"#version 100
+precision highp float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+uniform vec2 inv_size;
+uniform vec2 direction;
+void main() {
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int k = -8; k <= 8; k++) {
+        float w = 9.0 - abs(float(k));
+        vec2 off = direction * float(k) * inv_size;
+        sum += texture2D(Texture, uv + off) * w;
+        total += w;
+    }
+    gl_FragColor = sum / total;
+}
+"#;
+
+// Final composite + per-material visual treatments. The sim grid is
+// 320×315 cells but renders to a much larger output region (≈3.25× per
+// axis at the panel's normal layout), so each cell has multiple output
+// pixels — enough room for sub-cell shading like edge highlights, grain
+// noise, glyphs, and transparency.
+//
+// kind_tex packs per-cell metadata RGBA:
+//   R = element id (0..54)
+//   G = physics Kind (0=Empty, 1=Solid, 2=Gravel, 3=Powder, 4=Liquid,
+//                     5=Gas, 6=Fire) — phase-aware via cell_physics()
+//   B = frozen flag (0 or 1)
+//   A = unused (255)
+// Sampled with FilterMode::Nearest so cell boundaries are crisp.
+//
+// bloom_tex / gas_tex come from TWO render-target passes (each pass
+// y-flips, so they end up at normal orientation). Gas density lives
+// in alpha and is amped 8× to counteract two-pass triangle-blur
+// attenuation.
+const COMPOSITE_FRAG_SRC: &str = r#"#version 100
+precision highp float;
+varying lowp vec2 uv;
+uniform sampler2D Texture;
+uniform sampler2D bloom_tex;
+uniform sampler2D gas_tex;
+uniform sampler2D kind_tex;
+uniform float u_time;
+
+const float GRID_W = 320.0;
+const float GRID_H = 315.0;
+
+// Element IDs we treat specifically.
+const float K_SAND     = 1.0;
+const float K_LAVA     = 8.0;
+const float K_ICE      = 14.0;
+const float K_GLASS    = 16.0;
+const float K_HG       = 37.0;
+const float K_BATTPOS  = 46.0;
+const float K_BATTNEG  = 47.0;
+
+// Physics Kind discriminants (must match enum order).
+const float P_SOLID  = 1.0;
+const float P_GRAVEL = 2.0;
+const float P_POWDER = 3.0;
+const float P_GAS    = 5.0;
+
+// Float-equality helper. Element IDs are small integers stored in u8
+// then unpacked to [0..255]; tolerance hides any FP rounding.
+bool eq(float a, float b) { return abs(a - b) < 0.5; }
+
+float hash21(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+void main() {
+    vec3 base = texture2D(Texture, uv).rgb;
+    vec4 ki = texture2D(kind_tex, uv);
+    float k      = ki.r * 255.0;     // element id
+    float pkind  = ki.g * 255.0;     // physics kind
+    float frozen = ki.b * 255.0;     // 0 or 1
+
+    vec2 texel = vec2(1.0 / GRID_W, 1.0 / GRID_H);
+    vec2 cell_uv = uv * vec2(GRID_W, GRID_H);
+    vec2 within = fract(cell_uv);
+
+    // Neighbor element IDs (for edge detection + ambient-occlusion).
+    float k_t  = texture2D(kind_tex, uv + vec2( 0.0, -texel.y)).r * 255.0;
+    float k_b  = texture2D(kind_tex, uv + vec2( 0.0,  texel.y)).r * 255.0;
+    float k_l  = texture2D(kind_tex, uv + vec2(-texel.x, 0.0)).r * 255.0;
+    float k_r  = texture2D(kind_tex, uv + vec2( texel.x, 0.0)).r * 255.0;
+    float k_tl = texture2D(kind_tex, uv + vec2(-texel.x, -texel.y)).r * 255.0;
+    float k_tr = texture2D(kind_tex, uv + vec2( texel.x, -texel.y)).r * 255.0;
+    float k_bl = texture2D(kind_tex, uv + vec2(-texel.x,  texel.y)).r * 255.0;
+    float k_br = texture2D(kind_tex, uv + vec2( texel.x,  texel.y)).r * 255.0;
+
+    // Detect SOLID-phase atomic metals only. Liquid metals (molten
+    // Hg, molten Au, boiled-then-cooled vapor) fall through to the
+    // CPU liquid styling; gas-phase boiled metals fall through to
+    // the volumetric gas pipeline — both look bad with the
+    // surface specular below.
+    bool atomic_metal_id =
+           eq(k, 25.0) || eq(k, 26.0) || eq(k, 27.0) || eq(k, 32.0)
+        || eq(k, 33.0) || eq(k, 34.0) || eq(k, 35.0) || eq(k, 36.0)
+        || eq(k, 37.0) || eq(k, 38.0) || eq(k, 48.0) || eq(k, 49.0)
+        || eq(k, 50.0) || eq(k, 51.0) || eq(k, 53.0) || eq(k, 54.0);
+    bool atomic_metal = atomic_metal_id
+        && (eq(pkind, P_SOLID) || eq(pkind, P_GRAVEL));
+
+    // ---- Edge depth shading (non-metal blocks) ----
+    // Brighten the top + left band where the cell borders a different
+    // element; darken the bottom + right band. Universal "fake light
+    // from upper-left" cue for static blocks. Skipped for atomic
+    // metals — they get a stronger custom version that pushes harder
+    // toward white-shine on the lit faces.
+    bool is_block = (eq(pkind, P_SOLID) || eq(pkind, P_GRAVEL)
+        || eq(pkind, P_POWDER) || frozen > 0.5) && !atomic_metal;
+    if (is_block) {
+        float ew = 0.30;
+        float lit = 0.0;
+        float shd = 0.0;
+        if (!eq(k_t, k) && within.y < ew) lit += (ew - within.y) / ew;
+        if (!eq(k_l, k) && within.x < ew) lit += (ew - within.x) / ew;
+        if (!eq(k_b, k) && within.y > (1.0 - ew)) shd += (within.y - (1.0 - ew)) / ew;
+        if (!eq(k_r, k) && within.x > (1.0 - ew)) shd += (within.x - (1.0 - ew)) / ew;
+        base = mix(base, base * 1.45, clamp(lit * 0.5, 0.0, 0.45));
+        base = mix(base, base * 0.55, clamp(shd * 0.5, 0.0, 0.45));
+    }
+
+    // ---- Material shading per kind ----
+    vec2 fp = gl_FragCoord.xy;
+
+    if (atomic_metal) {
+        // Surface-aware metallic shading + light directional AO.
+        // Real metal bodies don't go dark in the middle — they
+        // stay full-bright with hot specular on lit edges and
+        // shadow on back edges. AO is kept subtle and biased
+        // upward (cells with metal above them dim more than
+        // cells with metal below them) so a pile reads as
+        // "lit from above" instead of "ambient-occluded into mud".
+        bool face_t = !eq(k_t, k);
+        bool face_b = !eq(k_b, k);
+        bool face_l = !eq(k_l, k);
+        bool face_r = !eq(k_r, k);
+
+        // Specular: push toward pure white at 90 % mix on the very
+        // edge. Narrow band (ew = 0.35) so it reads as a hot
+        // highlight rather than a soft glow.
+        float ew = 0.35;
+        float spec = 0.0;
+        if (face_t) spec = max(spec, smoothstep(ew, 0.0, within.y));
+        if (face_l) spec = max(spec, smoothstep(ew, 0.0, within.x) * 0.85);
+        base = mix(base, vec3(1.0), spec * 0.90);
+
+        // Back-edge shadow — toned down (0.25 → 0.45 floor) so
+        // the metal still reads as bright on the unlit side.
+        float shd = 0.0;
+        if (face_b) shd = max(shd, smoothstep(ew, 0.0, 1.0 - within.y));
+        if (face_r) shd = max(shd, smoothstep(ew, 0.0, 1.0 - within.x) * 0.85);
+        base *= mix(1.0, 0.45, shd);
+
+        // Directional AO: upper neighbors weighted more so cells
+        // BURIED beneath other metal (deep in a pile) get shaded
+        // while cells with metal below stay bright. Total weight 8;
+        // floor lifted from 0.55 → 0.80 so bodies stay clearly lit.
+        float same_m = 0.0;
+        if (eq(k_t,  k)) same_m += 1.8;
+        if (eq(k_tl, k)) same_m += 1.4;
+        if (eq(k_tr, k)) same_m += 1.4;
+        if (eq(k_l,  k)) same_m += 0.8;
+        if (eq(k_r,  k)) same_m += 0.8;
+        if (eq(k_b,  k)) same_m += 0.5;
+        if (eq(k_bl, k)) same_m += 0.65;
+        if (eq(k_br, k)) same_m += 0.65;
+        float ao_m = same_m / 8.0;
+        base *= mix(1.0, 0.80, ao_m);
+
+        // Subtle within-cell vertical gradient — top of each cell
+        // a touch brighter than the bottom, reinforces "lit from
+        // above" for the body interior.
+        base *= 1.0 - within.y * 0.08;
+    } else if (eq(pkind, P_POWDER)) {
+        // Powders: bump-mapped lighting + speckle. Loose particles
+        // catching light from above.
+        float h_c = hash21(fp);
+        float h_r = hash21(fp + vec2(1.0, 0.0));
+        float h_d = hash21(fp + vec2(0.0, 1.0));
+        float bump = (h_r - h_c) + (h_d - h_c);
+        base *= 1.0 + bump * 0.45;
+        base += (h_c - 0.5) * 0.18 * (base * 0.5 + vec3(0.04));
+        float bright = max(0.0, h_c - 0.94) * 16.7;
+        base = mix(base, base * 1.55, clamp(bright * 0.45, 0.0, 0.45));
+        float dark = max(0.0, 0.06 - h_c) * 16.7;
+        base = mix(base, base * 0.42, clamp(dark * 0.50, 0.0, 0.50));
+    } else if (eq(pkind, P_GRAVEL)) {
+        // Coarse tonal patches for natural rock variation.
+        vec2 q = floor(fp * 0.25);
+        float h_patch = hash21(q);
+        base *= mix(0.92, 1.08, h_patch);
+
+        // Convex ambient-occlusion: count same-kind among the 8
+        // neighbors. Surface cells (few same-kind around) stay
+        // bright; interior cells (most/all same-kind around) get
+        // darkened, so a stone pile reads as a 3D dome instead of
+        // a flat tonal field. AO falls off into the rim, so the
+        // pile looks lit from the outside.
+        float same = 0.0;
+        if (eq(k_t,  k)) same += 1.0;
+        if (eq(k_b,  k)) same += 1.0;
+        if (eq(k_l,  k)) same += 1.0;
+        if (eq(k_r,  k)) same += 1.0;
+        if (eq(k_tl, k)) same += 1.0;
+        if (eq(k_tr, k)) same += 1.0;
+        if (eq(k_bl, k)) same += 1.0;
+        if (eq(k_br, k)) same += 1.0;
+        float ao = same / 8.0;
+        base *= mix(1.10, 0.68, ao);
+    } else if (eq(pkind, P_SOLID)) {
+        // Non-metal solids (Wood/Quartz/Firebrick/Seed): per-cell
+        // stable tint at very low amplitude.
+        vec2 ci = floor(cell_uv);
+        float pc = hash21(ci);
+        base *= mix(0.94, 1.06, pc);
+    }
+
+    // ---- Glass / Ice transparency ----
+    // Blend with what's a few pixels "behind" (offset down) plus a
+    // bright edge band. Glass tints neutral; Ice tints cool blue.
+    if (eq(k, K_GLASS) || eq(k, K_ICE)) {
+        vec3 behind = texture2D(Texture, uv + vec2(0.0, texel.y * 4.0)).rgb;
+        float opacity = eq(k, K_GLASS) ? 0.50 : 0.55;
+        base = mix(behind, base, opacity);
+        bool top_e = !eq(k_t, k) && within.y < 0.18;
+        bool bot_e = !eq(k_b, k) && within.y > 0.82;
+        bool lft_e = !eq(k_l, k) && within.x < 0.18;
+        bool rgt_e = !eq(k_r, k) && within.x > 0.82;
+        if (top_e || bot_e || lft_e || rgt_e) {
+            vec3 edge_color = eq(k, K_ICE) ? vec3(0.85, 0.95, 1.0) : vec3(1.0);
+            base = mix(base, edge_color, 0.4);
+        }
+    }
+
+    // ---- Mercury shimmer ----
+    if (eq(k, K_HG)) {
+        float wave = sin(uv.y * GRID_H * 0.4 + u_time * 1.5) * 0.5 + 0.5;
+        base = mix(base, vec3(1.0), wave * 0.20);
+    }
+
+    // ---- Lava pulse ----
+    if (eq(k, K_LAVA)) {
+        float pulse = sin(u_time * 3.0 + (cell_uv.x + cell_uv.y) * 0.3) * 0.5 + 0.5;
+        base = mix(base, base * 1.35, pulse * 0.35);
+    }
+
+    // ---- Battery terminal caps ----
+    // Render BattPos / BattNeg cells so a CONTIGUOUS RUN of them reads
+    // as a single polished metal cap, not as a checkerboard of dome
+    // gradients. The trick: highlights only appear on the OUTER edge
+    // of the cap (where the terminal cell borders something that ISN'T
+    // a terminal) — interior cells get plain metal. Adjacent terminal
+    // cells in the same row/column then look like one continuous bar
+    // because they share the same color in their interiors.
+    //
+    // BattPos: copper gold. BattNeg: brushed silver. Both get a slow
+    // animated specular streak so the metal feels polished, not flat.
+    if (eq(k, K_BATTPOS) || eq(k, K_BATTNEG)) {
+        // Toned-down metallic palette — was reading too "wet/chrome";
+        // these values land closer to oxidized copper and brushed
+        // steel than mirror-polished metal.
+        vec3 metal = eq(k, K_BATTPOS)
+            ? vec3(0.70, 0.40, 0.16)
+            : vec3(0.62, 0.66, 0.72);
+        vec3 hi_col = eq(k, K_BATTPOS)
+            ? vec3(0.90, 0.68, 0.38)
+            : vec3(0.85, 0.88, 0.92);
+        vec3 sh_col = eq(k, K_BATTPOS)
+            ? vec3(0.32, 0.15, 0.05)
+            : vec3(0.22, 0.24, 0.28);
+
+        bool face_t = !eq(k_t, k);
+        bool face_b = !eq(k_b, k);
+        bool face_l = !eq(k_l, k);
+        bool face_r = !eq(k_r, k);
+
+        // Subtler outer-edge band — was 0.55, now 0.32.
+        float outer = 0.0;
+        if (face_t) outer = max(outer, smoothstep(0.50, 0.0, within.y));
+        if (face_b) outer = max(outer, smoothstep(0.50, 1.0, within.y));
+        if (face_l) outer = max(outer, smoothstep(0.30, 0.0, within.x));
+        if (face_r) outer = max(outer, smoothstep(0.30, 1.0, within.x));
+
+        float inner = 0.0;
+        if (face_t) inner = max(inner, smoothstep(0.55, 1.0, within.y));
+        if (face_b) inner = max(inner, smoothstep(0.55, 0.0, within.y));
+
+        vec3 lit = metal;
+        lit = mix(lit, hi_col, outer * 0.32);
+        lit = mix(lit, sh_col, inner * 0.30);
+
+        // Animated sheen kept but much weaker — 0.18 → 0.06. Reads
+        // as "light catching the metal occasionally" instead of
+        // "wet plastic shimmer".
+        float t = u_time * 0.4;
+        float band = sin((cell_uv.x + cell_uv.y) * 0.6 + t * 3.0);
+        float sheen = pow(max(0.0, band), 6.0);
+        lit += hi_col * sheen * 0.06;
+
+        base = lit;
+    }
+
+    // ---- Composite bloom + gas (existing) ----
+    vec3 bloom = texture2D(bloom_tex, uv).rgb;
+    vec4 gas = texture2D(gas_tex, uv);
+    float gd = clamp(gas.a * 8.0, 0.0, 1.0);
+    vec3 gas_color = gas.rgb * gd;
+
+    vec3 final_col = base + bloom + gas_color;
+    gl_FragColor = vec4(min(final_col, vec3(1.0)), 1.0);
+}
+"#;
+
 pub async fn run_game() {
     init_ui_font();
     let mut world = World::new();
     let mut image = Image::gen_image_color(W as u16, H as u16, BLACK);
     let texture = Texture2D::from_image(&image);
     texture.set_filter(FilterMode::Nearest);
+
+    // Sidecar images for the GPU post-process. bright_image holds the
+    // emission-tinted color per cell (driven by temp / Fire / Lava /
+    // energized noble gases) — fed into the bloom blur. gas_image holds
+    // the gas atom's color in RGB and per-atom density in alpha — fed
+    // into the gas-cloud blur. Both are zero-cleared each frame and
+    // populated alongside the base sim image.
+    let mut bright_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+    let bright_texture = Texture2D::from_image(&bright_image);
+    bright_texture.set_filter(FilterMode::Nearest);
+    let mut gas_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+    let gas_texture = Texture2D::from_image(&gas_image);
+    gas_texture.set_filter(FilterMode::Nearest);
+
+    // Per-cell metadata for the per-material composite shader. RGBA:
+    //   R = element id  (0..54)
+    //   G = physics Kind (phase-aware via cell_physics)
+    //   B = frozen flag (0 or 1)
+    //   A = unused (255)
+    // Always uploaded each frame — the shader uses it for edge shading,
+    // grain noise, transparency, glyphs, and per-element specials, so
+    // the data has to track current state.
+    let mut kind_image = Image::gen_image_color(W as u16, H as u16, BLACK);
+    let kind_texture = Texture2D::from_image(&kind_image);
+    kind_texture.set_filter(FilterMode::Nearest);
+
+    // Render targets for the four blur passes. Each is W×H (the sim
+    // resolution), filtered Linear so the bilinear samples blend the
+    // taps smoothly across edges.
+    let bloom_h_target = render_target(W as u32, H as u32);
+    bloom_h_target.texture.set_filter(FilterMode::Linear);
+    let bloom_v_target = render_target(W as u32, H as u32);
+    bloom_v_target.texture.set_filter(FilterMode::Linear);
+    let gas_h_target = render_target(W as u32, H as u32);
+    gas_h_target.texture.set_filter(FilterMode::Linear);
+    let gas_v_target = render_target(W as u32, H as u32);
+    gas_v_target.texture.set_filter(FilterMode::Linear);
+
+    let blur_bloom_material = load_material(
+        ShaderSource::Glsl {
+            vertex: POST_VERT_SRC,
+            fragment: BLUR_BLOOM_FRAG_SRC,
+        },
+        MaterialParams {
+            uniforms: vec![
+                UniformDesc::new("inv_size", UniformType::Float2),
+                UniformDesc::new("direction", UniformType::Float2),
+            ],
+            ..Default::default()
+        },
+    ).expect("bloom blur shader compile");
+    let blur_gas_material = load_material(
+        ShaderSource::Glsl {
+            vertex: POST_VERT_SRC,
+            fragment: BLUR_GAS_FRAG_SRC,
+        },
+        MaterialParams {
+            uniforms: vec![
+                UniformDesc::new("inv_size", UniformType::Float2),
+                UniformDesc::new("direction", UniformType::Float2),
+            ],
+            ..Default::default()
+        },
+    ).expect("gas blur shader compile");
+    let composite_material = load_material(
+        ShaderSource::Glsl {
+            vertex: POST_VERT_SRC,
+            fragment: COMPOSITE_FRAG_SRC,
+        },
+        MaterialParams {
+            textures: vec![
+                "bloom_tex".to_string(),
+                "gas_tex".to_string(),
+                "kind_tex".to_string(),
+            ],
+            uniforms: vec![
+                UniformDesc::new("u_time", UniformType::Float1),
+            ],
+            ..Default::default()
+        },
+    ).expect("composite shader compile");
+
+    // Offscreen camera for blur passes — one display rect at sim
+    // resolution, reused across passes by reassigning render_target.
+    let inv_size = vec2(1.0 / W as f32, 1.0 / H as f32);
 
     let mut selected: Element = Element::Sand;
     // derived_id sidecar: non-zero only when `selected == Element::Derived`,
@@ -7919,12 +10109,18 @@ pub async fn run_game() {
     // Pipet tool state. A single bucket of collected cells, optionally
     // filtered by target species. Capacity is generous so a full beaker
     // can be siphoned and moved.
-    const PIPET_CAPACITY: usize = 4000;
+    const PIPET_CAPACITY: usize = 20_000;
     let mut pipet_target: Option<(Element, u8)> = None;
     let mut pipet_bucket: Vec<Cell> = Vec::new();
     // Frames remaining on the "empty pipet first" warning flash. Shown
     // when the user tries to change target while bucket is non-empty.
     let mut pipet_warning_frames: u32 = 0;
+    // Toast overlay — short status message centered at the top of the
+    // sim area. Used for save/load feedback and could be reused for
+    // any "operation succeeded/failed" notification.
+    let mut toast_msg: String = String::new();
+    let mut toast_color: Color = WHITE;
+    let mut toast_frames: u32 = 0;
     // "Species present in scene" cache. Rescanning the full grid each
     // frame would be wasteful; we refresh at a few Hz while pipet is the
     // active tool so sparse/mingled species are still pickable without
@@ -7941,6 +10137,25 @@ pub async fn run_game() {
     let mut prefab_width: i32 = 145;
     let mut prefab_height: i32 = 200;
     let mut prefab_material: Element = Element::Glass;
+    // Per-kind config stashes, indexed by `PrefabKind as usize`. The
+    // "live" prefab_* values above mirror whichever kind is currently
+    // selected. Switching kinds saves the current values into the
+    // OLD kind's stash and loads the NEW kind's stash — so each
+    // shape remembers its own customizations.
+    // Tuple layout: (thickness, width, height, material).
+    let mut prefab_stashes: [(i32, i32, i32, Element); PREFAB_KIND_COUNT] = [
+        (10, 145, 200, Element::Glass),    // Beaker
+        (10, 145, 200, Element::Glass),    // Box
+        (10,  30,  40, Element::Quartz),   // Battery
+        ( 4,  80,   1, Element::Stone),    // Line  (W = length, T = bar thickness)
+        ( 4,  80,  80, Element::Stone),    // Circle (W = diameter, T = ring thickness)
+        ( 8, 100,  60, Element::Glass),    // Bowl  (W × H ellipse outline)
+    ];
+    // Whether the kind-picker dropdown inside the prefab sub-panel is
+    // expanded. While open it covers the parameter rows; clicking an
+    // option (or anywhere outside) closes it and shows the chosen
+    // shape's parameters.
+    let mut prefab_kind_dropdown_open: bool = false;
     // Battery output voltage — applied by all batteries in the scene
     // (MVP global). Drives Joule heating in the energized circuit.
     let mut prefab_voltage: i32 = 100;
@@ -7967,6 +10182,23 @@ pub async fn run_game() {
     // button on the next frame would immediately paint a pile into the sim.
     // Cleared once the mouse is released.
     let mut consume_stroke: bool = false;
+
+    // Per-section frame timing — accumulates µs across each second and
+    // emits an averaged report so we can see where the budget actually
+    // goes (sim step vs. render-build/post-process vs. UI/panel).
+    let mut perf_frames: u32 = 0;
+    let mut perf_t_step_us: u64 = 0;
+    let mut perf_t_render_us: u64 = 0;
+    let mut perf_t_ui_us: u64 = 0;
+    let mut perf_last_print = std::time::Instant::now();
+
+    // Cross-frame tracking for the render-skip gate. When emission or
+    // gas disappears, we still run the full pipeline ONE more frame so
+    // the corresponding render target is cleared to all-zeros. After
+    // that, we can skip the upload + GPU passes until the content
+    // reappears.
+    let mut last_had_emission: bool = true;
+    let mut last_had_gas: bool = true;
 
     loop {
         // --- keyboard ---
@@ -8226,7 +10458,18 @@ pub async fn run_game() {
         }
         // Periodic table overlay (Tab to open/close, Esc to close).
         if is_key_pressed(KeyCode::Tab) {
-            periodic_open = !periodic_open;
+            // Tab is the "I want to pick something to paint" key. Always
+            // open the table targeting the Paint slot — even if a side-
+            // panel material button (Prefab Material / Wire Material)
+            // had previously redirected pt_target, Tab overrides that.
+            // The PtTarget::Paint branch in the picker also flips
+            // tool_mode back to Paint, so Tab → pick → paint Just Works.
+            if periodic_open {
+                periodic_open = false;
+            } else {
+                periodic_open = true;
+                pt_target = PtTarget::Paint;
+            }
         }
         if periodic_open && is_key_pressed(KeyCode::Escape) {
             periodic_open = false;
@@ -8252,6 +10495,37 @@ pub async fn run_game() {
         // frame (so the saved image includes sim + UI + any open overlay).
         let take_screenshot = is_key_pressed(KeyCode::F2);
         if is_key_pressed(KeyCode::U) { panel_visible = !panel_visible; }
+
+        // F11 saves the current cell grid + ambient offset to
+        // alembic_state.save in the working dir; F12 reloads it. Lets
+        // the user build a testing scene once and reload it without
+        // rebuilding by hand each session.
+        if is_key_pressed(KeyCode::F11) {
+            match world.save_state("alembic_state.save") {
+                Ok(_) => {
+                    toast_msg = "State saved".to_string();
+                    toast_color = Color::from_rgba(140, 220, 140, 255);
+                }
+                Err(e) => {
+                    toast_msg = format!("Save failed: {}", e);
+                    toast_color = Color::from_rgba(240, 130, 130, 255);
+                }
+            }
+            toast_frames = 120;
+        }
+        if is_key_pressed(KeyCode::F12) {
+            match world.load_state("alembic_state.save") {
+                Ok(_) => {
+                    toast_msg = "State loaded".to_string();
+                    toast_color = Color::from_rgba(140, 220, 140, 255);
+                }
+                Err(e) => {
+                    toast_msg = format!("Load failed: {}", e);
+                    toast_color = Color::from_rgba(240, 130, 130, 255);
+                }
+            }
+            toast_frames = 120;
+        }
 
         // --- mouse ---
         // (mx, my) was captured earlier to feed the hover-scroll check.
@@ -8353,38 +10627,51 @@ pub async fn run_game() {
             if tool_mode == ToolMode::Prefab
                 && is_mouse_button_pressed(MouseButton::Left)
             {
-                let kr = prefab_kind_rects();
                 let hit_k = |r: (f32, f32, f32, f32)|
                     mx >= r.0 && mx < r.0 + r.2
                     && my >= r.1 && my < r.1 + r.3;
-                if hit_k(kr[0]) {
-                    prefab_kind = PrefabKind::Beaker;
+                // Kind-picker dropdown: clicking the selector toggles
+                // the dropdown open. While open, clicking an option
+                // commits that kind and closes the dropdown. Live
+                // values stash/restore per kind so customizations
+                // survive switching.
+                let sel = prefab_kind_selector_rect();
+                if hit_k(sel) {
+                    prefab_kind_dropdown_open = !prefab_kind_dropdown_open;
                     consume_stroke = true;
                 }
-                if hit_k(kr[1]) {
-                    prefab_kind = PrefabKind::Box;
-                    consume_stroke = true;
-                }
-                if hit_k(kr[2]) {
-                    // When first switching to Battery, nudge the
-                    // dimensions + material to sensible defaults for a
-                    // small working battery. User can still change these
-                    // afterwards (Cu casing for shorted-battery demos,
-                    // bigger dimensions for higher-capacity, etc.).
-                    if prefab_kind != PrefabKind::Battery {
-                        prefab_material = Element::Quartz;
-                        prefab_thickness = 10;
-                        prefab_width = 30;
-                        prefab_height = 40;
+                if prefab_kind_dropdown_open {
+                    let opt_rects = prefab_kind_option_rects();
+                    for (i, opt_kind) in PREFAB_KINDS.iter().enumerate() {
+                        if hit_k(opt_rects[i]) {
+                            if *opt_kind != prefab_kind {
+                                prefab_stashes[prefab_kind as usize] =
+                                    (prefab_thickness, prefab_width, prefab_height, prefab_material);
+                                let next = prefab_stashes[*opt_kind as usize];
+                                prefab_thickness = next.0;
+                                prefab_width     = next.1;
+                                prefab_height    = next.2;
+                                prefab_material  = next.3;
+                                prefab_kind      = *opt_kind;
+                            }
+                            prefab_kind_dropdown_open = false;
+                            consume_stroke = true;
+                            break;
+                        }
                     }
-                    prefab_kind = PrefabKind::Battery;
-                    consume_stroke = true;
                 }
-                let mr = prefab_material_rect();
-                if hit_k(mr) {
-                    pt_target = PtTarget::PrefabMaterial;
-                    periodic_open = true;
-                    consume_stroke = true;
+                // Material click is suppressed if the dropdown logic
+                // already consumed this click — selecting "Bowl" (the
+                // last option) sits visually above the Material button
+                // and was double-firing both. consume_stroke is set by
+                // the dropdown handler whenever it eats a click.
+                if !consume_stroke {
+                    let mr = prefab_material_rect();
+                    if hit_k(mr) {
+                        pt_target = PtTarget::PrefabMaterial;
+                        periodic_open = true;
+                        consume_stroke = true;
+                    }
                 }
             }
             // Wind reset button — one click zeros the wind vector.
@@ -8650,6 +10937,7 @@ pub async fn run_game() {
         // Per-frame UI timers — tick regardless of pause state so flashes
         // and fades aren't frozen while the sim is paused.
         if pipet_warning_frames > 0 { pipet_warning_frames -= 1; }
+        if toast_frames > 0 { toast_frames -= 1; }
 
         // Refresh the "species present" cache roughly 4× per second. The
         // list is always visible at the bottom of the panel (clicking a
@@ -8683,335 +10971,220 @@ pub async fn run_game() {
         // Propagate the battery voltage setting to the sim state so
         // Joule heating uses the currently-configured value.
         world.battery_voltage = prefab_voltage as f32;
+        let perf_t_step_start = std::time::Instant::now();
         if !paused { world.step(wind); }
+        perf_t_step_us += perf_t_step_start.elapsed().as_micros() as u64;
 
+        let perf_t_render_start = std::time::Instant::now();
         // --- render sim ---
-        // Direct byte writes — much faster than set_pixel which does a
-        // function call + bounds checks + float->u8 conversion per pixel.
+        // Single parallel pass that fills all three sim textures (base,
+        // bright, gas) at once. Each pixel touches its own slot in each
+        // image, so the three images can be zipped under rayon and
+        // updated concurrently — no shared writes, no double-pass over
+        // the same cell data.
         {
-            let bytes = &mut image.bytes;
-            for i in 0..(W * H) {
-                let c = world.cells[i];
-                let [mut r, mut g, mut b] = color_rgb(c);
-                // Energized cells get their electrical glow color (noble
-                // gases light up; conducting metals stay their normal
-                // color since glow_color is None for them). This is the
-                // neon-sign rendering path — no per-cell state needed.
-                if world.energized[i] {
-                    if let Some((gr, gg, gb)) = c.el.electrical().glow_color {
-                        r = gr; g = gg; b = gb;
-                    }
-                }
-                // Liquid styling — surface highlight + depth shading +
-                // gentle animated texture. All effects scale the cell's
-                // existing color, so dark liquids stay dark and bright
-                // liquids stay bright. Phase-aware via cell_physics so
-                // molten metals get the same treatment.
-                if cell_physics(c).kind == Kind::Liquid {
-                    let cx = (i % W) as i32;
-                    let cy = (i / W) as i32;
-                    // Surface highlight: only flag a cell as "true
-                    // surface" when its left/right neighbors at the
-                    // same row are also surface cells. Filters out
-                    // jagged single-cell spikes that produced
-                    // vertical streaks on Hg/Water/Lava.
-                    let is_top = |x: i32, y: i32| -> bool {
-                        if y <= 0 || x < 0 || x >= W as i32 { return false; }
-                        let here = (y as usize) * W + x as usize;
-                        if cell_physics(world.cells[here]).kind != Kind::Liquid { return false; }
-                        let above = ((y - 1) as usize) * W + x as usize;
-                        cell_physics(world.cells[above]).kind != Kind::Liquid
-                    };
-                    let self_top = is_top(cx, cy);
-                    let neigh_top = is_top(cx - 1, cy) as i32 + is_top(cx + 1, cy) as i32;
-                    let on_surface = self_top && neigh_top >= 1;
-                    if on_surface {
-                        r = ((r as u32 * 122 / 100).min(255)) as u8;
-                        g = ((g as u32 * 122 / 100).min(255)) as u8;
-                        b = ((b as u32 * 122 / 100).min(255)) as u8;
-                    }
-                    // Depth shading: count liquid cells stacked above
-                    // for cx-1, cx, cx+1 and take the MIN. Smooths
-                    // out column-by-column variation that read as
-                    // vertical streaks. ~3% per cell, capped 24%.
-                    let col_depth = |x: i32| -> i32 {
-                        if x < 0 || x >= W as i32 { return 0; }
-                        let mut d = 0i32;
-                        for dy in 1..=8 {
-                            let py = cy - dy;
-                            if py < 0 { break; }
-                            let pi = py as usize * W + x as usize;
-                            if cell_physics(world.cells[pi]).kind == Kind::Liquid { d += 1; }
-                            else { break; }
-                        }
-                        d
-                    };
-                    let depth = col_depth(cx).min(col_depth(cx - 1)).min(col_depth(cx + 1));
-                    if depth > 0 && !on_surface {
-                        let darken = 100 - (depth * 3).min(24);
-                        r = (r as u32 * darken as u32 / 100) as u8;
-                        g = (g as u32 * darken as u32 / 100) as u8;
-                        b = (b as u32 * darken as u32 / 100) as u8;
-                    }
-                }
-                let base = i * 4;
-                bytes[base]     = r;
-                bytes[base + 1] = g;
-                bytes[base + 2] = b;
-                bytes[base + 3] = 255;
-            }
-            // ---- Gas cloud post-process ----
-            // Smear gas cells into soft colored clouds. Two key choices:
-            // (1) hide the discrete atom pixel in the main render
-            //     (set to black), so the cloud halo is the ONLY visible
-            //     representation of gas. Without this, the bright atom
-            //     pixel dominates whatever subtle cloud-tint we apply.
-            // (2) amplify density on composite so even isolated atoms
-            //     produce a visible halo despite the heavy attenuation
-            //     of two-pass triangle blur.
-            // Atom-level physics is unchanged — purely visual.
-            // Wider radius + higher per-atom contribution gives a
-            // beefier volumetric look; rayon-parallelized blur keeps
-            // the cost manageable.
-            const GAS_BLUR_RADIUS: usize = 8;
-            const GAS_PER_ATOM: u8 = 255;
-            let n = W * H;
-            let mut gas_r = vec![0u8; n];
-            let mut gas_g = vec![0u8; n];
-            let mut gas_b = vec![0u8; n];
-            let mut gas_d = vec![0u8; n];
-            for i in 0..n {
-                let c = world.cells[i];
-                // cell_physics() respects the cell's current phase, so
-                // boiled metals (Pb vapor from U fission, etc.) get
-                // detected as gas even though their static Kind is
-                // Gravel/Powder.
-                if !matches!(cell_physics(c).kind, Kind::Gas) { continue; }
-                gas_r[i] = bytes[i * 4];
-                gas_g[i] = bytes[i * 4 + 1];
-                gas_b[i] = bytes[i * 4 + 2];
-                gas_d[i] = GAS_PER_ATOM;
-                // Hide the discrete atom — cloud will be the only
-                // visible representation of this gas in the final image.
-                bytes[i * 4]     = 0;
-                bytes[i * 4 + 1] = 0;
-                bytes[i * 4 + 2] = 0;
-            }
-            // Triangular kernel, radius 8 (17 taps). Wider than v0.1's
-            // radius-5 for beefier cloud halos.
-            let kw_g: [u16; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-            let kw_g_sum: u16 = 81;
-            let kw_g_len = kw_g.len();
-            // Horizontal blur — parallelize over rows.
-            let mut h_gr = vec![0u8; n];
-            let mut h_gg = vec![0u8; n];
-            let mut h_gb = vec![0u8; n];
-            let mut h_gd = vec![0u8; n];
-            {
-                use rayon::prelude::*;
-                let zipped = h_gr.par_chunks_mut(W)
-                    .zip(h_gg.par_chunks_mut(W))
-                    .zip(h_gb.par_chunks_mut(W))
-                    .zip(h_gd.par_chunks_mut(W))
-                    .enumerate();
-                zipped.for_each(|(y, (((row_r, row_g), row_b), row_d))| {
-                    let row_off = y * W;
-                    for x in 0..W {
-                        let mut sr: u32 = 0;
-                        let mut sg: u32 = 0;
-                        let mut sb: u32 = 0;
-                        let mut sd: u32 = 0;
-                        for k in 0..kw_g_len {
-                            let kx = (x as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
-                                .clamp(0, W as i32 - 1) as usize;
-                            let idx = row_off + kx;
-                            let w = kw_g[k] as u32;
-                            sr += gas_r[idx] as u32 * w;
-                            sg += gas_g[idx] as u32 * w;
-                            sb += gas_b[idx] as u32 * w;
-                            sd += gas_d[idx] as u32 * w;
-                        }
-                        row_r[x] = (sr / kw_g_sum as u32) as u8;
-                        row_g[x] = (sg / kw_g_sum as u32) as u8;
-                        row_b[x] = (sb / kw_g_sum as u32) as u8;
-                        row_d[x] = (sd / kw_g_sum as u32) as u8;
-                    }
-                });
-            }
-            // Vertical blur + composite. Additively combines the local
-            // blurred-gas-color (scaled by amplified density) onto the
-            // image bytes. Density is multiplied by ~8× to compensate
-            // for two-pass triangle-blur attenuation, so isolated
-            // atoms still produce a visible halo while clusters
-            // saturate to a dense fog.
-            // Parallelize over rows of the output image. Each row's
-            // vertical-blur reads spanning K columns from h_g* — disjoint
-            // writes per row → race-free under rayon.
-            {
-                use rayon::prelude::*;
-                bytes.par_chunks_mut(W * 4).enumerate().for_each(|(y, row_bytes)| {
-                    for x in 0..W {
-                        let mut sr: u32 = 0;
-                        let mut sg: u32 = 0;
-                        let mut sb: u32 = 0;
-                        let mut sd: u32 = 0;
-                        for k in 0..kw_g_len {
-                            let ky = (y as i32 + k as i32 - GAS_BLUR_RADIUS as i32)
-                                .clamp(0, H as i32 - 1) as usize;
-                            let idx = ky * W + x;
-                            let w = kw_g[k] as u32;
-                            sr += h_gr[idx] as u32 * w;
-                            sg += h_gg[idx] as u32 * w;
-                            sb += h_gb[idx] as u32 * w;
-                            sd += h_gd[idx] as u32 * w;
-                        }
-                        let blur_r = (sr / kw_g_sum as u32) as u32;
-                        let blur_g = (sg / kw_g_sum as u32) as u32;
-                        let blur_b = (sb / kw_g_sum as u32) as u32;
-                        let blur_d = (sd / kw_g_sum as u32) as u32;
-                        if blur_d > 0 {
-                            let amped_d = (blur_d * 8).min(255);
-                            let cr = (blur_r * amped_d / 255) as u8;
-                            let cg = (blur_g * amped_d / 255) as u8;
-                            let cb = (blur_b * amped_d / 255) as u8;
-                            let base = x * 4;
-                            row_bytes[base]     = row_bytes[base].saturating_add(cr);
-                            row_bytes[base + 1] = row_bytes[base + 1].saturating_add(cg);
-                            row_bytes[base + 2] = row_bytes[base + 2].saturating_add(cb);
+            use rayon::prelude::*;
+            let cells_ro = &world.cells;
+            let energized_ro = &world.energized;
+            image.bytes
+                .par_chunks_exact_mut(4)
+                .zip(bright_image.bytes.par_chunks_exact_mut(4))
+                .zip(gas_image.bytes.par_chunks_exact_mut(4))
+                .zip(kind_image.bytes.par_chunks_exact_mut(4))
+                .enumerate()
+                .for_each(|(i, (((base_pix, bright_pix), gas_pix), kind_pix))| {
+                    let c = cells_ro[i];
+                    // Per-cell metadata for the composite shader. Use
+                    // cell_physics() so phase-aware Kind (boiled-metal
+                    // gas, frozen Hg, etc.) is what the shader sees.
+                    let phys = cell_physics(c);
+                    kind_pix[0] = c.el as u8;
+                    kind_pix[1] = phys.kind as u8;
+                    kind_pix[2] = if c.is_frozen() { 1 } else { 0 };
+                    kind_pix[3] = 255;
+                    let [mut r, mut g, mut b] = color_rgb(c);
+                    // Energized cells get their electrical glow color (noble
+                    // gases light up; conducting metals stay their normal
+                    // color since glow_color is None for them).
+                    if energized_ro[i] {
+                        if let Some((gr, gg, gb)) = c.el.electrical().glow_color {
+                            r = gr; g = gg; b = gb;
                         }
                     }
-                });
-            }
-            // ---- Bloom post-process ----
-            // Bloom contribution is driven by EMISSION (cell temperature
-            // and "always glows" elements like Fire/Lava), NOT by pixel
-            // brightness. This stops bright-but-cool elements (silvery
-            // Mg, white MgO powder, glass) from triggering bloom while
-            // letting actually-hot cells glow even if their base color
-            // is dark. The pixel's RENDERED color is then tinted by
-            // emission intensity — so the bloom inherits the source
-            // pixel's hue (yellow lava → yellow halo, white-hot Mg →
-            // white halo, orange fire → orange halo) automatically.
-            // Bigger radius for a pronounced glow halo around hot/glowing
-            // cells. Combined with rayon-parallelized blur passes to keep
-            // the cost in budget even at this kernel size.
-            const BLOOM_RADIUS: usize = 18;
-            let n = W * H;
-            let mut bright_r = vec![0u8; n];
-            let mut bright_g = vec![0u8; n];
-            let mut bright_b = vec![0u8; n];
-            // Build the emission/bright buffer in parallel — purely
-            // per-cell read of world + bytes, disjoint per-index writes.
-            {
-                use rayon::prelude::*;
-                let cells = &world.cells;
-                let energized = &world.energized;
-                let bytes_ro: &[u8] = bytes;
-                bright_r.par_iter_mut()
-                    .zip(bright_g.par_iter_mut())
-                    .zip(bright_b.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(i, ((br, bg), bb))| {
-                        let c = cells[i];
-                        // Emission from temperature (linear ramp 500–
-                        // 2500°C). Above 2500°C saturates at 255. Below
-                        // 500°C contributes nothing.
-                        let mut emission: u32 = if c.temp > 500 {
-                            (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
-                        } else {
-                            0
+                    // Liquid styling — surface highlight + depth shading.
+                    // All effects scale the cell's existing color, so dark
+                    // liquids stay dark and bright liquids stay bright.
+                    // Phase-aware via cell_physics so molten metals get
+                    // the same treatment.
+                    if cell_physics(c).kind == Kind::Liquid {
+                        let cx = (i % W) as i32;
+                        let cy = (i / W) as i32;
+                        let is_top = |x: i32, y: i32| -> bool {
+                            if y <= 0 || x < 0 || x >= W as i32 { return false; }
+                            let here = (y as usize) * W + x as usize;
+                            if cell_physics(cells_ro[here]).kind != Kind::Liquid { return false; }
+                            let above = ((y - 1) as usize) * W + x as usize;
+                            cell_physics(cells_ro[above]).kind != Kind::Liquid
                         };
-                        // Fire and Lava are canonically luminous regardless
-                        // of temp. Energized noble gases — neon-tube glow.
-                        if matches!(c.el, Element::Fire | Element::Lava) {
-                            emission = emission.max(220);
+                        let self_top = is_top(cx, cy);
+                        let neigh_top = is_top(cx - 1, cy) as i32
+                            + is_top(cx + 1, cy) as i32;
+                        let on_surface = self_top && neigh_top >= 1;
+                        if on_surface {
+                            r = ((r as u32 * 122 / 100).min(255)) as u8;
+                            g = ((g as u32 * 122 / 100).min(255)) as u8;
+                            b = ((b as u32 * 122 / 100).min(255)) as u8;
                         }
-                        if energized[i] && c.el.electrical().glow_color.is_some() {
-                            emission = emission.max(180);
+                        let col_depth = |x: i32| -> i32 {
+                            if x < 0 || x >= W as i32 { return 0; }
+                            let mut d = 0i32;
+                            for dy in 1..=8 {
+                                let py = cy - dy;
+                                if py < 0 { break; }
+                                let pi = py as usize * W + x as usize;
+                                if cell_physics(cells_ro[pi]).kind == Kind::Liquid { d += 1; }
+                                else { break; }
+                            }
+                            d
+                        };
+                        let depth = col_depth(cx)
+                            .min(col_depth(cx - 1))
+                            .min(col_depth(cx + 1));
+                        if depth > 0 && !on_surface {
+                            let darken = 100 - (depth * 3).min(24);
+                            r = (r as u32 * darken as u32 / 100) as u8;
+                            g = (g as u32 * darken as u32 / 100) as u8;
+                            b = (b as u32 * darken as u32 / 100) as u8;
                         }
-                        if emission == 0 { return; }
-                        let r = bytes_ro[i * 4] as u32;
-                        let g = bytes_ro[i * 4 + 1] as u32;
-                        let b = bytes_ro[i * 4 + 2] as u32;
-                        *br = ((r * emission) / 255).min(255) as u8;
-                        *bg = ((g * emission) / 255).min(255) as u8;
-                        *bb = ((b * emission) / 255).min(255) as u8;
-                    });
-            }
-            // 1D triangular kernel (radius 18, 37 taps). Visually fine
-            // and trivially fast; wider kernel = larger halo with
-            // gentler falloff.
-            let kw: [u16; 37] = [
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
-            ];
-            let kw_sum: u16 = 361;
-            let kw_len = kw.len();
-            // Horizontal blur into scratch buffers — parallel over rows.
-            let mut h_r = vec![0u8; n];
-            let mut h_g = vec![0u8; n];
-            let mut h_b = vec![0u8; n];
-            {
-                use rayon::prelude::*;
-                let zipped = h_r.par_chunks_mut(W)
-                    .zip(h_g.par_chunks_mut(W))
-                    .zip(h_b.par_chunks_mut(W))
-                    .enumerate();
-                zipped.for_each(|(y, ((row_r, row_g), row_b))| {
-                    let row_off = y * W;
-                    for x in 0..W {
-                        let mut sr: u32 = 0;
-                        let mut sg: u32 = 0;
-                        let mut sb: u32 = 0;
-                        for k in 0..kw_len {
-                            let kx = (x as i32 + k as i32 - BLOOM_RADIUS as i32)
-                                .clamp(0, W as i32 - 1) as usize;
-                            let idx = row_off + kx;
-                            let w = kw[k] as u32;
-                            sr += bright_r[idx] as u32 * w;
-                            sg += bright_g[idx] as u32 * w;
-                            sb += bright_b[idx] as u32 * w;
-                        }
-                        row_r[x] = (sr / kw_sum as u32) as u8;
-                        row_g[x] = (sg / kw_sum as u32) as u8;
-                        row_b[x] = (sb / kw_sum as u32) as u8;
+                    }
+                    // Gas sidecar: cloud color + density. Hide the discrete
+                    // atom in base so only the blurred cloud halo shows.
+                    let is_gas = matches!(cell_physics(c).kind, Kind::Gas);
+                    let (gas_r, gas_g, gas_b) = (r, g, b);
+                    if is_gas {
+                        gas_pix[0] = gas_r;
+                        gas_pix[1] = gas_g;
+                        gas_pix[2] = gas_b;
+                        gas_pix[3] = 255;
+                        r = 0; g = 0; b = 0;
+                    } else {
+                        gas_pix[0] = 0;
+                        gas_pix[1] = 0;
+                        gas_pix[2] = 0;
+                        gas_pix[3] = 0;
+                    }
+                    base_pix[0] = r;
+                    base_pix[1] = g;
+                    base_pix[2] = b;
+                    base_pix[3] = 255;
+                    // Bright sidecar: emission-tinted color, inherits cell hue.
+                    let mut emission: u32 = if c.temp > 500 {
+                        (((c.temp - 500) as i32 * 255 / 2000).clamp(0, 255)) as u32
+                    } else { 0 };
+                    if matches!(c.el, Element::Fire | Element::Lava) {
+                        emission = emission.max(220);
+                    }
+                    if energized_ro[i] && c.el.electrical().glow_color.is_some() {
+                        emission = emission.max(180);
+                    }
+                    if emission == 0 {
+                        bright_pix[0] = 0;
+                        bright_pix[1] = 0;
+                        bright_pix[2] = 0;
+                        bright_pix[3] = 0;
+                    } else {
+                        // Source-color for bloom is pre-gas-mask (gas cells
+                        // have their atom pixel hidden but should still
+                        // glow if hot enough).
+                        let (br, bg, bb) = if is_gas {
+                            (gas_r as u32, gas_g as u32, gas_b as u32)
+                        } else {
+                            (r as u32, g as u32, b as u32)
+                        };
+                        bright_pix[0] = ((br * emission) / 255).min(255) as u8;
+                        bright_pix[1] = ((bg * emission) / 255).min(255) as u8;
+                        bright_pix[2] = ((bb * emission) / 255).min(255) as u8;
+                        bright_pix[3] = 255;
                     }
                 });
-            }
-            // Vertical blur, additive composite onto image bytes —
-            // parallel over output rows.
-            {
-                use rayon::prelude::*;
-                bytes.par_chunks_mut(W * 4).enumerate().for_each(|(y, row_bytes)| {
-                    for x in 0..W {
-                        let mut sr: u32 = 0;
-                        let mut sg: u32 = 0;
-                        let mut sb: u32 = 0;
-                        for k in 0..kw_len {
-                            let ky = (y as i32 + k as i32 - BLOOM_RADIUS as i32)
-                                .clamp(0, H as i32 - 1) as usize;
-                            let idx = ky * W + x;
-                            let w = kw[k] as u32;
-                            sr += h_r[idx] as u32 * w;
-                            sg += h_g[idx] as u32 * w;
-                            sb += h_b[idx] as u32 * w;
-                        }
-                        let br = (sr / kw_sum as u32) as u8;
-                        let bg = (sg / kw_sum as u32) as u8;
-                        let bb = (sb / kw_sum as u32) as u8;
-                        let base = x * 4;
-                        row_bytes[base]     = row_bytes[base].saturating_add(br);
-                        row_bytes[base + 1] = row_bytes[base + 1].saturating_add(bg);
-                        row_bytes[base + 2] = row_bytes[base + 2].saturating_add(bb);
-                    }
-                });
-            }
         }
         texture.update(&image);
-        // Clear with the panel color — any area the sim doesn't cover
-        // (bottom strip from aspect mismatch, space beside a centered sim)
-        // reads as panel instead of blank dead space.
+        kind_texture.update(&kind_image);
+
+        // Gate the bright/gas pipeline on actual content. When the grid
+        // has no emissive cells (no Fire/Lava/hot/energized) we skip the
+        // upload + 2 bloom blur passes entirely — that's ~1.5 ms saved
+        // per frame for sand-only scenes. The transition frame still
+        // runs the full pipeline so bloom_v_target ends up cleared to
+        // zeros; subsequent frames sample the stale (zero) target
+        // safely until emission returns.
+        let has_emission_now = world.has_emission();
+        let has_gas_now = world.has_any_gas();
+        let do_bloom = has_emission_now || last_had_emission;
+        let do_gas = has_gas_now || last_had_gas;
+        last_had_emission = has_emission_now;
+        last_had_gas = has_gas_now;
+
+        let pass_camera = |target: &RenderTarget| -> Camera2D {
+            let mut cam = Camera2D::from_display_rect(
+                Rect::new(0.0, 0.0, W as f32, H as f32),
+            );
+            cam.render_target = Some(target.clone());
+            cam
+        };
+        let dest_full = || DrawTextureParams {
+            dest_size: Some(vec2(W as f32, H as f32)),
+            ..Default::default()
+        };
+
+        if do_bloom {
+            bright_texture.update(&bright_image);
+            // Bloom horizontal — bright_texture → bloom_h_target.
+            set_camera(&pass_camera(&bloom_h_target));
+            clear_background(BLACK);
+            blur_bloom_material.set_uniform("inv_size", inv_size);
+            blur_bloom_material.set_uniform("direction", vec2(1.0, 0.0));
+            gl_use_material(&blur_bloom_material);
+            draw_texture_ex(&bright_texture, 0.0, 0.0, WHITE, dest_full());
+            gl_use_default_material();
+            // Bloom vertical — bloom_h_target → bloom_v_target.
+            set_camera(&pass_camera(&bloom_v_target));
+            clear_background(BLACK);
+            blur_bloom_material.set_uniform("inv_size", inv_size);
+            blur_bloom_material.set_uniform("direction", vec2(0.0, 1.0));
+            gl_use_material(&blur_bloom_material);
+            draw_texture_ex(&bloom_h_target.texture, 0.0, 0.0, WHITE, dest_full());
+            gl_use_default_material();
+        }
+
+        if do_gas {
+            gas_texture.update(&gas_image);
+            // Gas horizontal — gas_texture → gas_h_target.
+            set_camera(&pass_camera(&gas_h_target));
+            clear_background(BLACK);
+            blur_gas_material.set_uniform("inv_size", inv_size);
+            blur_gas_material.set_uniform("direction", vec2(1.0, 0.0));
+            gl_use_material(&blur_gas_material);
+            draw_texture_ex(&gas_texture, 0.0, 0.0, WHITE, dest_full());
+            gl_use_default_material();
+            // Gas vertical — gas_h_target → gas_v_target.
+            set_camera(&pass_camera(&gas_v_target));
+            clear_background(BLACK);
+            blur_gas_material.set_uniform("inv_size", inv_size);
+            blur_gas_material.set_uniform("direction", vec2(0.0, 1.0));
+            gl_use_material(&blur_gas_material);
+            draw_texture_ex(&gas_h_target.texture, 0.0, 0.0, WHITE, dest_full());
+            gl_use_default_material();
+        }
+
+        // Back to screen for the composite + UI.
+        set_default_camera();
         clear_background(panel_bg());
+        composite_material.set_texture("bloom_tex", bloom_v_target.texture.clone());
+        composite_material.set_texture("gas_tex", gas_v_target.texture.clone());
+        composite_material.set_texture("kind_tex", kind_texture.clone());
+        composite_material.set_uniform("u_time", get_time() as f32);
+        gl_use_material(&composite_material);
         draw_texture_ex(
             &texture, sim_x, sim_y, WHITE,
             DrawTextureParams {
@@ -9019,7 +11192,10 @@ pub async fn run_game() {
                 ..Default::default()
             },
         );
+        gl_use_default_material();
+        perf_t_render_us += perf_t_render_start.elapsed().as_micros() as u64;
 
+        let perf_t_ui_start = std::time::Instant::now();
         // Shockwave leading edges — a bright ring at each active wave's
         // current radius so blasts read visually as expanding fronts, not
         // just invisible forces knocking things around. Alpha scales with
@@ -9194,79 +11370,128 @@ pub async fn run_game() {
                 && my >= rst.1 && my < rst.1 + rst.3;
             draw_panel_button(rst, "Reset Wind", false, rst_hov);
 
-            // Prefab sub-panel — kind selectors + thickness/width/height.
+            // Prefab sub-panel — kind dropdown + parameter rows + material.
             if tool_mode == ToolMode::Prefab {
-                let kr = prefab_kind_rects();
+                let sel = prefab_kind_selector_rect();
                 draw_ui_text(
                     "PREFAB",
-                    kr[0].0 + 2.0, kr[0].1 - 10.0, 11.0,
+                    sel.0 + 2.0, sel.1 - 10.0, 11.0,
                     Color::from_rgba(130, 130, 150, 255),
                 );
                 let hit_k = |r: (f32, f32, f32, f32)|
                     mx >= r.0 && mx < r.0 + r.2
                     && my >= r.1 && my < r.1 + r.3;
-                draw_panel_button(
-                    kr[0], "Beaker",
-                    prefab_kind == PrefabKind::Beaker, hit_k(kr[0]),
+                // Kind selector — shows current kind's icon + name +
+                // a chevron suggesting it expands.
+                let sel_hov = hit_k(sel);
+                let sel_bg = if sel_hov {
+                    Color::from_rgba(45, 50, 70, 255)
+                } else {
+                    Color::from_rgba(28, 30, 42, 255)
+                };
+                draw_rectangle(sel.0, sel.1, sel.2, sel.3, sel_bg);
+                draw_rectangle_lines(
+                    sel.0, sel.1, sel.2, sel.3, 1.0,
+                    Color::from_rgba(70, 75, 95, 255),
                 );
-                draw_panel_button(
-                    kr[1], "Box",
-                    prefab_kind == PrefabKind::Box, hit_k(kr[1]),
+                let icon_size = 18.0;
+                let icon_x = sel.0 + 10.0;
+                let icon_y = sel.1 + (sel.3 - icon_size) * 0.5;
+                draw_prefab_icon(prefab_kind, icon_x, icon_y, icon_size);
+                draw_ui_text(
+                    prefab_kind.label(),
+                    sel.0 + 10.0 + icon_size + 8.0,
+                    sel.1 + sel.3 * 0.5 + 5.0,
+                    14.0,
+                    Color::from_rgba(220, 220, 230, 255),
                 );
-                draw_panel_button(
-                    kr[2], "Batt",
-                    prefab_kind == PrefabKind::Battery, hit_k(kr[2]),
+                let chev = if prefab_kind_dropdown_open { "▲" } else { "▼" };
+                let cd = measure_ui_text(chev, 12);
+                draw_ui_text(
+                    chev,
+                    sel.0 + sel.2 - cd.width - 10.0,
+                    sel.1 + sel.3 * 0.5 + 4.0,
+                    12.0,
+                    Color::from_rgba(160, 160, 180, 255),
                 );
-                let sr = prefab_slider_rects();
-                let labels = [
-                    ("Thickness", prefab_thickness.to_string()),
-                    ("Width",     prefab_width.to_string()),
-                    ("Height",    prefab_height.to_string()),
-                    ("Voltage",   format!("{} V", prefab_voltage)),
-                ];
-                for i in 0..PREFAB_ROW_COUNT {
-                    let r = sr[i];
-                    let hov = mx >= r.0 && mx < r.0 + r.2
-                        && my >= r.1 && my < r.1 + r.3;
-                    let bg = if hov {
-                        Color::from_rgba(38, 38, 48, 255)
-                    } else {
-                        Color::from_rgba(24, 24, 32, 255)
-                    };
-                    draw_rectangle(r.0, r.1, r.2, r.3, bg);
-                    draw_rectangle_lines(
-                        r.0, r.1, r.2, r.3, 1.0,
-                        Color::from_rgba(50, 50, 62, 255),
+                if prefab_kind_dropdown_open {
+                    // Option list — covers the parameter / material area.
+                    let opt = prefab_kind_option_rects();
+                    for (i, opt_kind) in PREFAB_KINDS.iter().enumerate() {
+                        let r = opt[i];
+                        let active = *opt_kind == prefab_kind;
+                        let hov = hit_k(r);
+                        let bg = if active {
+                            Color::from_rgba(50, 80, 130, 255)
+                        } else if hov {
+                            Color::from_rgba(38, 40, 52, 255)
+                        } else {
+                            Color::from_rgba(22, 24, 32, 255)
+                        };
+                        draw_rectangle(r.0, r.1, r.2, r.3, bg);
+                        draw_rectangle_lines(
+                            r.0, r.1, r.2, r.3, 1.0,
+                            Color::from_rgba(50, 52, 64, 255),
+                        );
+                        let oi_size = 16.0;
+                        draw_prefab_icon(*opt_kind, r.0 + 10.0,
+                            r.1 + (r.3 - oi_size) * 0.5, oi_size);
+                        draw_ui_text(
+                            opt_kind.label(),
+                            r.0 + 10.0 + oi_size + 8.0,
+                            r.1 + r.3 * 0.5 + 5.0,
+                            13.0,
+                            Color::from_rgba(220, 220, 230, 255),
+                        );
+                    }
+                } else {
+                    // Parameter rows. Voltage is Battery-only.
+                    let row_count = if prefab_kind == PrefabKind::Battery { 4 } else { 3 };
+                    let labels: [(&str, String); 4] = [
+                        ("Thickness", prefab_thickness.to_string()),
+                        (param_width_label(prefab_kind), prefab_width.to_string()),
+                        ("Height",     prefab_height.to_string()),
+                        ("Voltage",    format!("{} V", prefab_voltage)),
+                    ];
+                    let sr = prefab_slider_rects();
+                    for i in 0..row_count {
+                        let r = sr[i];
+                        let hov = hit_k(r);
+                        let bg = if hov {
+                            Color::from_rgba(38, 38, 48, 255)
+                        } else {
+                            Color::from_rgba(24, 24, 32, 255)
+                        };
+                        draw_rectangle(r.0, r.1, r.2, r.3, bg);
+                        draw_rectangle_lines(
+                            r.0, r.1, r.2, r.3, 1.0,
+                            Color::from_rgba(50, 50, 62, 255),
+                        );
+                        draw_ui_text(
+                            labels[i].0, r.0 + 10.0, r.1 + r.3 * 0.5 + 5.0, 13.0,
+                            Color::from_rgba(150, 150, 165, 255),
+                        );
+                        let vd = measure_ui_text(&labels[i].1, 13);
+                        draw_ui_text(
+                            &labels[i].1,
+                            r.0 + r.2 - vd.width - 10.0,
+                            r.1 + r.3 * 0.5 + 5.0, 13.0,
+                            Color::from_rgba(220, 220, 230, 255),
+                        );
+                    }
+                    let mr = prefab_material_rect();
+                    let mr_hov = hit_k(mr);
+                    draw_panel_button(
+                        mr,
+                        &format!("Material: {}", prefab_material.name()),
+                        false, mr_hov,
                     );
                     draw_ui_text(
-                        labels[i].0, r.0 + 10.0, r.1 + r.3 * 0.5 + 5.0, 13.0,
-                        Color::from_rgba(150, 150, 165, 255),
-                    );
-                    let vd = measure_ui_text(&labels[i].1, 13);
-                    draw_ui_text(
-                        &labels[i].1,
-                        r.0 + r.2 - vd.width - 10.0,
-                        r.1 + r.3 * 0.5 + 5.0, 13.0,
-                        Color::from_rgba(220, 220, 230, 255),
+                        "click in sim to place",
+                        mr.0 + 2.0, mr.1 + mr.3 + 14.0, 11.0,
+                        Color::from_rgba(130, 130, 150, 255),
                     );
                 }
-                // Material picker button. Displays current prefab material
-                // and opens the periodic table (in material-picker mode)
-                // when clicked.
-                let mr = prefab_material_rect();
-                let mr_hov = mx >= mr.0 && mx < mr.0 + mr.2
-                    && my >= mr.1 && my < mr.1 + mr.3;
-                draw_panel_button(
-                    mr,
-                    &format!("Material: {}", prefab_material.name()),
-                    false, mr_hov,
-                );
-                // Hint below — just the "click to place" reminder.
-                draw_ui_text(
-                    "click in sim to place",
-                    mr.0 + 2.0, mr.1 + mr.3 + 14.0, 11.0,
-                    Color::from_rgba(130, 130, 150, 255),
-                );
             }
 
             // Wire sub-panel — material picker + thickness slider. Shown
@@ -9666,6 +11891,39 @@ pub async fn run_game() {
             );
         }
 
+        // Toast overlay — fades over the last ~30 frames of its window.
+        // Drawn after everything else so it sits on top of UI and any
+        // open overlays. Centered at the top of the sim area (left of
+        // the side panel). Captured by the screenshot below.
+        if toast_frames > 0 && !toast_msg.is_empty() {
+            let fade = if toast_frames < 30 {
+                toast_frames as f32 / 30.0
+            } else { 1.0 };
+            let alpha = (fade * 240.0) as u8;
+            let dim = measure_ui_text(&toast_msg, 16);
+            let sim_w = (W as f32) * 3.25;
+            let bx = (sim_w - dim.width) * 0.5 - 12.0;
+            let by = 24.0;
+            draw_rectangle(
+                bx, by, dim.width + 24.0, 28.0,
+                Color::from_rgba(20, 20, 28, alpha.min(220)),
+            );
+            draw_rectangle_lines(
+                bx, by, dim.width + 24.0, 28.0, 2.0,
+                Color::from_rgba(
+                    (toast_color.r * 255.0) as u8,
+                    (toast_color.g * 255.0) as u8,
+                    (toast_color.b * 255.0) as u8,
+                    alpha,
+                ),
+            );
+            let mut c = toast_color;
+            c.a = fade;
+            draw_ui_text(
+                &toast_msg, bx + 12.0, by + 20.0, 16.0, c,
+            );
+        }
+
         // Screenshot: captured AFTER all drawing so the saved image includes
         // UI and the periodic-table overlay if it's open. Uses the OpenGL
         // framebuffer via get_screen_data.
@@ -9679,6 +11937,30 @@ pub async fn run_game() {
             img.export_png(&path);
             screenshot_notice = Some(format!("saved {}", path));
             screenshot_timer = 120;
+        }
+
+        perf_t_ui_us += perf_t_ui_start.elapsed().as_micros() as u64;
+
+        perf_frames += 1;
+        if perf_last_print.elapsed().as_secs_f32() >= 1.0 {
+            let f = perf_frames as f32;
+            let to_ms = |us: u64| us as f32 / f / 1000.0;
+            let step = to_ms(perf_t_step_us);
+            let render = to_ms(perf_t_render_us);
+            let ui = to_ms(perf_t_ui_us);
+            println!(
+                "[perf] fps={} cpu_total={:.2}ms step={:.2}ms render={:.2}ms ui={:.2}ms",
+                get_fps(),
+                step + render + ui,
+                step,
+                render,
+                ui,
+            );
+            perf_t_step_us = 0;
+            perf_t_render_us = 0;
+            perf_t_ui_us = 0;
+            perf_frames = 0;
+            perf_last_print = std::time::Instant::now();
         }
 
         next_frame().await
