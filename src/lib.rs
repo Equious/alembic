@@ -213,6 +213,15 @@ struct ThermalProfile {
     ignite_above:   Option<i16>,     // above this temperature, ignites (if dry)
     burn_duration:  Option<u8>,      // once lit, burns this many ticks before being consumed
     burn_temp:      Option<i16>,     // sustained temp while burning (controls "fire intensity")
+    // Porosity for combustion: fraction of ambient O₂ that reaches a
+    // fully-buried (no-air-cardinal) cell of this material via gaps
+    // between same-material cells in a pile. 0.0 = airtight (stone,
+    // dense metals), 1.0 = fully porous. Loose granular materials
+    // (leaves, seed, gunpowder) get high values; dense waxy/crystalline
+    // solids (P, sulfur) low values. Used by oxygen_available so a
+    // leaves pile burns through its interior naturally while a packed
+    // carbon pile chars layer-by-layer.
+    air_permeability: f32,
 }
 
 // Pressure: how overpressure propagates. `permeability` gates how readily
@@ -428,6 +437,7 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
             freeze_below: NONE_PH, melt_above: NONE_PH,
             boil_above: NONE_PH, condense_below: NONE_PH,
             ignite_above: None, burn_duration: None, burn_temp: None,
+            air_permeability: 0.0,
         }
     }
     let mut a = [base(); ELEMENT_COUNT];
@@ -462,7 +472,11 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
     a[Element::Wood  as usize]    = ThermalProfile {
         ambient_rate: 0.003, conductivity: 0.022, heat_capacity: 1.3,
         ignite_above: Some(350), burn_duration: Some(255),
-        burn_temp: Some(700), ..base()
+        burn_temp: Some(700),
+        // Logs char from the outside in — solid grain, low interior O₂
+        // access. Surface burns fast, interior chars slowly.
+        air_permeability: 0.15,
+        ..base()
     };
     a[Element::Fire as usize]     = ThermalProfile {
         initial_temp: 900, ambient_temp: 900, ambient_rate: 0.004,
@@ -498,16 +512,24 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
     };
     a[Element::Seed as usize]     = ThermalProfile {
         ambient_rate: 0.003, conductivity: 0.020, heat_capacity: 1.3,
-        ignite_above: Some(320), burn_duration: Some(150),
-        burn_temp: Some(650), ..base()
+        ignite_above: Some(320), burn_duration: Some(80),
+        burn_temp: Some(650),
+        // Loose granular pile, lots of inter-grain air gaps.
+        air_permeability: 0.55,
+        ..base()
     };
     a[Element::Mud as usize]      = ThermalProfile {
         ambient_rate: 0.003, conductivity: 0.030, heat_capacity: 1.2, ..base()
     };
     a[Element::Leaves as usize]   = ThermalProfile {
         ambient_rate: 0.005, conductivity: 0.020, heat_capacity: 1.0,
-        ignite_above: Some(230), burn_duration: Some(80),
-        burn_temp: Some(600), ..base()
+        ignite_above: Some(230), burn_duration: Some(20),
+        burn_temp: Some(600),
+        // Crumpled non-conformal leaves pack with huge air gaps —
+        // a leaf pile lights up almost uniformly fast. Short burn
+        // duration so leaves visibly flash through in a few frames.
+        air_permeability: 0.95,
+        ..base()
     };
     a[Element::Oil as usize]      = ThermalProfile {
         ambient_rate: 0.006, conductivity: 0.035, heat_capacity: 2.2,
@@ -515,7 +537,11 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
         // Realistic hydrocarbon flame: hotter than wood. Water adjacent still
         // wins in sufficient volume, thanks to the increased latent heat of
         // vaporization — each boil drains 1200 energy from this cell.
-        burn_temp: Some(800), ..base()
+        burn_temp: Some(800),
+        // Liquid oil burns at the surface; submerged interior gets
+        // very little O₂. Low porosity matches "pool fire" behavior.
+        air_permeability: 0.05,
+        ..base()
     };
     a[Element::Ice as usize]      = ThermalProfile {
         initial_temp: -5,
@@ -549,7 +575,13 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
     };
     a[Element::C  as usize] = ThermalProfile {
         conductivity: 0.040, heat_capacity: 1.0,
-        ignite_above: Some(500), burn_duration: Some(220), burn_temp: Some(900), ..base()
+        ignite_above: Some(500), burn_duration: Some(255), burn_temp: Some(900),
+        // Carbon piles (lump charcoal, coal) burn from the surface
+        // inward — moderate porosity. Matches grill behavior where
+        // outer lumps glow while inner ones char. Long burn duration
+        // so a coal pile sustains for minutes of game time.
+        air_permeability: 0.20,
+        ..base()
     };
     a[Element::Na as usize] = ThermalProfile {
         ignite_above: Some(100), burn_duration: Some(80), burn_temp: Some(700), ..base()
@@ -558,12 +590,47 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
         // Magnesium burns with an intense white flame at 2000°C+.
         ignite_above: Some(470), burn_duration: Some(90), burn_temp: Some(2200), ..base()
     };
+    a[Element::Ca as usize] = ThermalProfile {
+        // Calcium auto-ignites in air around 480°C as fine powder; bulk
+        // Ca needs higher. Burns with a brick-red flame at ~1500°C.
+        ignite_above: Some(500), burn_duration: Some(100), burn_temp: Some(1500), ..base()
+    };
+    a[Element::Sc as usize] = ThermalProfile {
+        // Bulk Sc oxidizes via chemistry (Sc + O → Sc₂O₃ at any temp via
+        // emergent reaction), it doesn't sustain a fire cascade. Leaving
+        // ignite_above unset matches the Rust→Fe pattern: oxide
+        // decomposition produces clean bulk metal that doesn't re-burn
+        // back into Sc₂O₃. Real Sc combustion is a fine-powder behavior,
+        // not bulk; we don't model that distinction. Sc still tarnishes
+        // ambiently and forms a passivating Sc₂O₃ Gravel layer.
+        ..base()
+    };
     a[Element::P  as usize] = ThermalProfile {
         // White phosphorus auto-ignites just above room temperature.
-        ignite_above: Some(30), burn_duration: Some(60), burn_temp: Some(900), ..base()
+        ignite_above: Some(30), burn_duration: Some(60), burn_temp: Some(900),
+        // Waxy solid, low interior porosity — surface-only ignition
+        // when piled, and effectively zero when submerged in water.
+        air_permeability: 0.05,
+        ..base()
     };
     a[Element::S  as usize] = ThermalProfile {
-        ignite_above: Some(232), burn_duration: Some(120), burn_temp: Some(700), ..base()
+        // Match Na/K's "normal colored burner" profile so sulfur
+        // doesn't visually outshout the other flame-color metals.
+        // The blue tint still applies to nearby Fire via flame_color
+        // + the existing color_fires pass; we just don't want S
+        // double-emitting flame-test Fire on top of its burn cascade.
+        ignite_above: Some(232), burn_duration: Some(80), burn_temp: Some(700),
+        air_permeability: 0.0,
+        ..base()
+    };
+    a[Element::Se as usize] = ThermalProfile {
+        // Real Se ignites in air around 340°C, burns with a vivid
+        // azure-blue flame producing SeO₂ vapor. Use a slightly cooler
+        // burn_temp than S (Se's combustion is less energetic) so the
+        // surrounding cells don't all flash to combustion.
+        ignite_above: Some(340), burn_duration: Some(100), burn_temp: Some(620),
+        air_permeability: 0.0,
+        ..base()
     };
     a[Element::K  as usize] = ThermalProfile {
         ignite_above: Some(60), burn_duration: Some(90), burn_temp: Some(800), ..base()
@@ -582,6 +649,10 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
         burn_duration: Some(2),
         burn_temp: Some(2200),
         conductivity: 0.15,
+        // Coarse grains with lots of air gaps; gunpowder is mostly
+        // self-oxidizing anyway (KNO₃ + S + C) so this is mostly
+        // belt-and-suspenders for chain ignition through a pile.
+        air_permeability: 0.60,
         ..base()
     };
     // Caesium — hyper-reactive alkali. Real Cs ignites in dry air at
@@ -629,15 +700,18 @@ static THERMAL: [ThermalProfile; ELEMENT_COUNT] = {
     a[Element::Ba as usize] = ThermalProfile {
         ignite_above: Some(700), burn_duration: Some(80), burn_temp: Some(2000), ..base()
     };
-    // Beryllium has high mp but burns dazzling-white when finely
-    // divided; let it ignite well below mp.
-    a[Element::Be as usize] = ThermalProfile {
-        ignite_above: Some(900), burn_duration: Some(70), burn_temp: Some(2400), ..base()
-    };
-    // Titanium burns with an intense white flame (used in fireworks).
-    a[Element::Ti as usize] = ThermalProfile {
-        ignite_above: Some(1200), burn_duration: Some(60), burn_temp: Some(2300), ..base()
-    };
+    // Be and Ti are bulk-non-combustible in this model — same as Fe.
+    // Real Be/Ti combustion is a fine-powder phenomenon (sparkler /
+    // pyrotechnic flake), not a bulk-metal behavior; we don't model
+    // particle size. Oxidation runs through chemistry (Be+O → BeO,
+    // Ti+O → TiO₂) and the oxide layer passivates as a Gravel
+    // coating. Treating them as flammable gave the Rust→Fe-style
+    // oxide decomposition no clean exit: the freed metal would
+    // re-ignite in any sustained heat zone and reform the oxide,
+    // making decomp visually identical to a phase cycle. Default
+    // base() leaves ignite_above/burn_temp/burn_duration unset.
+    a[Element::Be as usize] = ThermalProfile { ..base() };
+    a[Element::Ti as usize] = ThermalProfile { ..base() };
     // Boron — finely divided B powder burns with a vivid green flame
     // (boric acid + boron itself give the same flame test). Real
     // amorphous boron auto-ignites in air around 700°C; we set the
@@ -995,6 +1069,13 @@ static ELECTRICAL: [ElectricalProfile; ELEMENT_COUNT] = {
     // color it would have when un-energized.
     a[Element::F as usize] = ElectricalProfile {
         conductivity: 0.0, glow_color: Some((220, 140, 200)),
+    };
+    // Chlorine — discharge tubes glow pale yellow-green to apple-green
+    // depending on pressure. Cl₂ atomic emission is dominated by green
+    // bands (around 540 nm) with a touch of red. The glow is dimmer
+    // and more uniform than the noble-gas tubes.
+    a[Element::Cl as usize] = ElectricalProfile {
+        conductivity: 0.0, glow_color: Some((180, 240, 130)),
     };
     // Krypton — pale white with a faint blue. Real Kr discharge tubes
     // are off-white from the broad multi-line emission spectrum.
@@ -1889,6 +1970,13 @@ fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Op
         | (Element::Fe, Element::Ice)
         | (Element::Fe, Element::Steam) => Some(Element::Rust),
         (Element::C, Element::O) => Some(Element::CO2),
+        // Si + O is SiO₂ — the same compound as Element::Sand. Without
+        // this mapping the derived registry creates a parallel "SiO₂"
+        // entry that's distinct from Sand even though they're the same
+        // chemistry, so the same atom pair can produce two different-
+        // looking products depending on which code path triggered. Map
+        // explicitly to Sand to keep compound identity unified.
+        (Element::Si, Element::O) => Some(Element::Sand),
         (m, Element::Water) | (m, Element::Ice) | (m, Element::Steam)
             if atom_profile_for(m).map_or(false, |a|
                 a.implemented
@@ -1896,6 +1984,18 @@ fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Op
                 && a.electronegativity < 1.4
                 && a.valence_electrons <= 2)
             => Some(Element::H),
+        // Sc + water — slow but real (Sc(OH)₃ + H₂). Sc's valence 3
+        // misses the EN-and-valence-≤-2 clause above, but the chemistry
+        // is similar to the Mg/Ca tier — needs hot water to fizz.
+        (Element::Sc, Element::Water)
+        | (Element::Sc, Element::Ice)
+        | (Element::Sc, Element::Steam) => Some(Element::H),
+        // Mn + water — inert at room temp, releases H₂ in hot water /
+        // steam (Mn(OH)₂ + H₂). Same Mg/Ca/Sc tier, valence 7 misses
+        // the EN-and-valence clause above.
+        (Element::Mn, Element::Water)
+        | (Element::Mn, Element::Ice)
+        | (Element::Mn, Element::Steam) => Some(Element::H),
         _ => None,
     };
     if let Some(el) = bespoke {
@@ -1918,6 +2018,19 @@ fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Op
     if is_waterish(acceptor) && donor == Element::Be {
         return None;
     }
+    // As is inert to water — no As + H₂O reaction at any temperature.
+    // Without this gate, As cells in water happily form As₂O₅ since
+    // water's chemistry face exposes O. Same pattern as the Be gate.
+    if is_waterish(acceptor) && donor == Element::As {
+        return None;
+    }
+    // Se is inert to water (and to non-oxidizing acids in general).
+    // Real Se requires concentrated HNO₃ or hot conditions for any
+    // water-side reaction. Block bulk Se + H₂O at the product level
+    // so the derived registry doesn't auto-form SeO₃ on contact.
+    if is_waterish(acceptor) && donor == Element::Se {
+        return None;
+    }
     // Nitride block: only Li reacts with N₂ at room temperature to form
     // Li₃N. Real Na/K/Rb/Cs/Fr do NOT form nitrides under normal
     // conditions — Li⁺ has uniquely high charge density (small ion)
@@ -1926,6 +2039,17 @@ fn infer_product(donor: Element, acceptor: Element, catalysts: &[Element]) -> Op
     if acceptor == Element::N && matches!(donor,
         Element::Na | Element::K | Element::Rb | Element::Cs | Element::Fr)
     {
+        return None;
+    }
+    // Interhalogen block. ClF/ClF₃/BrF₃ etc. exist but require extreme
+    // lab conditions (fluorine streams at high temp/pressure). The
+    // sandbox produced ClF₇ from displaced Cl gas immediately re-
+    // reacting with adjacent F, eating the freed halogen instead of
+    // letting it escape as gas. Block at the product level so freed
+    // halogens stay free.
+    let is_halogen = |e: Element| matches!(e,
+        Element::F | Element::Cl | Element::Br | Element::I);
+    if is_halogen(donor) && is_halogen(acceptor) {
         return None;
     }
     // Fallback — derive a new compound from the constituents.
@@ -1956,6 +2080,12 @@ struct ReactionOutcome {
     products: [ProductSpec; 2],
     delta_temp: i16,
     rate: f32,
+    // Optional byproduct gas to spawn into a third (empty) neighbor
+    // when the reaction fires. Used by slow-hydrolysis (M + water →
+    // MO residue + H₂ released as bubbles, water cell preserved) so
+    // the reaction can cycle indefinitely on a small puddle without
+    // consuming the water away.
+    byproduct: Option<Element>,
 }
 
 // Attempt to react cells A and B based on their chemistry. Returns the
@@ -1972,11 +2102,14 @@ fn try_emergent_reaction(
     if ea == 0.0 || eb == 0.0 { return None; } // noble / inert
 
     let delta_e = (ea - eb).abs();
-    // 0.35 threshold (was 0.4) so H + S (Δe = 0.38) can actually
-    // form H₂S — the previous bar barely excluded it. Other sub-0.4
-    // pairs in our table are all same-period nonmetal/metalloid
-    // mismatches that wouldn't form interesting compounds anyway.
-    if delta_e < 0.35 { return None; }
+    // 0.34 threshold (was 0.35, originally 0.4). Lowered to 0.34 to
+    // cover f32 precision: H + Se delta_e is exactly 0.35 in math
+    // (2.55 - 2.20) but evaluates to ~0.349999 in f32, falling just
+    // below a 0.35 strict-less-than cutoff. Other sub-0.4 pairs in
+    // our table are same-period nonmetal/metalloid mismatches that
+    // don't form interesting compounds. The 0.34 floor still
+    // excludes those (Si+P = 0.29, C+I = 0.11, etc.).
+    if delta_e < 0.34 { return None; }
 
     // Donor is lower-electronegativity (gives electrons); acceptor pulls.
     let (donor_el, donor_v, acceptor_el, acceptor_v) = if ea < eb {
@@ -1992,12 +2125,24 @@ fn try_emergent_reaction(
     // halogen. Treat H-as-acceptor with effective valence 7 so the
     // metal-hydride pair passes this filter.
     let effective_acceptor_v = if acceptor_el == Element::H { 7 } else { acceptor_v };
-    // Nitrogen as donor is also special: N has 5 valence electrons but
-    // can act as a donor when paired with O/F/Cl (NO, NF₃, NCl₃). Its
-    // chemistry treats it as donating 2-3 electrons to those acceptors,
-    // not all 5. Use effective donor valence 2 so the donor_v ≤ 4 check
-    // doesn't silently bar all N-as-donor reactions.
-    let effective_donor_v = if donor_el == Element::N { 2 } else { donor_v };
+    // High-valence donors don't actually give up all their valence
+    // electrons — they oxidize to a much lower state (S→SO₂ is +4,
+    // Cr→Cr₂O₃ is +3, etc.). The raw valence_electrons field counts
+    // their full outer shell which fails the donor_v ≤ 4 gate, so
+    // without an override S+O / Cr+S / Mn+anything etc. all silently
+    // return None even though they're real reactions.
+    //
+    // Pnictogens (N/P/As, valence 5) → 2-3 electrons donated.
+    // Chalcogens (O/S/Se, valence 6) → 2 electrons donated.
+    // Halogens (Cl/Br/I, valence 7) → 1 electron donated (interhalogens).
+    // Transition metals with valence > 4 (V, Cr, Mn, Fe, etc.) → 2.
+    let effective_donor_v = match donor_el {
+        Element::N | Element::P | Element::As => 2,
+        Element::O | Element::S | Element::Se => 2,
+        Element::Cl | Element::Br | Element::I => 1,
+        _ if donor_v > 4 => 2,
+        _ => donor_v,
+    };
     if effective_donor_v > 4 || effective_acceptor_v < 5 { return None; }
 
     // Activation energy scales inversely with Δelectronegativity — strongly
@@ -2074,13 +2219,109 @@ fn try_emergent_reaction(
     {
         activation = activation.min(0);
     }
+    // Si + Br / Si + I — proceeds in real life but slowly at room
+    // temp; vigorous with mild heat. Bucket math lands Si+Br at 62°C
+    // (just above ambient, never fires). Force room-temp fireable so
+    // submerging Si in liquid Br₂ produces a visible reaction even
+    // without an external heat source.
+    if donor_el == Element::Si
+        && matches!(acceptor_el, Element::Br | Element::I)
+    {
+        activation = activation.min(0);
+    }
+    // P + halogens — white phosphorus reacts vigorously with all
+    // halogens at room temperature (PF₅, PCl₃/PCl₅, PBr₃/PBr₅, PI₃).
+    // Bucket math lands P+Cl at 202°C and P+Br at 62°C, neither of
+    // which fires at ambient. Force room-temp fireable so a P-on-Cl
+    // pile reacts on contact like real life. P+F already passes
+    // (activation -344) so isn't strictly necessary in this list,
+    // but included for symmetry.
+    if donor_el == Element::P
+        && matches!(acceptor_el,
+            Element::F | Element::Cl | Element::Br | Element::I)
+    {
+        activation = activation.min(0);
+    }
+    // Transition + post-transition metal + heavy-halogen (Br / I)
+    // general rule. The bucket math systematically under-prioritizes
+    // these pairs (Δe lands them in the [0.9, 1.6) bucket at 400°C
+    // activation, then small acceptor and donor-metal bonuses don't
+    // drop it below ambient). In real chemistry M + Br₂/I₂ → MBr_x /
+    // MI_x fires on contact at room temp for every transition metal
+    // and post-transition metal we audit (Sc, Ti, V, Cr, Mn, Ga all
+    // needed/needs this; Al + Br₂ is a textbook ignition demo).
+    // Forcing activation ≤ 0 lets the salt form on contact and the
+    // halide can then proceed through its normal decomp/melt/boil
+    // cycle. F and Cl are already covered by their stronger acceptor
+    // bonuses, so this rule narrowly targets the gap.
+    let donor_is_metal_block = atom_profile_for(donor_el)
+        .map_or(false, |a| matches!(a.category,
+            AtomCategory::TransitionMetal | AtomCategory::PostTransition));
+    if donor_is_metal_block && matches!(acceptor_el, Element::Br | Element::I) {
+        activation = activation.min(0);
+    }
+    // Nonmetal & metalloid donors + heavy halogens (Cl/Br/I). Bucket
+    // math systematically under-activates these because the strong
+    // halogen acceptor_bonus (~200 for Cl, ~280 for F) dominates a
+    // moderate Δe bucket (200-400°C), netting activation values in
+    // the single digits — pairs silently fire on contact at room
+    // temperature even though real chemistry requires sustained heat
+    // (industrial chlorination of C, Si, P, S etc. runs 300-500°C).
+    // 400°C floor matches real ignition tier. F stays uncapped — F
+    // is uniquely aggressive (real C + F₂, Si + F₂ etc. ARE contact-
+    // reactive at room temp due to F's outsized electron affinity).
+    if matches!(donor_el,
+        Element::C | Element::Si | Element::P | Element::S | Element::B)
+        && matches!(acceptor_el, Element::Cl | Element::Br | Element::I)
+    {
+        activation = activation.max(400);
+    }
+    // Ge halogenation activation override (CAP, not floor). Bucket
+    // math lands Ge+F at -344, Ge+Cl at 202, Ge+Br at 262, Ge+I
+    // at 152 — F auto-fires at STP (don't want), and Cl/Br need
+    // furnace temps the user can't realistically reach in a
+    // sandbox. Real Ge + Cl₂ proceeds at ~250°C in industrial
+    // chlorination, but Br bp is 59°C and I sublimes at 184°C
+    // so any activation above their phase points means the
+    // halogen disperses before reacting. Cap activation at
+    // 150 (F/Cl) and 50 (Br/I) so heated Ge in halogen vapor
+    // actually fires.
+    if donor_el == Element::Ge
+        && matches!(acceptor_el, Element::F | Element::Cl)
+    {
+        activation = 150;
+    }
+    if donor_el == Element::Ge
+        && matches!(acceptor_el, Element::Br | Element::I)
+    {
+        activation = 50;
+    }
+    // Ge + O activation override: real Ge does tarnish slowly at
+    // room temp; bucket math gates it at 118°C and prevents any
+    // ambient oxidation. Drop activation so chemistry fires at STP;
+    // rate is capped below to keep tarnish gradual.
+    if donor_el == Element::Ge && acceptor_el == Element::O
+        && matches!(inferred, InferredProduct::Derived(_))
+    {
+        activation = activation.min(0);
+    }
+    // Metal hydride formation needs Haber-tier conditions in real life
+    // (high temp + pressurized H₂). Without a high activation floor,
+    // fresh H₂ gas produced by M+water reactions is at ~1300°C, which
+    // easily clears the bucket math's 200°C activation for K+H,
+    // dampening the dramatic alkali-water reaction. 500°C floor keeps
+    // metal hydrides accessible in a hot enriched atmosphere but
+    // doesn't let them auto-form from drifting H gas.
+    if acceptor_el == Element::H && donor_e < 2.0 {
+        activation = activation.max(500);
+    }
     // Mg/Ca + water hydrolysis is slow in real life — Mg is essentially
     // inert in cold water, fizzes weakly in hot (~80°C) water, and only
     // reacts vigorously with steam. The bespoke (metal, water) → H clause
     // sweeps Mg/Ca in alongside the alkalis at full rate, which is wrong
     // for these less-reactive alkaline-earth metals. 80°C activation
     // floor matches the real "warm water needed" threshold.
-    if matches!(donor_el, Element::Mg | Element::Ca)
+    if matches!(donor_el, Element::Mg | Element::Ca | Element::Sc | Element::Mn)
         && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
         && matches!(inferred, InferredProduct::Bespoke(Element::H))
     {
@@ -2123,13 +2364,23 @@ fn try_emergent_reaction(
             RUST_EXPLICIT_O_RATE
         };
     }
+    // Si passivation — Si + O → Sand should NOT consume a Si pile in
+    // seconds. Real Si oxidizes very slowly at room temperature; a
+    // thin SiO₂ surface layer (a few nanometers) protects the bulk.
+    // With our cell-based engine we can't truly "stop after one
+    // layer", but we can cap the rate so it forms slowly enough that
+    // the visible behavior reads as gradual surface tarnish rather
+    // than instant conversion.
+    if matches!(inferred, InferredProduct::Bespoke(Element::Sand)) {
+        rate = 0.0005;
+    }
     // Mg/Ca in water — slow even when activation is met. Even in
     // boiling water Mg only fizzes gently (real reaction takes minutes
     // to visibly progress); we want the visible bubble-stream look but
     // not the alkali-style flash conversion. 0.03 cap matches the rust
     // tier's slow-corrosion timescale.
     if matches!(inferred, InferredProduct::Bespoke(Element::H))
-        && matches!(donor_el, Element::Mg | Element::Ca)
+        && matches!(donor_el, Element::Mg | Element::Ca | Element::Sc | Element::Mn)
         && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
     {
         rate = (rate * 0.05).min(0.03);
@@ -2140,6 +2391,64 @@ fn try_emergent_reaction(
     // to its compound in one frame.
     if matches!(inferred, InferredProduct::Derived(_)) {
         rate = (rate * 0.01).min(0.2);
+    }
+    // Passivating donors (Al, Cr, Ti, V, Sc, Be, Ni, Cu, Zn, Ga, Ge,
+    // As, Se) form a tight protective oxide layer that slows further
+    // oxidation. Real Ni is the textbook example — used as corrosion-
+    // resistant plating exactly because NiO passivates the surface.
+    // Without a rate floor *here* (after the generic Derived ×0.01
+    // slowdown above), the cap collapses to ~2e-5 — visually nothing
+    // forms even in spawned O₂ atmospheres. 0.002 reads as gradual
+    // surface tarnish rather than rapid consumption, while staying
+    // above the floor needed to actually be visible. List mirrors
+    // `coating_oxide` in derive_or_lookup so these oxides land as
+    // Gravel coatings rather than flaky Powder.
+    let donor_passivates = acceptor_el == Element::O
+        && matches!(donor_el,
+            Element::Al | Element::Cr | Element::Ti
+            | Element::V | Element::Sc | Element::Be
+            | Element::Ni | Element::Cu | Element::Zn
+            | Element::Ga | Element::Ge | Element::As
+            | Element::Se);
+    if donor_passivates && matches!(inferred, InferredProduct::Derived(_)) {
+        rate = 0.002;
+    }
+    // Halide passivation for noble metals — Au/Cu form tight halide
+    // surface layers in real chemistry: AuBr₃, CuBr/CuI form slowly
+    // and coat the parent metal before flaking. Ag is intentionally
+    // excluded — silver halides (AgF, AgCl, AgBr, AgI) are the
+    // famous photographic "flash salts" that form rapidly on
+    // contact, not slow tarnish. Without a cap on Au/Cu, the
+    // metal+halogen contact-reactive rule consumes the metal at
+    // ~0.002 per pair-frame and reads as rapid uniform conversion.
+    // 0.0005 reads as gradual surface tarnish — slower than oxide
+    // passivation because halide bond formation is less thermo-
+    // dynamically favorable than oxide formation on these metals.
+    // Mirror in `coating_halide` in derive_or_lookup so the product
+    // lands as Gravel rather than Powder.
+    let halide_acceptor = matches!(acceptor_el,
+        Element::F | Element::Cl | Element::Br | Element::I);
+    let donor_halide_passivates = halide_acceptor
+        && matches!(donor_el, Element::Au | Element::Cu);
+    if donor_halide_passivates && matches!(inferred, InferredProduct::Derived(_)) {
+        rate = 0.0005;
+    }
+    // Ge halogenation rate floor — once the activation barrier is
+    // crossed, the reaction needs to proceed visibly before the
+    // volatile halogen drifts away. The generic Derived ×0.01
+    // throttle above lands Ge+Br at ~0.0019 per frame, so even
+    // hot Ge in Br vapor would barely form anything before the
+    // vapor diffused out of contact range. 0.35 is fast enough
+    // that a heated Ge cell in adjacent Br/I vapor converts in
+    // a handful of frames, matching real-world hot-halogenation
+    // kinetics. Narrowed to Ge specifically — broader donors
+    // (Si/B/P/S) stay on the slow path until their audit pass
+    // revisits the same issue.
+    if donor_el == Element::Ge
+        && matches!(acceptor_el, Element::F | Element::Cl | Element::Br | Element::I)
+        && matches!(inferred, InferredProduct::Derived(_))
+    {
+        rate = rate.max(0.35);
     }
     // Hyper-reactive alkali donors (Cs EN 0.79; Rb, Fr would land here
     // once added). Real Cs ignites in air and explodes in water — so we
@@ -2214,30 +2523,34 @@ fn try_emergent_reaction(
         // by itself.
         delta_temp = 450;
     }
-    // Mg/Ca + water — tame the heat. The default 400°C alkali-in-water
-    // exotherm is appropriate for Na/K (real Na flash-vaporizes water
-    // contact) but wrong for Mg/Ca (real reaction is gentle fizzing
-    // even at the boil). 80°C keeps the products warm but doesn't
-    // immediately steam-vaporize the surrounding water cells.
+    // Tier metal-water exotherm by donor reactivity to match the real
+    // reactivity series. Mg/Ca barely fizz; Li gentle; Na vigorous;
+    // K/Rb/Cs/Fr violently detonate (clear the 1200°C chem_blast
+    // threshold so the accumulator emits a shockwave). Without this
+    // tiering K-in-water looked just like Na-in-water — a moderate
+    // fizz instead of the iconic ignite-the-H₂ pop K is famous for.
     if matches!(inferred, InferredProduct::Bespoke(Element::H))
-        && matches!(donor_el, Element::Mg | Element::Ca)
         && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
     {
-        delta_temp = 80;
-    }
-    // Cs/Fr + water — boost the heat into detonation territory. The
-    // M + H₂O reaction enthalpy for the heavy alkalis is enough to
-    // self-detonate independent of any subsequent H₂ + O₂ combustion
-    // (which is why a Cs droplet in water explodes even in an oxygen-
-    // free atmosphere). 1500°C clears the 1200°C chemistry-shockwave
-    // threshold so the chem_blast accumulator picks up a real blast
-    // contribution, the water cells flash to hot steam, and the metal
-    // cells become near-vapor H₂.
-    if matches!(inferred, InferredProduct::Bespoke(Element::H))
-        && matches!(donor_el, Element::Cs | Element::Fr)
-        && matches!(acceptor_el, Element::Water | Element::Ice | Element::Steam)
-    {
-        delta_temp = 1500;
+        delta_temp = match donor_el {
+            // Slow tier — gently exothermic. Real Mg/Ca/Mn + water
+            // releases ~50 kJ/mol H₂; with our cell granularity and
+            // the cumulative heat that piles up across hundreds of
+            // reactions, 80°C/event boils the entire pool before
+            // saturation can build at the interface. 15°C is a more
+            // honest per-event warming that lets the simmer be
+            // visible without overheating the pool. The pool will
+            // still slowly approach boil with sustained reaction —
+            // that's correct chemistry — just not racing past it
+            // every reaction.
+            Element::Mg | Element::Ca | Element::Sc | Element::Mn => 15,
+            Element::Li => 400,
+            Element::Na => 700,
+            Element::K  => 1300,
+            Element::Rb => 1400,
+            Element::Cs | Element::Fr => 1500,
+            _ => delta_temp,
+        };
     }
     // Violent tier heat scaling — same predicate as the rate boost above.
     // Scale heat to the EN gap so the released energy crosses the 1200°C
@@ -2265,7 +2578,36 @@ fn try_emergent_reaction(
             Element::Water | Element::Ice | Element::Steam)
         && matches!(inferred, InferredProduct::Bespoke(Element::H));
     let rust_reaction = matches!(inferred, InferredProduct::Bespoke(Element::Rust));
-    let products = if metal_in_water {
+    // Slow-tier hydrolysis donors leave a hydroxide residue in real
+    // life (Mg(OH)₂, Ca(OH)₂, Sc(OH)₃, Mn(OH)₂) — visible white/brown
+    // powder where the metal sat. We approximate with the metal's
+    // derived oxide (closest sim analogue, since hydroxides aren't
+    // modeled). Alkali metals genuinely dissolve into solution so
+    // their cells vanish; the slow tier doesn't.
+    let slow_hydrolysis = matches!(donor_el,
+        Element::Mg | Element::Ca | Element::Sr | Element::Ba | Element::Ra
+        | Element::Sc | Element::Mn);
+    let mut byproduct: Option<Element> = None;
+    let products = if metal_in_water && slow_hydrolysis {
+        // Donor → oxide residue. Acceptor (water) PRESERVED — the
+        // reaction does not consume the solvent. This is a sim
+        // simplification of real chemistry (Mn + 2H₂O → Mn(OH)₂ +
+        // H₂ does consume water), but our cell-granular model
+        // makes 1:1 water consumption gameplay-hostile: every
+        // reaction event destroys a solvent cell, the residue
+        // can never accumulate enough dissolved solute for the
+        // pool to saturate. By preserving water, the residue can
+        // dissolve up to its low-solubility cap (~64) and the user
+        // sees saturation climb. H₂ is still emitted as byproduct;
+        // a probabilistic Steam visual fires at the chemistry-pass
+        // emission point (chemistry-pass-side, see byproduct loop).
+        let residue = match derive_or_lookup(donor_el, Element::O) {
+            Some(id) => ProductSpec::derived(id),
+            None     => ProductSpec::bespoke(donor_el),
+        };
+        byproduct = Some(Element::H);
+        [residue, ProductSpec::bespoke(acceptor_el)]
+    } else if metal_in_water {
         [ProductSpec::bespoke(Element::H), ProductSpec::bespoke(Element::Steam)]
     } else if rust_reaction {
         let acceptor_product = match acceptor_el {
@@ -2278,7 +2620,7 @@ fn try_emergent_reaction(
         [s, s]
     };
 
-    Some(ReactionOutcome { products, delta_temp, rate })
+    Some(ReactionOutcome { products, delta_temp, rate, byproduct })
 }
 
 // ============================================================================
@@ -2315,6 +2657,14 @@ struct DerivedCompound {
     // metal behind. Set to None for salts and other compounds that melt
     // cleanly (e.g. NaCl → molten salt).
     decomposes_above: Option<i16>,
+    // Optional "wet" color for compounds with hydration-dependent
+    // appearance. Real CoCl₂ is the textbook example: anhydrous deep
+    // blue, hydrated pink/magenta. The render path interpolates
+    // between `color` (dry) and `hydration_color` (wet) based on the
+    // cell's moisture. None means no hydration shift — the cell stays
+    // the static `color` regardless of moisture (just gets the
+    // standard wet-darken tint applied uniformly later).
+    hydration_color: Option<(u8, u8, u8)>,
 }
 
 // Process-global derived-compound registry. Two storage tiers:
@@ -2344,6 +2694,7 @@ struct DerivedHot {
     melting_point: i16,
     boiling_point: i16,
     decomposes_above: Option<i16>,
+    hydration_color: Option<(u8, u8, u8)>,
 }
 
 static DERIVED_HOT: [std::sync::OnceLock<DerivedHot>; 256] =
@@ -2359,7 +2710,7 @@ fn derived_hot(idx: u8) -> Option<&'static DerivedHot> {
 fn format_formula(atoms: &[(Element, u8)]) -> String {
     let mut out = String::new();
     for &(el, count) in atoms {
-        let symbol = element_symbol(el);
+        let symbol = el.formula().unwrap_or("?");
         out.push_str(symbol);
         if count > 1 {
             // Unicode subscript digits U+2080..=U+2089.
@@ -2374,21 +2725,38 @@ fn format_formula(atoms: &[(Element, u8)]) -> String {
     out
 }
 
-// Short symbol for an Element. Atoms use their real symbol; everything else
-// uses an abbreviated name. Compounds reuse their symbol for now.
-fn element_symbol(el: Element) -> &'static str {
-    if let Some(a) = atom_profile_for(el) {
-        return a.symbol;
+// Cell-level identity / label helpers. These dispatch over both
+// bespoke Element variants AND derived compounds (Element::Derived
+// with a registry id), so callers don't need to know which case
+// they're in.
+
+// Canonical chemical formula for a cell. Returns the static formula
+// for atoms and known-formula compounds, the registry-stored formula
+// for derived compounds. Atoms always have a formula (the symbol);
+// some bespoke macro-materials (Wood, Lava, etc.) may return None.
+fn cell_formula(c: Cell) -> Option<String> {
+    if c.el == Element::Derived {
+        let reg = DERIVED_COMPOUNDS.read();
+        return reg.get(c.derived_id as usize).map(|d| d.formula.clone());
     }
-    match el {
-        Element::Water => "H₂O",
-        Element::Rust  => "Fe₂O₃",
-        Element::Salt  => "NaCl",
-        Element::Steam => "H₂O",
-        Element::Ice   => "H₂O",
-        Element::Oil   => "CH",
-        _              => "?",
+    c.el.formula().map(|s| s.to_string())
+}
+
+// User-facing label for a cell. Audit-phase format mirrors
+// Element::display_label: "Formula (Common Name)" so the player can
+// distinguish materials of the same compound (Sand vs Glass vs
+// Quartz, all SiO₂). Derived compounds show their formula only (no
+// common name yet — that's what the post-audit discovery system
+// will assign). Compounds without a clean formula fall back to the
+// common name. See display_label for the post-audit refactor TODO.
+fn cell_label(c: Cell) -> String {
+    if c.el == Element::Derived {
+        let reg = DERIVED_COMPOUNDS.read();
+        return reg.get(c.derived_id as usize)
+            .map(|d| d.formula.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
     }
+    c.el.display_label()
 }
 
 // Look up or build a derived compound from a pair of atoms. Returns the
@@ -2492,6 +2860,7 @@ fn alloy_or_lookup(a: Element, b: Element) -> Option<u8> {
             melting_point,
             boiling_point,
             decomposes_above: None,
+            hydration_color: None,
         });
         let new_idx = (reg.len() - 1) as u8;
         // Mirror the hot-read fields into the lock-free cache so
@@ -2500,8 +2869,236 @@ fn alloy_or_lookup(a: Element, b: Element) -> Option<u8> {
         let _ = DERIVED_HOT[new_idx as usize].set(DerivedHot {
             physics, color, melting_point, boiling_point,
             decomposes_above: None,
+            hydration_color: None,
         });
         Some(new_idx)
+    }
+}
+
+// Per-formula color overrides for derived compounds whose averaged
+// constituent colors don't match real-world appearance. Used by
+// derive_or_lookup. Add entries during element audits where a
+// compound's averaged color reads wrong (Sc₂O₃ is real-world pinkish-
+// white, but the average of Sc silver + O cyan comes out plain gray).
+fn bespoke_color_for_formula(formula: &str) -> Option<(u8, u8, u8)> {
+    match formula {
+        "Sc₂O₃" => Some((235, 215, 220)),  // pinkish white
+        "V₂O₅"  => Some((250, 175,  60)),  // yellow-orange (vanadium pentoxide)
+        // Anhydrous cobalt(II) chloride — the iconic deep cobalt
+        // blue (humidity indicator: blue dry → pink hydrated).
+        // The hydrated/wet color comes from the moisture-aware
+        // override below; this is the dry baseline.
+        "CoCl₂" => Some(( 40,  85, 200)),
+        // Copper(I) oxide — sim approximation of the iconic green/
+        // blue copper patina. Real Cu₂O is actually deep red/brown
+        // (cuprite), and the actual patina is a basic copper
+        // carbonate (CuCO₃·Cu(OH)₂) we don't model — but visually
+        // "green oxide on a copper roof or Statue of Liberty" is
+        // what users associate with copper oxide. The bespoke
+        // override skips real-Cu₂O-red and renders the recognizable
+        // patina green directly.
+        "Cu₂O"  => Some(( 90, 165, 130)),
+        // Copper(I) chloride — pale white-yellow when anhydrous;
+        // hydrates and dissolves to the iconic teal/cyan copper
+        // chloride solution color via the moisture-aware override
+        // below. Solution shade pushes more cyan-green than
+        // straight blue so it reads distinct from water's own
+        // blue tint at saturation.
+        "CuCl"  => Some((230, 220, 170)),
+        _ => None,
+    }
+}
+
+// Wet-state color for compounds whose visible appearance shifts with
+// hydration. Real CoCl₂ is the textbook indicator: anhydrous deep
+// blue, hexahydrate (CoCl₂·6H₂O) bright pink/magenta — the basis of
+// every humidity-indicating drying agent. The render path
+// interpolates between the dry `bespoke_color_for_formula` value
+// and this wet color based on the cell's moisture, so dropping a
+// CoCl₂ pile in water visibly shifts the residue and the resulting
+// CoCl₂-saturated water solution toward pink. Returns None for
+// compounds without hydration-driven color change.
+// Per-formula kind override for compounds where the heuristic
+// (Solid+Gas → Powder, etc.) gets the state wrong. Real-world
+// volatile metalloid fluorides (GeF₄, SiF₄, BF₃) are gases at
+// STP, but our averaging gives them a wildly-off bp that fails
+// the < 100°C molecular-gas detection. Returns Some(Kind) to
+// force the kind; None falls through to the heuristic.
+fn bespoke_kind_for_formula(formula: &str) -> Option<Kind> {
+    match formula {
+        // GeF₄: real bp -36°C, gas at STP. Averaging Ge bp 2833 with
+        // F bp -188 gives 1322°C, so "molecular_gas" check fails and
+        // it lands as Powder. Force Gas.
+        "GeF₄" => Some(Kind::Gas),
+        // AsF₅: real bp -53°C, gas at STP. Same averaging issue as
+        // GeF₄. Sim produces +5 oxidation state from valence math
+        // (real-world stable form is AsF₃ but engine isn't variable-
+        // valence) — both AsF₅ and AsF₃ are gases at STP, so the
+        // kind override is correct regardless.
+        "AsF₅" => Some(Kind::Gas),
+        // AsCl₅ (sim formula from As valence 5): real AsCl₅ is unstable
+        // above -50°C, basically doesn't exist. Render as the
+        // textbook +3 form's behavior: AsCl₃ is liquid at STP
+        // (mp -16, bp 130). Treat the sim's AsCl₅ cell as that
+        // liquid for plausibility.
+        "AsCl₅" => Some(Kind::Liquid),
+        // SeF₆: real bp -34°C, gas at STP. Same averaging issue as
+        // GeF₄ / AsF₅ — averaging Se bp 685 with F bp -188 lands well
+        // above ambient and the molecular_gas check fails.
+        "SeF₆" => Some(Kind::Gas),
+        // H₂Se: real bp -41°C, gas at STP. Real toxic chalcogen
+        // hydride, similar to H₂S but heavier. Sim doesn't model
+        // the toxicity — just gets the kind right.
+        "H₂Se" => Some(Kind::Gas),
+        _ => None,
+    }
+}
+
+// Per-formula phase points override. Must be paired with
+// bespoke_kind_for_formula whenever a kind is forced — otherwise the
+// generic phase pass compares cell temp against averaged mp/bp,
+// concludes "this is currently solid", sets PHASE_SOLID, and
+// cell_physics() turns the cell into Gravel regardless of the base
+// Kind. Returns Some((mp, bp)) to override the averaged values.
+fn bespoke_phase_points_for_formula(formula: &str) -> Option<(i16, i16)> {
+    match formula {
+        // GeF₄ real bp -36°C. Both points kept below ambient so the
+        // phase pass agrees with the forced Kind::Gas at room temp.
+        "GeF₄" => Some((-50, -36)),
+        // AsF₅ real bp -53°C, mp -80°C.
+        "AsF₅" => Some((-80, -53)),
+        // AsCl₅ rendered as AsCl₃-equivalent: real AsCl₃ mp -16,
+        // bp 130 — liquid at STP, boils with mild heating.
+        "AsCl₅" => Some((-16, 130)),
+        // As₂O₅: render with sublimation behavior. Real As₂O₃
+        // (white arsenic) sublimes at 193°C; As₂O₅ in sandbox
+        // gameplay reads better as a sublimating volatile oxide
+        // than a refractory powder. bp < mp = same sublimation
+        // pattern As itself uses (bp 614, mp 817).
+        "As₂O₅" => Some((400, 200)),
+        // SeF₆ real bp -34°C, mp -50°C.
+        "SeF₆" => Some((-50, -34)),
+        // H₂Se real bp -41°C, mp -65°C.
+        "H₂Se" => Some((-65, -41)),
+        // SeO₃ — sublimation pattern (bp < mp) for volatile chalcogen
+        // oxide. Real SeO₃ sublimes at 119°C, SeO₂ at 315°C; pick
+        // ~190°C as a plausible midpoint that gives a heat-to-vaporize
+        // gameplay window.
+        "SeO₃" => Some((400, 190)),
+        // SeCl₆ (sim formula): real SeCl₄ sublimes at 191°C, decomposes
+        // at higher temps. Render the sim's +6 product with the +4
+        // form's sublimation behavior — Powder/Gravel coating that
+        // vaporizes when heated past ~190°C.
+        "SeCl₆" => Some((400, 190)),
+        _ => None,
+    }
+}
+
+fn bespoke_hydration_color_for_formula(formula: &str) -> Option<(u8, u8, u8)> {
+    match formula {
+        "CoCl₂" => Some((230,  85, 145)),  // hydrated cobalt-chloride pink
+        // Hydrated/dissolved copper chloride — saturated cyan-teal,
+        // pushed toward green-blue-cyan (vs straight blue) so it
+        // reads distinct from water's own blue tint at solute
+        // saturation. Real CuCl₂·2H₂O crystals and CuCl₂ aqueous
+        // solutions are this same blue-green range.
+        "CuCl"  => Some(( 30, 195, 200)),
+        _ => None,
+    }
+}
+
+// Map a stoichiometric formula string back to the bespoke Element
+// variant that represents it, if any. Used by derive_or_lookup to
+// avoid creating parallel derived entries that would visually and
+// behaviorally diverge from their hand-tuned bespoke twins.
+fn bespoke_for_formula(formula: &str) -> Option<Element> {
+    match formula {
+        "H₂O"   => Some(Element::Water),
+        "NaCl"  => Some(Element::Salt),
+        "Fe₂O₃" => Some(Element::Rust),
+        "CO₂"   => Some(Element::CO2),
+        "SiO₂"  => Some(Element::Sand),
+        _ => None,
+    }
+}
+
+// Per-(donor, acceptor) compound decomposition threshold. Returns None
+// for compounds that are stable across the sim's temp range, Some(°C)
+// for ones that break apart on heating into donor + acceptor atom
+// (Rust-style). Covers oxides AND halides — halide bond strength
+// drops F > Cl > Br > I, so iodides decompose lowest, fluorides
+// essentially never. Alkali halides (NaCl, KBr) and alkaline-earth
+// halides are stable; transition-metal halides decompose into metal
+// + halogen on heating, matching real-world behavior (CrI₃ → CrI₂ +
+// I₂ at 500-600°C; van Arkel-de Boer Ti from TiI₄ at 1400°C; etc.).
+// Stability vs. decomp is chosen for chemistry plausibility AND
+// loop-prevention.
+fn compound_decomposition_threshold(donor: Element, acceptor: Element, melting_point: i16) -> Option<i16> {
+    let donor_is_alkali = matches!(donor,
+        Element::Li | Element::Na | Element::K | Element::Rb
+        | Element::Cs | Element::Fr);
+    let donor_is_alkaline_earth = matches!(donor,
+        Element::Be | Element::Mg | Element::Ca
+        | Element::Sr | Element::Ba | Element::Ra);
+
+    match acceptor {
+        // ---- Oxides ----
+        Element::O => match donor {
+            // Alkali / alkaline-earth oxides — Cs₂O, Na₂O, CaO, MgO, BeO
+            // etc. Don't reduce back to bulk metal at sim temps. Letting
+            // them decompose creates an oxidize-decompose loop with the
+            // alkali metals' fast O reactivity.
+            _ if donor_is_alkali || donor_is_alkaline_earth => None,
+            // Al₂O₃ — most thermodynamically stable oxide; the reason
+            // thermite works. Stable at sim temps.
+            Element::Al => None,
+            // Nonmetal oxides — SO₃, P₂O₅, NO₂, B₂O₃. Stable in sim
+            // temp range. Prevents burning-S → SO₃ → decompose loops.
+            Element::S | Element::P | Element::N | Element::B => None,
+            // As₂O₅: don't decompose back to As. Real arsenic oxides
+            // (As₂O₃ in particular) sublime as the volatile compound
+            // — the cell vaporizes whole, NOT splits into As + O.
+            // Skipping decomp puts the compound on the phase-pass
+            // track instead, where its bespoke phase points
+            // (mp 400, bp 200) drive sublimation at 200°C.
+            Element::As => None,
+            // SeO₃: same sublimation behavior as As₂O₅. Real SeO₃
+            // sublimes at 119°C, real SeO₂ at 315°C — both volatile,
+            // neither decomposes back to elemental Se under normal
+            // conditions. Phase points handle the sublimation.
+            Element::Se => None,
+            // Rust-like decomposing transition-metal oxides. Real-
+            // world decomp temps used as thresholds.
+            Element::Sc => Some(2400),  // Sc₂O₃ ~2485°C
+            Element::Ti => Some(3200),  // TiO₂ decomp >3000°C
+            Element::V  => Some(1800),  // V₂O₅  ~1750°C
+            Element::Cr => Some(2400),  // Cr₂O₃ ~2435°C
+            // Generic metal-oxide fallback. Catches Cu₂O, MnO₂, etc.
+            // without per-donor entries until audit reaches them.
+            _ => Some(melting_point.max(600)),
+        },
+        // ---- Halides ----
+        // Alkali / alkaline-earth halides (NaCl, KBr, MgF₂, CaCl₂)
+        // are very stable in real chemistry — most don't decompose,
+        // they just melt or boil. Skip the decomp path entirely.
+        _ if donor_is_alkali || donor_is_alkaline_earth => None,
+        // M-F bonds are too strong for sim-reachable decomp.
+        Element::F => None,
+        // Volatile non-metal halides (SeCl₆ rendered as SeCl₄-like)
+        // sublimate as the whole compound, like the chalcogen oxides.
+        // Don't decompose back to the constituents — the bespoke
+        // phase points drive sublimation at ~190°C instead.
+        _ if donor == Element::Se => None,
+        // Transition / post-transition metal Cl / Br / I — decompose
+        // at halide-specific thresholds. Heavier halogens go lower
+        // because the M-X bond is weaker. These thresholds are coarse
+        // (one number per halogen, not per metal) — the sim doesn't
+        // model stepwise oxidation states (CrI₃ vs CrI₂), just the
+        // end-state metal + halogen split.
+        Element::Cl => Some(1500),
+        Element::Br => Some(800),
+        Element::I  => Some(500),
+        _ => None,
     }
 }
 
@@ -2532,6 +3129,15 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         (acceptor, acceptor_count),
     ];
     let formula = format_formula(&constituents);
+
+    // Bespoke compounds win — if this formula already has a hand-tuned
+    // Element variant (Water = H₂O, Sand = SiO₂, Salt = NaCl, Rust =
+    // Fe₂O₃, CO2 = CO₂), refuse to create a duplicate derived entry.
+    // Forces all callers to either map through infer_product's bespoke
+    // table or get None back. Keeps compound identity unified.
+    if bespoke_for_formula(&formula).is_some() {
+        return None;
+    }
 
     {
         let mut reg = DERIVED_COMPOUNDS.write();
@@ -2568,7 +3174,11 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
             let b_mix = mix(donor_color.2, donor_count, acceptor_color.2, acceptor_count);
             (r_mix, g_mix, b_mix)
         };
-        let color = (r_mix, g_mix, b_mix);
+        // Per-formula color overrides for compounds whose averaged
+        // constituent colors don't match real-world appearance. Adds
+        // up as needed during the audit pass.
+        let color = bespoke_color_for_formula(&formula)
+            .unwrap_or((r_mix, g_mix, b_mix));
         // Kind heuristic. Earlier version used STP-state of the
         // constituents only — H (gas) + Br (liquid) hit (Gas, _)
         // → Powder, even though HBr is a textbook gas. Augment with
@@ -2578,7 +3188,10 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         let avg_mp_pre = (da.melting_point as i32 + aa.melting_point as i32) / 2;
         let avg_bp_pre = (da.boiling_point as i32 + aa.boiling_point as i32) / 2;
         let molecular_gas = avg_bp_pre < 100;
-        let kind = if molecular_gas {
+        // Per-formula kind override takes priority over the heuristic.
+        let kind = if let Some(forced) = bespoke_kind_for_formula(&formula) {
+            forced
+        } else if molecular_gas {
             Kind::Gas
         } else {
             // Ionic salts and oxides — anything pairing a solid metal
@@ -2594,16 +3207,36 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
             let anion_acceptor = matches!(acceptor,
                 Element::F | Element::Cl | Element::Br | Element::I
                 | Element::O | Element::S | Element::N | Element::P);
-            // Tight passivating oxides — Al₂O₃, Cr₂O₃ — form coherent
-            // cohesive coatings that don't flake. They're the real-
-            // world textbook examples of self-protecting layers; we
-            // model that by keeping them as Gravel (rigid) instead
-            // of the default Powder for ionic salts.
+            // Tight passivating oxides — Al₂O₃, Cr₂O₃, TiO₂, V₂O₅,
+            // Sc₂O₃ — form coherent cohesive coatings that don't flake.
+            // Real-world textbook examples of self-protecting layers
+            // (V₂O₅ is why V is corrosion-resistant despite EN
+            // suggesting it should oxidize easily; Sc₂O₃ is similar
+            // for rare-earth-adjacent metals); modeled by keeping
+            // them as Gravel (rigid) instead of the default Powder
+            // for ionic salts.
             let coating_oxide = acceptor == Element::O
-                && matches!(donor, Element::Al | Element::Cr);
+                && matches!(donor,
+                    Element::Al | Element::Cr | Element::Ti
+                    | Element::V | Element::Sc | Element::Be
+                    | Element::Ni | Element::Cu | Element::Zn
+                    | Element::Ga | Element::Ge | Element::As
+                    | Element::Se);
+            // Noble metal halide coating — Au, Cu form tight
+            // halide surface layers (CuI/CuBr, AuBr₃) that read
+            // as cohesive tarnish, not flaky powder. Ag is
+            // excluded — silver halides are the photographic
+            // flash salts and should remain Powder (rapid
+            // formation, granular). Mirrors the rate cap in
+            // try_emergent_reaction's donor_halide_passivates list.
+            let coating_halide = matches!(acceptor,
+                    Element::F | Element::Cl | Element::Br | Element::I)
+                && matches!(donor,
+                    Element::Au | Element::Cu);
             match (da.stp_state, aa.stp_state) {
                 (AtomState::Gas, AtomState::Gas) => Kind::Gas,
                 (AtomState::Solid, _) if coating_oxide => Kind::Gravel,
+                (AtomState::Solid, _) if coating_halide => Kind::Gravel,
                 (AtomState::Solid, _) if anion_acceptor => Kind::Powder,
                 (AtomState::Solid, _)            => Kind::Gravel,
                 (AtomState::Liquid, _)           => Kind::Liquid,
@@ -2676,64 +3309,53 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
         let avg_bp = avg_bp_pre;
         let gas_gas = da.stp_state == AtomState::Gas
             && aa.stp_state == AtomState::Gas;
-        // Refractory oxides (Al₂O₃ ~2072°C, MgO ~2852°C) shouldn't be
-        // molten at typical reaction temperatures. The averaging
-        // heuristic underestimates them severely.
-        let oxide_mp_floor: i32 = if acceptor == Element::O
-            && matches!(donor, Element::Al | Element::Mg)
-        {
-            2000
-        } else {
-            500
-        };
+        // Refractory metal oxides — strong ionic bonding gives them very
+        // high mp AND bp (Sc₂O₃ mp 2485 / bp 3900, Cr₂O₃ mp 2435 / bp
+        // 4000, Al₂O₃ mp 2072 / bp 3000, MgO mp 2852 / bp 3600, V₂O₅
+        // mp 690 / decomposes ~1750). The averaging heuristic
+        // underestimates both severely. The bp floor matters as much
+        // as the mp floor: if bp lands below the decomposition
+        // threshold set further down, heating the oxide boils it into
+        // a gas before it can decompose back to its constituents
+        // (Sc₂O₃ would gas at 1500°C instead of decomposing at
+        // 2400°C, killing the oxide-coating illusion).
+        let refractory_oxide = acceptor == Element::O
+            && matches!(donor,
+                Element::Al | Element::Mg | Element::Be
+                | Element::Sc | Element::Ti | Element::V | Element::Cr);
+        let oxide_mp_floor: i32 = if refractory_oxide { 2000 } else { 500 };
+        let oxide_bp_floor: i32 = if refractory_oxide { 3500 } else { 1500 };
         // Molecular gases (HCl/HBr/HI/H₂S/NH₃/etc.) keep their real
         // sub-zero boiling points — flooring them to 1500 °C would
         // wrongly hold them solid up through any reasonable temp.
         let (melting_point, boiling_point) = if gas_gas || molecular_gas {
             (avg_mp as i16, avg_bp as i16)
         } else {
-            (avg_mp.max(oxide_mp_floor) as i16, avg_bp.max(1500) as i16)
+            (avg_mp.max(oxide_mp_floor) as i16, avg_bp.max(oxide_bp_floor) as i16)
         };
-        // Oxides break apart rather than melting to a liquid. Cu₂O, Fe-type
-        // oxides, transition-metal oxides generally decompose on heating and
-        // release their oxygen. A molten Cu₂O isn't a thing — you get molten
-        // Cu + O₂ gas. Same rule for any compound where the acceptor is
-        // elemental oxygen. Other compounds (halides, salts) fall through to
-        // normal melt/boil behavior. Gas-gas oxides (NO, etc.) have very
-        // low "melting points" from the averaging, so decomposition there
-        // would trigger at cryogenic temps — they're stable gases, not
-        // oxides that break down.
-        // Decomposition: oxides of transition/post-transition metals do
-        // break apart on heating (Cu₂O → Cu + O₂, Fe₂O₃ → Fe + O₂). But
-        // alkali and alkaline-earth metal oxides are very stable — real
-        // Cs₂O doesn't reduce back to Cs + O at combustion temperatures.
-        // Letting it decompose creates a feedback loop (oxidize → decompose
-        // → oxidize → …) that runs the sim into the ground in seconds.
-        let donor_is_reactive_metal = atom_profile_for(donor)
-            .map(|a| matches!(a.category,
-                AtomCategory::AlkaliMetal | AtomCategory::AlkalineEarth))
-            .unwrap_or(false);
-        // Refractory metal oxides (Al₂O₃, MgO) are among the most
-        // thermodynamically stable oxides — they don't decompose at any
-        // temperature reachable in the sim. That's the reason thermite
-        // works: Al pulls O off Fe₂O₃ specifically because Al₂O₃ is a
-        // much deeper energy well than Fe₂O₃. MgO is similarly stable.
-        // Without these exceptions, the auto-derived 600°C decomp
-        // threshold makes the products instantly dissociate back to
-        // their constituent metals, killing the cascade.
-        let donor_makes_stable_oxide = donor_is_reactive_metal
-            || matches!(donor, Element::Al | Element::Mg);
-        let decomposes_above = if acceptor == Element::O && !gas_gas
-            && !donor_makes_stable_oxide
-        {
-            // Floor the threshold: averaged MP of a metal + O often comes
-            // out unphysically low (Cs: 28, O: -218 averages negative).
-            // Real oxide decomposition happens at least in the high
-            // hundreds of °C — 600 is a conservative floor.
-            Some(melting_point.max(600))
+        // Per-formula phase-point override — paired with the
+        // bespoke kind override above. Volatile metalloid fluorides
+        // (GeF₄ etc.) need explicit sub-ambient mp/bp so the phase
+        // pass doesn't classify them as currently-solid and force
+        // PHASE_SOLID, which would override the forced Kind::Gas
+        // back to Gravel.
+        let (melting_point, boiling_point) =
+            if let Some((mp, bp)) = bespoke_phase_points_for_formula(&formula) {
+                (mp, bp)
+            } else {
+                (melting_point, boiling_point)
+            };
+        // Compound decomposition policy lives in
+        // compound_decomposition_threshold — covers oxides and halides
+        // uniformly. Gas-gas products (NO, SO₂ from gas reactants)
+        // skip decomp because their averaged "melting point" is below
+        // ambient and would trigger spurious decomposition.
+        let decomposes_above = if !gas_gas {
+            compound_decomposition_threshold(donor, acceptor, melting_point)
         } else {
             None
         };
+        let hydration_color = bespoke_hydration_color_for_formula(&formula);
         reg.push(DerivedCompound {
             formula,
             constituents,
@@ -2742,10 +3364,12 @@ fn derive_or_lookup(donor: Element, acceptor: Element) -> Option<u8> {
             melting_point,
             boiling_point,
             decomposes_above,
+            hydration_color,
         });
         let new_idx = (reg.len() - 1) as u8;
         let _ = DERIVED_HOT[new_idx as usize].set(DerivedHot {
             physics, color, melting_point, boiling_point, decomposes_above,
+            hydration_color,
         });
         Some(new_idx)
     }
@@ -2810,6 +3434,26 @@ fn derived_is_soluble_salt(idx: u8) -> bool {
         }
     }
     has_metal && has_halogen
+}
+
+// Slow-hydrolysis residues — oxides of Mg/Ca/Sr/Ba/Ra/Sc/Mn formed when
+// these metals react with water (donor cell → oxide, water cell → H₂).
+// Their real-world hydroxides Mg(OH)₂/Ca(OH)₂/etc. have slight water
+// solubility, so the residue cells slowly dissolve into adjacent water
+// as solute. Once water saturates (solute_amt ≥ ABSORB_THRESHOLD in
+// dissolve()), fresh residue stops dissolving and piles up — matches
+// real saturation kinetics. Without this, the residue layer at the
+// metal-water interface permanently shells over fresh metal and the
+// reaction stops; with it, the layer cycles through form → dissolve →
+// expose-fresh-metal → repeat.
+fn derived_is_hydrolysis_residue(idx: u8) -> bool {
+    let reg = DERIVED_COMPOUNDS.read();
+    let Some(c) = reg.get(idx as usize) else { return false; };
+    let has_o = c.constituents.iter().any(|&(el, _)| el == Element::O);
+    let slow_donor = c.constituents.iter().any(|&(el, _)| matches!(el,
+        Element::Mg | Element::Ca | Element::Sr | Element::Ba | Element::Ra
+        | Element::Sc | Element::Mn));
+    has_o && slow_donor
 }
 
 // Map an atom (by index into ATOMS) to its corresponding paintable Element.
@@ -2924,7 +3568,8 @@ fn atom_profile_for(el: Element) -> Option<&'static AtomProfile> {
         Element::Ne => 10,
         Element::Na => 11,  Element::Mg => 12,  Element::Al => 13,
         Element::Si => 14,  Element::P  => 15,  Element::S  => 16,
-        Element::Cl => 17,  Element::K  => 19,  Element::Ca => 20,
+        Element::Cl => 17,  Element::Ar => 18,
+        Element::K  => 19,  Element::Ca => 20,
         Element::Fe => 26,  Element::Cu => 29,  Element::Au => 79,
         Element::Hg => 80,  Element::U  => 92,
         Element::B  => 5,
@@ -3067,14 +3712,25 @@ fn element_phase_points(cell: Cell) -> Option<(i16, i16, AtomState)> {
         Element::Derived => {
             // Hot-path lookup: physics + mp/bp all live in the
             // lock-free hot cache.
-            derived_hot(cell.derived_id).map(|h| {
-                let stp_state = match h.physics.kind {
-                    Kind::Gas | Kind::Fire => AtomState::Gas,
-                    Kind::Liquid => AtomState::Liquid,
-                    _ => AtomState::Solid,
-                };
-                (h.melting_point, h.boiling_point, stp_state)
-            })
+            let h = derived_hot(cell.derived_id)?;
+            // Decomposable derived oxides (Sc₂O₃, V₂O₅, Cr₂O₃, Cu₂O, …)
+            // behave like bespoke Rust: they don't melt or vaporize into
+            // a liquid/gas of themselves. They sit there until the
+            // decomposition pass breaks them into donor metal + O at
+            // their threshold. Returning None here pulls them out of
+            // the generic phase-transition system entirely, which
+            // otherwise would convert hot oxide → gas → condense-back-
+            // to-oxide and read as a phase cycle instead of a real
+            // decomp. Bespoke Rust avoids this implicitly because it's
+            // not in the phase-points table; derived oxides need the
+            // same exclusion explicitly.
+            if h.decomposes_above.is_some() { return None; }
+            let stp_state = match h.physics.kind {
+                Kind::Gas | Kind::Fire => AtomState::Gas,
+                Kind::Liquid => AtomState::Liquid,
+                _ => AtomState::Solid,
+            };
+            Some((h.melting_point, h.boiling_point, stp_state))
         }
         _ => None,
     }
@@ -3095,7 +3751,7 @@ fn flame_color(el: Element) -> Option<(u8, u8, u8)> {
         Element::Cu   => Some((80, 255, 110)),  // emerald green
         Element::Na   => Some((255, 220, 80)),  // bright yellow
         Element::K    => Some((220, 130, 230)), // lilac/violet
-        Element::Ca   => Some((255, 140, 60)),  // orange-red (brick)
+        Element::Ca   => Some((235,  80,  70)),  // brick-red
         Element::Mg   => Some((255, 255, 255)), // brilliant white
         Element::B    => Some((130, 220, 100)), // bright green
         Element::Salt => Some((255, 220, 80)),  // NaCl → Na yellow
@@ -3103,6 +3759,10 @@ fn flame_color(el: Element) -> Option<(u8, u8, u8)> {
         Element::Rb   => Some((200,  80, 140)), // red-violet
         Element::Cs   => Some((130,  90, 220)), // blue-violet
         Element::Fr   => Some((150, 110, 240)), // extrapolated, bluer
+        Element::S    => Some(( 80, 160, 255)), // sky-blue (iconic SO₂ flame)
+        Element::Se   => Some(( 80, 140, 255)), // azure (Se burns vivid blue)
+        Element::Ti   => Some((250, 245, 230)), // white-hot incandescence
+        Element::Be   => Some((245, 250, 255)), // dazzling white-blue (Be flame)
         _ => None,
     }
 }
@@ -3202,6 +3862,65 @@ impl Element {
     #[inline] fn moisture(self) -> &'static MoistureProfile { &MOISTURE[self as usize] }
     #[inline] fn pressure_p(self) -> &'static PressureProfile { &PRESSURE[self as usize] }
     #[inline] fn electrical(self) -> &'static ElectricalProfile { &ELECTRICAL[self as usize] }
+
+    // Canonical chemical formula. This is the IDENTITY of a compound.
+    // Atoms return their atomic symbol; known-formula compounds return
+    // their formula string (e.g., Water → "H₂O", Sand → "SiO₂").
+    // Compounds without a clean formula (Wood, Lava, mixtures, etc.)
+    // return None — they're treated as named macro-materials rather
+    // than discrete chemical species.
+    fn formula(self) -> Option<&'static str> {
+        if let Some(a) = atom_profile_for(self) {
+            return Some(a.symbol);
+        }
+        match self {
+            Element::Water | Element::Steam | Element::Ice => Some("H₂O"),
+            Element::Sand | Element::Glass | Element::MoltenGlass
+                | Element::Quartz | Element::Obsidian => Some("SiO₂"),
+            Element::Salt   => Some("NaCl"),
+            Element::Rust   => Some("Fe₂O₃"),
+            Element::CO2    => Some("CO₂"),
+            Element::Oil    => Some("CₙHₙ₊₂"),  // generic alkane mixture
+            Element::Firebrick => Some("Al₂O₃·SiO₂"),  // refractory mix
+            _ => None,
+        }
+    }
+
+    // English common name. Same string the periodic-table palette uses
+    // for atoms, and the sandbox material name for compounds. Distinct
+    // from formula() so the future discovery system can swap which one
+    // gets shown to the player without renaming any internal data.
+    #[inline] fn common_name(self) -> &'static str { self.name() }
+
+    // User-facing display label.
+    //
+    // Audit-phase format: "Formula (Common Name)" so the player can
+    // see at a glance which material is which while we work through
+    // periodic-table tuning. Atoms render as "H (Hydrogen)", bespoke
+    // compounds as "H₂O (Water)", "SiO₂ (Sand)". Compounds without a
+    // clean formula fall back to common name only ("Wood", "Lava").
+    //
+    // POST-AUDIT TODO: split Element into separate Atom and Material
+    // enums + a first-class Compound registry keyed by formula. Then
+    // wire the discovery system: encountering a compound (any of its
+    // materials) reveals the compound entry with common name + fun
+    // facts via a modal. After discovery, this label collapses to
+    // just the common name (with user-overrideable). See also
+    // bespoke_for_formula and cell_label below — those are the seams
+    // where compound-level identity already operates.
+    fn display_label(self) -> String {
+        match self.formula() {
+            Some(f) => {
+                let cn = self.common_name();
+                if cn == f {
+                    f.to_string()
+                } else {
+                    format!("{} ({})", f, cn)
+                }
+            }
+            None => self.common_name().to_string(),
+        }
+    }
 
     fn base_color(self) -> (u8, u8, u8) {
         match self {
@@ -4197,23 +4916,43 @@ impl World {
     }
 
     // Is there oxygen reachable to a cell at (x, y)? Explicit O in the
-    // 3×3 neighborhood always counts; otherwise roll the ambient-oxygen
-    // fraction to see if the air provides one. Returns the "oxygen
-    // pressure" (0.0-1.0+) — explicit O gives 1.0, air gives
-    // ambient_oxygen, and pure-O₂ enriched worlds can exceed 1.0.
+    // 3×3 neighborhood always counts (returns 1.0+); otherwise the
+    // ambient atmosphere can supply O — but only if there's actual
+    // air contact (an Empty cell in 3×3). Cells fully surrounded by
+    // water/stone/etc. are sealed off from the atmosphere and get 0.
+    // This is what makes white-P storage under water actually work
+    // (submerged P sees no O₂ → ignite gate fails) and prevents
+    // cell-deep buried materials from spontaneously combusting.
     fn oxygen_available(&self, x: i32, y: i32) -> f32 {
+        let mut has_air = false;
         for dy in -1..=1i32 {
             for dx in -1..=1i32 {
                 if dx == 0 && dy == 0 { continue; }
                 let nx = x + dx;
                 let ny = y + dy;
                 if !Self::in_bounds(nx, ny) { continue; }
-                if self.cells[Self::idx(nx, ny)].el == Element::O {
+                let n = self.cells[Self::idx(nx, ny)].el;
+                if n == Element::O {
                     return 1.0f32.max(self.ambient_oxygen);
+                }
+                if n == Element::Empty {
+                    has_air = true;
                 }
             }
         }
-        self.ambient_oxygen
+        if has_air {
+            self.ambient_oxygen
+        } else {
+            // Buried — interior O₂ scales by the cell's own
+            // air_permeability (porosity when packed against itself).
+            // Loose materials (leaves, gunpowder) still get most of
+            // the ambient supply; dense ones (wood interior, P, oil)
+            // get little or none. Matches "leaves pile burns through
+            // fast, log chars from the outside in".
+            let porosity = self.cells[Self::idx(x, y)]
+                .el.thermal().air_permeability;
+            self.ambient_oxygen * porosity
+        }
     }
 
     // Static weight contribution of an element to hydrostatic pressure. Solids
@@ -4647,7 +5386,13 @@ impl World {
         // (grows outward), 30% slough off as a loose powder that gravity
         // settles into a pile beneath — exactly what happens in dirty
         // real-world electroplating.
-        const PLATE_P: f32 = 0.015;
+        // 0.003 (down from 0.015) — plating per cathode-cell per
+        // adjacent-brine per frame compounds across the whole electrode
+        // surface, so even small per-frame odds build up to fast visible
+        // deposition. Real electroplating is gradual (a clean layer in
+        // minutes, not seconds); 1/5 the prior rate slows the visible
+        // build to match.
+        const PLATE_P: f32 = 0.001;
         const ADHERENT_FRAC: f32 = 0.70;
         for i in 0..self.cells.len() {
             if !self.cathode_mask[i] { continue; }
@@ -4790,6 +5535,17 @@ impl World {
         // Scale tuned so V=100 puts Fe (cond 0.4) at a few °C per frame
         // gain — visible glow over seconds without instantly vaporizing.
         const K: f32 = 0.00005;
+        // Galvanic cells are real-world weak current sources — a Cu/Zn
+        // cell pushes ~tens of mA, not the amps a paint-on battery
+        // does. Without limiting, V² × resistance heats brine fast
+        // enough to boil the electrolyte in seconds (especially for
+        // wider EN gaps like Zn/Au at 71V). Real galvanic experiments
+        // run for hours on the same beaker without warming visibly.
+        // Scale heating by 0.05× when galvanic is the active source so
+        // the brine survives long enough to plate / show solute tints
+        // without boiling away.
+        let galvanic_mode = self.galvanic_voltage > 0.0;
+        let mode_factor: f32 = if galvanic_mode { 0.05 } else { 1.0 };
         for i in 0..self.cells.len() {
             if !self.energized[i] { continue; }
             let c = self.cells[i];
@@ -4801,7 +5557,7 @@ impl World {
             let gas_like = c.el.electrical().glow_color.is_some();
             let resistance = (1.0 - cond).max(0.0);
             let factor = if gas_like { 0.1 } else { 1.0 };
-            let delta = v2 * resistance * K * factor;
+            let delta = v2 * resistance * K * factor * mode_factor;
             if delta < 0.01 { continue; }
             // Stochastic rounding: integer temps truncate small gains,
             // so a 0.8°C/frame climb on a good conductor (Ag σ0.98 at
@@ -4844,25 +5600,41 @@ impl World {
         self.active_emf = 0.0;
         self.galvanic_cathode_el = None;
         self.galvanic_anode_el = None;
-        // Seed lists.
-        let mut pos_seeds: Vec<(i32, i32)> = Vec::new();
-        let mut neg_seeds: Vec<(i32, i32)> = Vec::new();
+        // Seed lists. Battery and galvanic seeds are tracked separately
+        // so the two circuit types verify and energize independently —
+        // a battery prefab in one chamber won't poison the galvanic
+        // detection in another chamber, and vice versa.
+        let mut batt_pos: Vec<(i32, i32)> = Vec::new();
+        let mut batt_neg: Vec<(i32, i32)> = Vec::new();
         for i in 0..self.cells.len() {
             match self.cells[i].el {
-                Element::BattPos => pos_seeds.push(((i % W) as i32, (i / W) as i32)),
-                Element::BattNeg => neg_seeds.push(((i % W) as i32, (i / W) as i32)),
+                Element::BattPos => batt_pos.push(((i % W) as i32, (i / W) as i32)),
+                Element::BattNeg => batt_neg.push(((i % W) as i32, (i / W) as i32)),
                 _ => {}
             }
         }
-        // Galvanic cell detection — only if there's no explicit battery. Two
-        // distinct metals touching the same electrolyte drive a flood from
-        // the more-reactive (lowest EN → anode / BattNeg) to the less-
-        // reactive (highest EN → cathode / BattPos). Voltage scales with the
-        // EN gap so Cu/Zn-ish pairs give ~1V while Cu/Na-ish pairs give more.
-        if pos_seeds.is_empty() && neg_seeds.is_empty() {
+        // Galvanic seeds are produced inside the galvanic block below.
+        // Default empty so we can fall through if galvanic doesn't fire.
+        let mut galvanic_seeds: (Vec<(i32, i32)>, Vec<(i32, i32)>) = (Vec::new(), Vec::new());
+        // Galvanic cell detection. Two distinct metals touching the same
+        // electrolyte drive a flood from the more-reactive (lowest EN →
+        // anode / BattNeg) to the less-reactive (highest EN → cathode /
+        // BattPos). Voltage scales with the EN gap so Cu/Zn-ish pairs
+        // give ~1V while Cu/Na-ish pairs give more.
+        //
+        // Closed-loop check runs ONLY against galvanic seeds, not any
+        // battery seeds that may be elsewhere on the grid. Without
+        // this isolation, a battery prefab's seeds would mix with the
+        // galvanic seeds in the same BFS check and a wonky battery
+        // loop could fail-then-reset galvanic_voltage even though
+        // the galvanic circuit is fine on its own. The two circuit
+        // types must verify themselves independently.
+        if galvanic_possible {
             // (element, (x, y), electronegativity). Any metal cell — loose
             // paint or a frozen wire — with a brine neighbor qualifies.
             let mut candidates: Vec<(Element, (i32, i32), f32)> = Vec::new();
+            let n = W * H;
+            let mut candidate_at: Vec<Option<usize>> = vec![None; n];
             for i in 0..self.cells.len() {
                 let c = self.cells[i];
                 if !is_atomic_metal(c.el) { continue; }
@@ -4873,94 +5645,122 @@ impl World {
                     let nx = x + dx;
                     let ny = y + dy;
                     if !Self::in_bounds(nx, ny) { continue; }
-                    let n = self.cells[Self::idx(nx, ny)];
-                    if n.el == Element::Water && n.solute_amt > 20 {
+                    let nidx = Self::idx(nx, ny);
+                    let nn = self.cells[nidx];
+                    if nn.el == Element::Water && nn.solute_amt > 20 {
                         on_brine = true;
                         break;
                     }
                 }
                 if !on_brine { continue; }
                 let en = atom_profile_for(c.el).map(|a| a.electronegativity).unwrap_or(0.0);
+                candidate_at[i] = Some(candidates.len());
                 candidates.push((c.el, (x, y), en));
             }
-            if candidates.len() >= 2 {
-                let lo = candidates.iter().map(|c| c.2).fold(f32::INFINITY, f32::min);
-                let hi = candidates.iter().map(|c| c.2).fold(f32::NEG_INFINITY, f32::max);
-                let gap = hi - lo;
-                // Need at least two distinct metals (different EN) — same
-                // metal on both sides is not a galvanic cell.
-                if gap > 0.05 {
-                    let mut cathode_el: Option<Element> = None;
-                    let mut anode_el: Option<Element> = None;
-                    for &(el, (x, y), en) in &candidates {
-                        if (en - lo).abs() < 1e-3 {
-                            neg_seeds.push((x, y));
-                            anode_el = Some(el);
-                        }
-                        if (en - hi).abs() < 1e-3 {
-                            pos_seeds.push((x, y));
-                            cathode_el = Some(el);
-                        }
-                    }
-                    // Scale EN gap (Pauling units, typically 0.2–2.0) into a
-                    // usable voltage. Cap to avoid melting wires the instant
-                    // Na/Au touches brine.
-                    self.galvanic_voltage = (gap * 80.0).clamp(10.0, 250.0);
-                    self.galvanic_cathode_el = cathode_el;
-                    self.galvanic_anode_el = anode_el;
-                }
-            }
-            // Verify a closed loop actually exists. The brine already
-            // connects anode and cathode *internally* (that's the ion
-            // half of the cell), but current can't flow without an
-            // EXTERNAL conductor path too. Flood from pos_seeds through
-            // non-water conductors only; if it doesn't reach any neg_seed,
-            // the circuit is open — kill the galvanic emf and bail so
-            // stray wires dangling off one rod don't glow.
-            if !pos_seeds.is_empty() && !neg_seeds.is_empty() {
-                let n = W * H;
-                let mut reach = vec![false; n];
+            // Per-connected-component galvanic evaluation. Candidates in
+            // separate electrolyte pools (e.g. galvanic cell in one
+            // chamber, battery prefab metals in another) are physically
+            // unconnected — their EN values must NOT be compared as
+            // potential electrode pairs. The previous global-min/max
+            // approach silently mixed metals across chambers, producing
+            // phantom electrode pairs that then failed the closed-loop
+            // check and reset galvanic_voltage to 0. By BFS-walking
+            // each connected component (external conductor path only,
+            // skipping brine) and evaluating min/max EN within each,
+            // unrelated chambers can't contaminate each other.
+            let mut gal_pos: Vec<(i32, i32)> = Vec::new();
+            let mut gal_neg: Vec<(i32, i32)> = Vec::new();
+            let mut best_gap: f32 = 0.0;
+            let mut visited_global = vec![false; n];
+            for start_idx in 0..candidates.len() {
+                let (_, start_pos, _) = candidates[start_idx];
+                let start_cell_idx = Self::idx(start_pos.0, start_pos.1);
+                if visited_global[start_cell_idx] { continue; }
+                // BFS the connected component reachable from this
+                // candidate via external conductors (skip Water).
+                // Collect any candidates encountered in the component.
+                let mut comp_candidates: Vec<usize> = Vec::new();
                 self.energized_queue.clear();
-                for &(x, y) in &pos_seeds {
-                    reach[Self::idx(x, y)] = true;
-                    self.energized_queue.push((x, y));
-                }
+                visited_global[start_cell_idx] = true;
+                self.energized_queue.push(start_pos);
                 while let Some((cx, cy)) = self.energized_queue.pop() {
+                    let here_idx = Self::idx(cx, cy);
+                    if let Some(ci) = candidate_at[here_idx] {
+                        comp_candidates.push(ci);
+                    }
                     for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
                         let nx = cx + dx;
                         let ny = cy + dy;
                         if !Self::in_bounds(nx, ny) { continue; }
                         let ni = Self::idx(nx, ny);
-                        if reach[ni] { continue; }
+                        if visited_global[ni] { continue; }
                         let nc = self.cells[ni];
-                        // Water (brine) is the *internal* path — skip.
                         if nc.el == Element::Water { continue; }
                         if nc.conductivity() > 0.02
                             || nc.el.electrical().glow_color.is_some()
                         {
-                            reach[ni] = true;
+                            visited_global[ni] = true;
                             self.energized_queue.push((nx, ny));
                         }
                     }
                 }
-                let closed = neg_seeds
-                    .iter()
-                    .any(|&(x, y)| reach[Self::idx(x, y)]);
-                if !closed {
-                    self.galvanic_voltage = 0.0;
-                    return;
+                if comp_candidates.len() < 2 { continue; }
+                // Min/max EN within this component only.
+                let lo = comp_candidates.iter()
+                    .map(|&i| candidates[i].2)
+                    .fold(f32::INFINITY, f32::min);
+                let hi = comp_candidates.iter()
+                    .map(|&i| candidates[i].2)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let gap = hi - lo;
+                if gap <= 0.05 { continue; }
+                if gap <= best_gap { continue; }
+                // This component beats the current best — adopt its
+                // electrodes as the active galvanic pair.
+                best_gap = gap;
+                gal_pos.clear();
+                gal_neg.clear();
+                let mut cathode_el: Option<Element> = None;
+                let mut anode_el: Option<Element> = None;
+                for &ci in &comp_candidates {
+                    let (el, pos, en) = candidates[ci];
+                    if (en - lo).abs() < 1e-3 {
+                        gal_neg.push(pos);
+                        anode_el = Some(el);
+                    }
+                    if (en - hi).abs() < 1e-3 {
+                        gal_pos.push(pos);
+                        cathode_el = Some(el);
+                    }
                 }
+                self.galvanic_cathode_el = cathode_el;
+                self.galvanic_anode_el = anode_el;
             }
+            if best_gap > 0.0 {
+                // Scale EN gap (Pauling units, typically 0.2–2.0) into a
+                // usable voltage. Cap to avoid melting wires the instant
+                // Na/Au touches brine.
+                self.galvanic_voltage = (best_gap * 80.0).clamp(10.0, 250.0);
+            }
+            galvanic_seeds = (gal_pos, gal_neg);
         }
-        if pos_seeds.is_empty() || neg_seeds.is_empty() { return; }
-        // At this point seeds exist on both sides, so a circuit is possible.
-        // If galvanic seeded them, it already set galvanic_voltage; otherwise
-        // this is a battery circuit and the slider value applies.
-        self.active_emf = if self.galvanic_voltage > 0.0 {
-            self.galvanic_voltage
+        // Pick the active circuit source. Galvanic wins if it has a
+        // verified closed loop (galvanic_voltage > 0); otherwise the
+        // battery (if present) drives. Battery and galvanic don't
+        // combine — a battery prefab in one chamber doesn't bleed
+        // current into a galvanic cell in another, and vice versa.
+        // (Future: per-circuit isolated passes for both to coexist
+        // independently. For now, single active source.)
+        let (pos_seeds, neg_seeds) = if self.galvanic_voltage > 0.0 {
+            self.active_emf = self.galvanic_voltage;
+            galvanic_seeds
+        } else if !batt_pos.is_empty() && !batt_neg.is_empty() {
+            self.active_emf = self.battery_voltage;
+            (batt_pos, batt_neg)
         } else {
-            self.battery_voltage
+            return;
         };
+        if pos_seeds.is_empty() || neg_seeds.is_empty() { return; }
         // Reusable buffers — reuse self.wind_exposed-style storage to
         // avoid two more big Vec allocations. We allocate them lazily
         // here as local buffers since they're only needed for this pass.
@@ -5145,7 +5945,7 @@ impl World {
 
     pub fn step(&mut self, wind: Vec2) {
         self.frame = self.frame.wrapping_add(1);
-        // Clear only the per-frame "updated" bit; preserve FROZEN.
+        // Clear per-frame UPDATED bit; preserve FROZEN + phase.
         for c in self.cells.iter_mut() { c.flag &= !Cell::FLAG_UPDATED; }
         // Refresh per-element presence so each system can gate on
         // "is my required element on the grid" before scanning.
@@ -5358,6 +6158,37 @@ impl World {
 
         // 2) Moisture dynamics — wetting from water contact, heat-driven and
         // passive evaporation *only on cells touching air* (surface-first).
+        //
+        // Derived compound cells in solid phases (Gravel/Powder/Solid) absorb
+        // and wick moisture too — without this, hydration-shifting compounds
+        // (CoCl₂, CuCl) sit in water with moisture=0 and never trigger their
+        // wet-color shift. Liquid/gas-phase derived cells skip absorption
+        // because molten salts and HCl gas shouldn't behave like wet sand.
+        // We use the static MoistureProfile (which is_sink=false for the
+        // Element::Derived stub) as the base, then opt-in solid derived
+        // cells via runtime kind check.
+        let cell_absorbs = |cell: Cell| -> bool {
+            if cell.el.moisture().is_sink { return true; }
+            if cell.el == Element::Derived {
+                let kind = cell_physics(cell).kind;
+                return matches!(kind, Kind::Solid | Kind::Gravel | Kind::Powder);
+            }
+            false
+        };
+        let cell_moisture_conductivity = |cell: Cell| -> f32 {
+            let k = cell.el.moisture().conductivity;
+            if k > 0.0 { return k; }
+            // Default conductivity for derived solids — matches Sand's
+            // 0.08 ballpark so a CuCl pile in water saturates over a
+            // few seconds rather than only the surface layer.
+            if cell.el == Element::Derived {
+                let kind = cell_physics(cell).kind;
+                if matches!(kind, Kind::Solid | Kind::Gravel | Kind::Powder) {
+                    return 0.06;
+                }
+            }
+            0.0
+        };
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -5366,7 +6197,7 @@ impl World {
 
                 // Absorption from any adjacent moisture source (water, ice, mud).
                 // Non-sinks (oil, stone-wise no, but oil is hydrophobic here) skip.
-                if c.moisture < 250 && c.el.moisture().is_sink {
+                if c.moisture < 250 && cell_absorbs(c) {
                     for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                         let n = self.get(x + dx, y + dy).el;
                         if n.moisture().is_source {
@@ -5380,18 +6211,18 @@ impl World {
                 // Moisture shares with every drier non-water neighbor, scaled
                 // by the bottleneck material's conductivity.
                 let c = self.cells[i];
-                let my_k = c.el.moisture().conductivity;
-                if c.moisture > 5 && my_k > 0.0 && c.el.moisture().is_sink {
+                let my_k = cell_moisture_conductivity(c);
+                if c.moisture > 5 && my_k > 0.0 && cell_absorbs(c) {
                     for (dx, dy) in [(1i32, 0), (-1, 0), (0, 1), (0, -1)] {
                         if !Self::in_bounds(x + dx, y + dy) { continue; }
                         let nidx = Self::idx(x + dx, y + dy);
                         let n = self.cells[nidx];
-                        if !n.el.moisture().is_sink { continue; }
+                        if !cell_absorbs(n) { continue; }
                         // Don't pump moisture INTO cells past boiling — water
                         // doesn't travel into a cell that's actively evaporating,
                         // otherwise wet neighbors shield hot ones indefinitely.
                         if n.temp > 100 { continue; }
-                        let k = my_k.min(n.el.moisture().conductivity);
+                        let k = my_k.min(cell_moisture_conductivity(n));
                         if k <= 0.0 { continue; }
                         let cm = self.cells[i].moisture as i16;
                         let nm = n.moisture as i16;
@@ -5475,6 +6306,40 @@ impl World {
                         if let Some(dur) = c.el.thermal().burn_duration {
                             self.cells[i].burn = dur;
                             self.cells[i].moisture = 0;
+                        }
+                        // Porous flammables (leaves at 0.95, seed at 0.55,
+                        // gunpowder at 0.60) chain-ignite via flame jumping
+                        // through air gaps — the thermal-conduction model
+                        // is too slow to capture this. Without explicit
+                        // chain, a leaves pile only ignites cells in
+                        // direct torch contact, then those snuff out
+                        // before neighbors heat past ignite_above. Result
+                        // looks like "leaves won't ignite" even though
+                        // each contact cell flashes briefly. Threshold
+                        // 0.5 includes leaves/seed/gunpowder but excludes
+                        // wood (0.15) / oil (0.05) / carbon (0.20) / P
+                        // (0.05) which legitimately propagate by heat.
+                        if c.el.thermal().air_permeability >= 0.5 {
+                            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                                let nx = x + dx;
+                                let ny = y + dy;
+                                if !Self::in_bounds(nx, ny) { continue; }
+                                let ni = Self::idx(nx, ny);
+                                if self.cells[ni].el == c.el
+                                    && self.cells[ni].burn == 0
+                                {
+                                    if let Some(dur) =
+                                        c.el.thermal().burn_duration
+                                    {
+                                        self.cells[ni].burn = dur;
+                                        self.cells[ni].moisture = 0;
+                                        let t_self = self.cells[i].temp;
+                                        if self.cells[ni].temp < t_self {
+                                            self.cells[ni].temp = t_self;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // Detonation path — gunpowder emits a shockwave on
                         // ignition and immediately chain-ignites adjacent
@@ -5604,6 +6469,118 @@ impl World {
                                 let mut ch = Cell::new(Element::C);
                                 ch.temp = 450;
                                 self.cells[i] = ch;
+                            } else if c.el == Element::P {
+                                // Phosphorus burns to P₂O₅ (white smoke
+                                // in real life). Use the derived
+                                // registry entry so it's the same
+                                // compound the chemistry path would
+                                // produce — unified identity.
+                                if let Some(p2o5_id) = derive_or_lookup(
+                                    Element::P, Element::O)
+                                {
+                                    let mut p2o5 = Cell::new(Element::Derived);
+                                    p2o5.derived_id = p2o5_id;
+                                    p2o5.temp = 500;
+                                    self.cells[i] = p2o5;
+                                } else {
+                                    let mut sm = Cell::new(Element::CO2);
+                                    sm.temp = 500;
+                                    self.cells[i] = sm;
+                                }
+                            } else if c.el == Element::S {
+                                // Sulfur burns to SO₃ (well, mostly SO₂
+                                // in real life — but our valence math
+                                // produces 1:3 stoichiometry for S+O).
+                                // Either way, oxide of sulfur, not
+                                // CO₂. Real S flame is the iconic blue
+                                // we just added a flame_color for.
+                                if let Some(sox_id) = derive_or_lookup(
+                                    Element::S, Element::O)
+                                {
+                                    let mut sox = Cell::new(Element::Derived);
+                                    sox.derived_id = sox_id;
+                                    sox.temp = 500;
+                                    self.cells[i] = sox;
+                                } else {
+                                    let mut sm = Cell::new(Element::CO2);
+                                    sm.temp = 500;
+                                    self.cells[i] = sm;
+                                }
+                            } else if is_atomic_metal(c.el) {
+                                // Burning metals leave their oxide as
+                                // residue (Ca → CaO, Li → Li₂O, etc.)
+                                // — NOT CO₂. Bulk transition metals
+                                // (Ti, Be, Sc) don't ignite; oxide
+                                // formation for those goes through the
+                                // chemistry pass instead, see
+                                // oxide_decomposition_threshold.
+                                //
+                                // Alkali metals: combustion in air is
+                                // violent and produces an aerosol fume
+                                // (Cs₂O / K₂O / Na₂O smoke) that drifts
+                                // away rather than settling as a solid
+                                // pile — visible as a quick puff in
+                                // real life, then mostly nothing left.
+                                // Without a dispersal pass, every
+                                // single burning Cs cell creates a
+                                // persistent Cs₂O cell, leaving an
+                                // ungodly amount of oxide residue
+                                // where there should be a small pile
+                                // and a puff of smoke. Tier dispersal
+                                // by reactivity: the hyperreactive
+                                // alkalis (Cs/Fr) lose ~95% to
+                                // aerosol; K/Rb ~85%; Na ~70%; Li
+                                // ~50% (less violent burn, more
+                                // residue plausible).
+                                let disperse_p: f32 = match c.el {
+                                    // Alkali. Real combustion is mostly
+                                    // aerosol — visible smoke cloud,
+                                    // not a solid oxide pile. Heavy
+                                    // dispersal across the tier.
+                                    Element::Cs | Element::Fr => 0.99,
+                                    Element::K  | Element::Rb => 0.975,
+                                    Element::Na               => 0.96,
+                                    Element::Li               => 0.925,
+                                    // Alkaline earth. Mg ribbon
+                                    // photoflash vaporizes nearly
+                                    // completely; Sr/Ba/Ra firework
+                                    // burns produce a hot fume cloud
+                                    // with a fraction of glowing
+                                    // oxide particles suspended in it
+                                    // (the firework color comes from
+                                    // the metal in the gas phase, not
+                                    // settled solid). Ca slightly
+                                    // less violent. Be bulk-non-
+                                    // combustible already.
+                                    Element::Mg                       => 0.975,
+                                    Element::Ca                       => 0.90,
+                                    Element::Sr | Element::Ba
+                                    | Element::Ra                     => 0.925,
+                                    _                                 => 0.0,
+                                };
+                                let dispersed = disperse_p > 0.0
+                                    && rand::gen_range::<f32>(0.0, 1.0) < disperse_p;
+                                if dispersed {
+                                    // Visible aerosol/fume: real alkali combustion
+                                    // produces a gray-white smoke cloud, not a
+                                    // void. Spawn hot CO2 (our gas-kind smoke
+                                    // element) so the dispersal reads as a
+                                    // billowing cloud rather than empty space.
+                                    let mut puff = Cell::new(Element::CO2);
+                                    puff.temp = 500;
+                                    self.cells[i] = puff;
+                                } else if let Some(oxide_id) = derive_or_lookup(
+                                    c.el, Element::O)
+                                {
+                                    let mut ox = Cell::new(Element::Derived);
+                                    ox.derived_id = oxide_id;
+                                    ox.temp = 500;
+                                    self.cells[i] = ox;
+                                } else {
+                                    let mut sm = Cell::new(Element::CO2);
+                                    sm.temp = 500;
+                                    self.cells[i] = sm;
+                                }
                             } else {
                                 let mut sm = Cell::new(Element::CO2);
                                 sm.temp = 500;
@@ -5622,8 +6599,34 @@ impl World {
                         // Gunpowder's radial pressure injection was removed —
                         // the shockwave object emitted at ignition carries the
                         // blast now, propagating as a proper traveling wave.
-                        // Emit flame above, sparsely — thinner visual column.
-                        if self.get(x, y - 1).el == Element::Empty
+                        // Emit visible flame. Default sparse upward column
+                        // (1/10 per frame, only Empty above). Porous
+                        // flammables emit more often and can spread to
+                        // a side cell (not all four at once — that
+                        // produced a wall of fire). One Fire cell per
+                        // frame at most, picking a random Empty cardinal.
+                        let porosity = c.el.thermal().air_permeability;
+                        if porosity >= 0.5
+                            && rand::gen_range::<f32>(0.0, 1.0) < 0.40
+                        {
+                            let order = rand::gen_range::<u8>(0, 4);
+                            for k in 0..4 {
+                                let (dx, dy) = match (order + k) % 4 {
+                                    0 => (0i32, -1i32),
+                                    1 => (1, 0),
+                                    2 => (-1, 0),
+                                    _ => (0, 1),
+                                };
+                                let fx = x + dx;
+                                let fy = y + dy;
+                                if !Self::in_bounds(fx, fy) { continue; }
+                                let fi = Self::idx(fx, fy);
+                                if self.cells[fi].el == Element::Empty {
+                                    self.cells[fi] = Cell::new(Element::Fire);
+                                    break;
+                                }
+                            }
+                        } else if self.get(x, y - 1).el == Element::Empty
                             && rand::gen_range::<u16>(0, 10) == 0
                         {
                             self.set(x, y - 1, Cell::new(Element::Fire));
@@ -5726,27 +6729,35 @@ impl World {
                             let solute_el = here.solute_el;
                             let solute_did = here.solute_derived_id;
                             if solute_amt >= 128 && solute_el != Element::Empty {
-                                // Mirror the pure-water flow: water cell
-                                // becomes steam in-place (so boiling happens
-                                // even in a sealed interior — same as pure
-                                // water does). The precipitate *additionally*
-                                // tries to spawn in an adjacent empty so the
-                                // crystal is visible; if no empty exists,
-                                // the solute is lost as vapor (small mass
-                                // loss, acceptable for a sim).
-                                for (dx, dy) in [(0i32, 1i32), (-1, 0), (1, 0), (0, -1)] {
+                                // Supersaturated boil: the water leaves as
+                                // steam, the solute crystallizes. Prefer
+                                // crystal-in-place + steam-in-neighbor (the
+                                // crystal stays where the precipitation
+                                // happens, matching real salt-pan behavior
+                                // where dried-out spots leave visible
+                                // residue). If no empty neighbor for the
+                                // steam, fall back to crystal-in-place
+                                // alone (steam escapes implicitly). Old
+                                // behavior was the inverse — steam in
+                                // place, crystal in neighbor — which lost
+                                // the precipitate when the pool was packed
+                                // and read as "evaporation lost the salt."
+                                let mut crystal = Cell::new(solute_el);
+                                crystal.derived_id = solute_did;
+                                crystal.temp = p.threshold;
+                                let mut steam_placed = false;
+                                for (dx, dy) in [(0i32, -1i32), (1, 0), (-1, 0), (0, 1)] {
                                     if !Self::in_bounds(x + dx, y + dy) { continue; }
                                     let ni = Self::idx(x + dx, y + dy);
                                     if self.cells[ni].el != Element::Empty { continue; }
-                                    let mut crystal = Cell::new(solute_el);
-                                    crystal.derived_id = solute_did;
-                                    crystal.temp = p.threshold;
-                                    self.cells[ni] = crystal;
+                                    let mut steam = Cell::new(p.target);
+                                    steam.temp = p.threshold + 15;
+                                    self.cells[ni] = steam;
+                                    steam_placed = true;
                                     break;
                                 }
-                                let mut tgt = Cell::new(p.target);
-                                tgt.temp = p.threshold + 15;
-                                self.cells[i] = tgt;
+                                self.cells[i] = crystal;
+                                let _ = steam_placed;
                                 changed = true;
                             } else {
                                 // Try to offload whatever solute there is to a
@@ -5865,14 +6876,47 @@ impl World {
                 if !changed {
                     if let Some((thr, donor_el, byproduct_el)) = decomposition_of(c) {
                         if t >= thr {
+                            // Both products inherit the decomp temperature
+                            // (the visible "molten/vapor metal + glowing
+                            // halogen/O"). The thermodynamic gate in the
+                            // chemistry pass keeps them from re-forming the
+                            // parent compound while they're hot — at temps
+                            // ≥ decomp threshold, formation rate is 0; just
+                            // below, it scales smoothly with how cool they
+                            // are. So the falling metal cools through the
+                            // threshold and only starts tarnishing again
+                            // once it's well below — naturally giving it
+                            // time to separate from the released byproduct.
+                            //
+                            // Emerge-temp floor at mp + 100°C: the heat
+                            // source driving decomposition keeps pumping
+                            // energy in, so the metal emerges at least
+                            // molten rather than instantly solid. This is
+                            // why Rust → Fe looks dramatic (Rust threshold
+                            // 3500°C is far above Fe mp 1538°C, so Fe
+                            // erupts as liquid and cascades down). Halide
+                            // thresholds (500-1500°C) are sometimes below
+                            // the donor's mp — without this clamp, decomp
+                            // produces an instant solid hunk and skips
+                            // the molten cascade. The clamp unifies the
+                            // visible behavior: every decomp eruption
+                            // looks like Rust does.
+                            let donor_mp = atom_profile_for(donor_el)
+                                .map(|a| a.melting_point)
+                                .unwrap_or(0);
+                            let emerge_t = (t as i16).max(donor_mp + 100);
                             let mut d = Cell::new(donor_el);
-                            d.temp = t as i16;
+                            d.temp = emerge_t;
                             d.flag |= Cell::FLAG_UPDATED;
                             self.cells[i] = d;
                             // Emit one byproduct (gas atom) into an adjacent
-                            // empty cell. The visible "O₂ evolution" when
-                            // oxides break apart. Stoichiometry is lossy at
-                            // single-cell granularity — that's OK for a sim.
+                            // empty cell. The visible "O₂ evolution" / "I₂
+                            // vapor" when oxides or heavy halides break
+                            // apart. Stoichiometry is lossy at single-cell
+                            // granularity — that's OK for a sim. Byproduct
+                            // inherits the same emerge_t so the released
+                            // gas is hot enough to rise convincingly even
+                            // when decomp threshold is low.
                             for (dx, dy) in [(0i32, -1i32), (1, 0), (-1, 0), (0, 1)] {
                                 let nx = x + dx;
                                 let ny = y + dy;
@@ -5880,7 +6924,7 @@ impl World {
                                 let ni = Self::idx(nx, ny);
                                 if self.cells[ni].el != Element::Empty { continue; }
                                 let mut g = Cell::new(byproduct_el);
-                                g.temp = t as i16;
+                                g.temp = emerge_t;
                                 g.flag |= Cell::FLAG_UPDATED;
                                 self.cells[ni] = g;
                                 break;
@@ -6220,6 +7264,16 @@ impl World {
                 if self.cells[i].is_updated() { continue; }
                 let c = self.cells[i];
                 if c.el == Element::Empty { continue; }
+                // Skip cells in active combustion. The burn cascade is
+                // already consuming this cell (sustaining heat, emitting
+                // Fire, eventually transmuting via burn-end). Letting
+                // the chemistry pass also fire per-frame produces a
+                // per-adjacent-O oxide cell per frame for the entire
+                // burn duration — a tsunami of oxide residue (worst on
+                // alkali metals where activation drops below ambient
+                // and rate is high). Combustion in real chemistry is
+                // a hot rapid process producing aerosol, not a per-
+                // frame deposit. Burn-end handles the residue.
                 // Inert-pair early-out: if this cell has no chemistry
                 // signature, no reaction can fire with any neighbor. Most
                 // of the play space (Stone, Wood, Sand, Empty) hits this
@@ -6232,6 +7286,23 @@ impl World {
                     if !Self::in_bounds(nx, ny) { continue; }
                     let mut ni = Self::idx(nx, ny);
                     if self.cells[ni].is_updated() { continue; }
+                    // Burn-skip: when either cell is in active combustion
+                    // AND the pair would form a metal oxide (acceptor is
+                    // O / water), skip — the burn cascade owns oxide
+                    // formation in this case (alkali combustion was
+                    // producing per-frame oxide tsunamis from chemistry
+                    // running alongside burn-end transmute). For other
+                    // products (halogen chemistry, e.g. burning S + Cl
+                    // → SCl₂; burning P + Br₂ flash → PBr₃), the
+                    // chemistry path SHOULD fire — those are real
+                    // combustion-environment reactions distinct from
+                    // oxide aerosol.
+                    let either_burning = c.burn > 0 || self.cells[ni].burn > 0;
+                    let acceptor_is_oxide_class = matches!(c.el,
+                            Element::O | Element::Water | Element::Ice | Element::Steam)
+                        || matches!(self.cells[ni].el,
+                            Element::O | Element::Water | Element::Ice | Element::Steam);
+                    if either_burning && acceptor_is_oxide_class { continue; }
                     let mut n = self.cells[ni];
                     // Same-element early-out: identical atoms never react
                     // (delta_e = 0). Saves a huge amount of work on Al/gas
@@ -6394,6 +7465,35 @@ impl World {
                     // into each other).
                     if c.is_frozen()  { eff_rate *= 0.02; }
                     if self.cells[ni].is_frozen() { eff_rate *= 0.02; }
+                    // Thermodynamic gate + rate scaling. If a derived
+                    // product would form, look up its decomposition
+                    // threshold. Above the threshold, the forward
+                    // reaction is unfavorable — equilibrium has
+                    // flipped toward decomposition (real chemistry:
+                    // that's what "decomposes at 2400°C" means).
+                    // Just below the threshold, formation is slow;
+                    // far below, it runs at full rate. Multiplying
+                    // eff_rate by a (thr - max_t)/thr factor gives
+                    // smooth hysteresis around equilibrium with no
+                    // arbitrary cooldown timer or special flag —
+                    // hot decomp products refuse to re-form their
+                    // parent compound because the math says so.
+                    let max_reactant_t = c.temp.max(n.temp);
+                    let mut thermo_factor: f32 = 1.0;
+                    for prod in [r.products[0], r.products[1]] {
+                        if prod.el != Element::Derived { continue; }
+                        let thr_opt = derived_hot(prod.derived_id)
+                            .and_then(|h| h.decomposes_above);
+                        let Some(thr) = thr_opt else { continue; };
+                        if max_reactant_t as i32 >= thr as i32 {
+                            thermo_factor = 0.0;
+                            break;
+                        }
+                        let f = (thr as f32 - max_reactant_t as f32)
+                            / (thr as f32).max(1.0);
+                        if f < thermo_factor { thermo_factor = f; }
+                    }
+                    eff_rate *= thermo_factor;
                     if eff_rate < 1.0
                         && rand::gen_range::<f32>(0.0, 1.0) > eff_rate
                     { continue; }
@@ -6420,13 +7520,150 @@ impl World {
                         out
                     };
                     self.cells[i] = spawn(pa, c.temp, r.delta_temp as i32);
+                    // Solute-rescue: if we're about to overwrite a water
+                    // cell that's carrying solute (from prior dissolution
+                    // events), offload that solute to an adjacent water
+                    // cell with room before the chemistry consumes the
+                    // cell into Steam / a fresh product. Without this
+                    // rescue, every Mn+Water → MnO+Steam reaction
+                    // destroys the solute the consumed water cell had
+                    // accumulated, so saturation can never climb past
+                    // the rate at which fresh residue replaces it.
+                    // Same logic as boil_above's offload — preserves
+                    // dissolved species across cell consumption.
+                    let acceptor_was_water = matches!(
+                        self.cells[ni].el,
+                        Element::Water | Element::Ice | Element::Steam
+                    );
+                    let new_acceptor_carries_solute = matches!(
+                        pb.el,
+                        Element::Water | Element::Ice | Element::Steam
+                    );
+                    if acceptor_was_water && !new_acceptor_carries_solute {
+                        let saved_amt = self.cells[ni].solute_amt;
+                        let saved_el  = self.cells[ni].solute_el;
+                        let saved_did = self.cells[ni].solute_derived_id;
+                        if saved_amt > 0 {
+                            let mut remaining = saved_amt;
+                            for (sx, sy) in [(0i32, 1i32), (-1, 0), (1, 0), (0, -1)] {
+                                if remaining == 0 { break; }
+                                let snx = nx + sx;
+                                let sny = ny + sy;
+                                if !Self::in_bounds(snx, sny) { continue; }
+                                let si = Self::idx(snx, sny);
+                                if si == i || si == ni { continue; }
+                                let sn = self.cells[si];
+                                if !matches!(sn.el, Element::Water | Element::Ice) {
+                                    continue;
+                                }
+                                if sn.solute_amt > 0
+                                    && (sn.solute_el != saved_el
+                                        || sn.solute_derived_id != saved_did)
+                                {
+                                    continue;
+                                }
+                                let room = 255u8.saturating_sub(sn.solute_amt);
+                                let take = remaining.min(room);
+                                if take == 0 { continue; }
+                                self.cells[si].solute_el = saved_el;
+                                self.cells[si].solute_derived_id = saved_did;
+                                self.cells[si].solute_amt = sn.solute_amt + take;
+                                remaining -= take;
+                            }
+                        }
+                    }
                     // Virtual-O path: don't materialize a product in Empty.
                     if !virtual_o {
+                        let acceptor_preserved = pb.el == n.el
+                            && pb.derived_id == n.derived_id;
+                        let dt = if acceptor_preserved { 0 } else { r.delta_temp as i32 };
                         let mut cb = Cell::new(pb.el);
                         cb.derived_id = pb.derived_id;
-                        cb.temp = (n.temp as i32 + r.delta_temp as i32).clamp(-273, 5000) as i16;
+                        cb.temp = (n.temp as i32 + dt).clamp(-273, 5000) as i16;
                         cb.flag |= Cell::FLAG_UPDATED;
                         self.cells[ni] = cb;
+                    }
+                    // Optional byproduct gas — emitted into a third
+                    // neighbor when the reaction defines one (slow
+                    // hydrolysis releases H₂ while preserving the water
+                    // cell). Strategy: prefer an Empty cardinal (above-
+                    // surface or air-gap reaction); if none, walk
+                    // upward through water until we find Empty air
+                    // above the pool surface and emit there. Models
+                    // gas bubbles rising out of solution to break at
+                    // the surface. Crucially, this emits into Empty,
+                    // not into Water — the water column is fully
+                    // preserved, only Empty above the surface is
+                    // consumed. If no path to surface (e.g. sealed
+                    // container completely full of water), the H is
+                    // released implicitly (lost as if vented through
+                    // some unmodeled path); accepting that loss is
+                    // better than consuming water.
+                    if let Some(byp_el) = r.byproduct {
+                        let mut emit_at: Option<usize> = None;
+                        for (dx, dy) in [(0i32, -1i32), (1, 0), (-1, 0), (0, 1)] {
+                            let bx = x + dx;
+                            let by = y + dy;
+                            if !Self::in_bounds(bx, by) { continue; }
+                            let bi = Self::idx(bx, by);
+                            if self.cells[bi].el == Element::Empty {
+                                emit_at = Some(bi);
+                                break;
+                            }
+                        }
+                        if emit_at.is_none() {
+                            // Walk upward through water/ice/steam looking
+                            // for air above the pool surface. Stop on
+                            // anything else (wall, metal, gas bubble).
+                            let mut yy = y - 1;
+                            while yy >= 0 {
+                                let ti = Self::idx(x, yy);
+                                let t_el = self.cells[ti].el;
+                                if t_el == Element::Empty {
+                                    emit_at = Some(ti);
+                                    break;
+                                }
+                                if !matches!(t_el, Element::Water | Element::Ice | Element::Steam) {
+                                    break;
+                                }
+                                yy -= 1;
+                            }
+                        }
+                        if let Some(bi) = emit_at {
+                            let mut g = Cell::new(byp_el);
+                            g.temp = c.temp;
+                            g.flag |= Cell::FLAG_UPDATED;
+                            self.cells[bi] = g;
+                        }
+                    }
+                    // Slow-hydrolysis simmer: occasional Steam puff so a
+                    // metal pile reacting in water reads as visibly
+                    // simmering even though we preserve the water cell
+                    // (water → Steam in the products would have
+                    // destroyed solvent and prevented saturation).
+                    // Probabilistic, not stoichiometric — the Steam
+                    // is a visual tag, not actual conserved water.
+                    let is_slow_hydrolysis_pair = matches!(c.el,
+                        Element::Mg | Element::Ca | Element::Sr
+                        | Element::Ba | Element::Ra
+                        | Element::Sc | Element::Mn)
+                        && matches!(n.el, Element::Water | Element::Ice | Element::Steam);
+                    if is_slow_hydrolysis_pair
+                        && rand::gen_range::<f32>(0.0, 1.0) < 0.02
+                    {
+                        for (dx, dy) in [(0i32, -1i32), (1, 0), (-1, 0), (0, 1)] {
+                            let fx = x + dx;
+                            let fy = y + dy;
+                            if !Self::in_bounds(fx, fy) { continue; }
+                            let fi = Self::idx(fx, fy);
+                            if self.cells[fi].el == Element::Empty {
+                                let mut s = Cell::new(Element::Steam);
+                                s.temp = 110;
+                                s.flag |= Cell::FLAG_UPDATED;
+                                self.cells[fi] = s;
+                                break;
+                            }
+                        }
                     }
                     // Combustion-scale exotherms visibly burn: drop a Fire
                     // cell into a random empty neighbor. Without this, a
@@ -6534,8 +7771,14 @@ impl World {
                     let n = self.cells[ni];
                     let Some(ap) = atom_profile_for(n.el) else { continue; };
                     if ap.electronegativity <= 0.0 { continue; }
-                    if ap.electronegativity >= METAL_E_CUTOFF { continue; }
-                    let metal_reactivity = METAL_E_CUTOFF - ap.electronegativity;
+                    // Strict > so Co (EN 1.88) lands inside the
+                    // cutoff while Cu (1.90) still sits above it.
+                    // Co does react with dilute HCl in real life
+                    // (above Cu in the activity series), just slowly;
+                    // the original >= cutoff put Co exactly on the
+                    // boundary and silently excluded it.
+                    if ap.electronegativity > METAL_E_CUTOFF { continue; }
+                    let metal_reactivity = (METAL_E_CUTOFF - ap.electronegativity).max(0.01);
                     let rate = (strength * metal_reactivity * 0.5).min(0.5);
                     if rand::gen_range::<f32>(0.0, 1.0) > rate { continue; }
                     // Build the salt (metal + halogen via the derived
@@ -6580,7 +7823,9 @@ impl World {
     //     2 Al + Fe₂O₃  →  Al₂O₃ + 2 Fe + huge exotherm
     fn thermite(&mut self) {
         if !self.has(Element::Rust) || !self.has(Element::Al) { return; }
-        const BURN_DURATION: u8 = 30;
+        // 60 frames (~1s) per cell, doubled from 30 — slower visible
+        // burn-through with more time per cell at incandescence.
+        const BURN_DURATION: u8 = 60;
         const BURN_TEMP: i16 = 2500;
         // 1700°C — hot enough that the products glow visibly orange/red
         // for many seconds of thermal diffusion before cooling out of
@@ -6609,25 +7854,128 @@ impl World {
                 if c.burn > 0 && matches!(c.el, Element::Rust | Element::Al) {
                     let new_burn = c.burn - 1;
                     if new_burn == 0 {
-                        // Transmute. Rust → Fe, Al → Al₂O₃ slag.
+                        // Transmute. Real thermite stoichiometry:
+                        // 2 Al + Fe₂O₃ → Al₂O₃ + 2 Fe + heat. Per
+                        // cell at our granularity, "every Al becomes
+                        // a full Al₂O₃ cell" produces a slag pile
+                        // roughly equal to the original reactant
+                        // mass — wrong by volume (real Al₂O₃ slag
+                        // is denser than its Al + O₂ inputs by a
+                        // bit, but in our visual cell economy that
+                        // 1:1 conversion reads as a giant ash pile
+                        // that stifles further reaction).
+                        //
+                        // Better cell economy: Rust cells transmute
+                        // to Fe AND consume up to 2 nearby Al cells
+                        // (those Al cells "burn into" the reaction
+                        // as Fire instead of becoming separate slag
+                        // cells). Slag spawns probabilistically near
+                        // the Rust ignition site. Al cells that
+                        // finish their independent burn (no Rust
+                        // partner found) mostly become Fire too,
+                        // with a small chance of leaving a slag
+                        // cell behind. Net: per thermite event,
+                        // ~3 reactant cells → 1 Fe + ~0.3 Al₂O₃ +
+                        // Fire flames. Cascade has room to breathe
+                        // because products don't tile every cell.
                         let new_cell = if c.el == Element::Rust {
-                            let mut f = Cell::new(Element::Fe);
-                            f.temp = FINAL_TEMP;
-                            f.flag |= Cell::FLAG_UPDATED;
-                            f
-                        } else {
-                            let slag = derive_or_lookup(Element::Al, Element::O);
-                            if let Some(id) = slag {
-                                let mut s = Cell::new(Element::Derived);
-                                s.derived_id = id;
-                                s.temp = FINAL_TEMP;
-                                s.flag |= Cell::FLAG_UPDATED;
-                                s
+                            // Consume up to 2 adjacent Al cells —
+                            // they vanish into the heat as Fire.
+                            let mut consumed = 0;
+                            for ddy in -1..=1i32 {
+                                for ddx in -1..=1i32 {
+                                    if ddx == 0 && ddy == 0 { continue; }
+                                    if consumed >= 2 { break; }
+                                    let cx = x + ddx;
+                                    let cy = y + ddy;
+                                    if !Self::in_bounds(cx, cy) { continue; }
+                                    let ci = Self::idx(cx, cy);
+                                    let nc = self.cells[ci];
+                                    if nc.el != Element::Al { continue; }
+                                    let mut fire = Cell::new(Element::Fire);
+                                    fire.temp = FINAL_TEMP;
+                                    fire.flag |= Cell::FLAG_UPDATED;
+                                    self.cells[ci] = fire;
+                                    consumed += 1;
+                                }
+                                if consumed >= 2 { break; }
+                            }
+                            // Spawn one Al₂O₃ slag cell near the
+                            // Rust location, ~30% of the time, in
+                            // an Empty/Fire cardinal. Sparse slag
+                            // matches real thermite visuals (you
+                            // see molten Fe, not a uniform ash).
+                            if consumed > 0
+                                && rand::gen_range::<f32>(0.0, 1.0) < 0.30
+                            {
+                                if let Some(id) = derive_or_lookup(
+                                    Element::Al, Element::O)
+                                {
+                                    for (dx, dy) in [(0i32, -1i32), (1, 0), (-1, 0), (0, 1)] {
+                                        let sx = x + dx;
+                                        let sy = y + dy;
+                                        if !Self::in_bounds(sx, sy) { continue; }
+                                        let si = Self::idx(sx, sy);
+                                        let se = self.cells[si].el;
+                                        if se != Element::Empty
+                                            && se != Element::Fire
+                                        { continue; }
+                                        let mut s = Cell::new(Element::Derived);
+                                        s.derived_id = id;
+                                        s.temp = FINAL_TEMP;
+                                        s.flag |= Cell::FLAG_UPDATED;
+                                        self.cells[si] = s;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Half the Rust cells become Fe; the
+                            // other half "burn off" as Fire. Per-cell
+                            // 1:1 Fe yield was producing visible chunks
+                            // of solid/liquid iron in the middle of
+                            // the reactant pile (real thermite drains
+                            // molten Fe to a small puddle below the
+                            // slag, not a uniform tile of solid metal).
+                            // 50% Fe / 50% Fire keeps a visible Fe
+                            // residue that sinks proportionally to
+                            // its real-world volumetric share without
+                            // overwhelming the visible result.
+                            if rand::gen_range::<f32>(0.0, 1.0) < 0.50 {
+                                let mut f = Cell::new(Element::Fe);
+                                f.temp = FINAL_TEMP;
+                                f.flag |= Cell::FLAG_UPDATED;
+                                f
                             } else {
-                                let mut a = c;
-                                a.burn = 0;
-                                a.flag |= Cell::FLAG_UPDATED;
-                                a
+                                let mut fire = Cell::new(Element::Fire);
+                                fire.temp = FINAL_TEMP;
+                                fire.flag |= Cell::FLAG_UPDATED;
+                                fire
+                            }
+                        } else {
+                            // Al that completed its burn without
+                            // being consumed by a paired Rust event
+                            // mostly becomes Fire too — only a small
+                            // chance of leaving slag.
+                            if rand::gen_range::<f32>(0.0, 1.0) < 0.15 {
+                                let slag = derive_or_lookup(
+                                    Element::Al, Element::O);
+                                if let Some(id) = slag {
+                                    let mut s = Cell::new(Element::Derived);
+                                    s.derived_id = id;
+                                    s.temp = FINAL_TEMP;
+                                    s.flag |= Cell::FLAG_UPDATED;
+                                    s
+                                } else {
+                                    let mut fire = Cell::new(Element::Fire);
+                                    fire.temp = FINAL_TEMP;
+                                    fire.flag |= Cell::FLAG_UPDATED;
+                                    fire
+                                }
+                            } else {
+                                let mut fire = Cell::new(Element::Fire);
+                                fire.temp = FINAL_TEMP;
+                                fire.flag |= Cell::FLAG_UPDATED;
+                                fire
                             }
                         };
                         self.cells[i] = new_cell;
@@ -6730,6 +8078,16 @@ impl World {
                 if c.burn > 0 { continue; }
                 if c.temp < 600 { continue; }
                 if flame_color(c.el).is_none() { continue; }
+                // If this cell can ignite and is currently above its
+                // ignition threshold, the burn cascade is about to take
+                // over — emitting Fire here too would double up with
+                // the burn cascade's emission and produce visible
+                // spam. Most noticeable for elements with a big gap
+                // between ignite_above and the 600°C flame_test floor
+                // (S: 232 vs 600). Skip the cell and let burn handle.
+                if let Some(ig) = c.el.thermal().ignite_above {
+                    if c.temp > ig { continue; }
+                }
                 // Flame-color emission isn't combustion — it's the
                 // tint hot metal vapor adds to an existing flame. So
                 // gate it on either real oxygen presence (a flame
@@ -6837,7 +8195,13 @@ impl World {
         const BURN_TEMP: i16 = 3000;
         const FINAL_TEMP: i16 = 1700;
         const IGNITION: i16 = 470;
-        const HEAT_BROADCAST_DELTA: i16 = 35;
+        // 80°C/frame to neighbors keeps the iconic photoflash chain
+        // alive — without it Mg ribbon ignites only the cell in direct
+        // torch contact, then snuffs before its neighbors heat past
+        // ignition (the conductivity-only path is too slow for the
+        // 470°C ignite threshold and the surface-area-driven real-
+        // world flash).
+        const HEAT_BROADCAST_DELTA: i16 = 80;
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -6940,20 +8304,37 @@ impl World {
                     let c = self.cells[i]; // re-read after possible burn refresh
                     let new_burn = c.burn - 1;
                     if new_burn == 0 {
-                        // Transmute to MgO (Mg+O derived compound).
-                        let new_cell = match derive_or_lookup(Element::Mg, Element::O) {
-                            Some(id) => {
-                                let mut s = Cell::new(Element::Derived);
-                                s.derived_id = id;
-                                s.temp = FINAL_TEMP;
-                                s.flag |= Cell::FLAG_UPDATED;
-                                s
-                            }
-                            None => {
-                                let mut a = c;
-                                a.burn = 0;
-                                a.flag |= Cell::FLAG_UPDATED;
-                                a
+                        // Transmute. Real Mg ribbon photoflash vaporizes
+                        // nearly completely — the iconic puff of white
+                        // smoke is the visible aerosol, with only a
+                        // sliver of MgO settling as visible powder.
+                        // Mirror the alkali/alkaline-earth dispersal
+                        // table from the generic burn-end transmute:
+                        // 97.5% disperse to hot CO2 puff, 2.5% retain
+                        // as MgO. Without this, a Mg pile fully burns
+                        // to a solid MgO pile of the same size,
+                        // missing the smoke-cloud aesthetic.
+                        let dispersed = rand::gen_range::<f32>(0.0, 1.0) < 0.975;
+                        let new_cell = if dispersed {
+                            let mut puff = Cell::new(Element::CO2);
+                            puff.temp = FINAL_TEMP;
+                            puff.flag |= Cell::FLAG_UPDATED;
+                            puff
+                        } else {
+                            match derive_or_lookup(Element::Mg, Element::O) {
+                                Some(id) => {
+                                    let mut s = Cell::new(Element::Derived);
+                                    s.derived_id = id;
+                                    s.temp = FINAL_TEMP;
+                                    s.flag |= Cell::FLAG_UPDATED;
+                                    s
+                                }
+                                None => {
+                                    let mut a = c;
+                                    a.burn = 0;
+                                    a.flag |= Cell::FLAG_UPDATED;
+                                    a
+                                }
                             }
                         };
                         self.cells[i] = new_cell;
@@ -7100,9 +8481,16 @@ impl World {
     // liquid phase. (2) skips ferrous metals (Fe, Ni) which don't amalgamate.
     fn hg_amalgamation(&mut self) {
         if !self.has(Element::Hg) { return; }
-        // Slow reaction so the user sees a gradual amalgam spread,
-        // not a flash conversion of the entire contact line.
-        const RATE: f32 = 0.05;
+        // Real Hg amalgamation (especially with Cu) is gradual — a
+        // copper coin in mercury takes hours to visibly dissolve. The
+        // previous 0.05 rate consumed solid metal on contact, which
+        // read as "Hg eats your metal cell-by-cell every frame." 0.005
+        // drops the visible behavior to a slow creeping infiltration
+        // — the contact line shows amalgam forming, but the parent
+        // metal pile persists across many seconds. Au remains the
+        // exception (real Hg sucks up Au fast); we don't differentiate
+        // per-metal yet but could.
+        const RATE: f32 = 0.005;
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
@@ -7156,15 +8544,52 @@ impl World {
     // this models F + (metal-Cl salt) → (metal-F salt) + Cl gas. Targets
     // both Element::Salt (bespoke NaCl) and any derived metal-Cl compound.
     fn halogen_displacement(&mut self) {
-        if !self.has(Element::F) { return; }
-        const RATE: f32 = 0.30;
-        const REACTION_HEAT: i16 = 200;
+        // Reactivity series F > Cl > Br > I (by electronegativity).
+        // A more-electronegative halogen displaces any less-EN halogen
+        // bound in a metal salt: F kicks out Cl/Br/I, Cl kicks out
+        // Br/I, Br kicks out I. Heat decreases up the series, so
+        // F-displacement is the most exothermic.
+        let any_attacker = self.has(Element::F)
+            || self.has(Element::Cl)
+            || self.has(Element::Br)
+            || self.has(Element::I);
+        if !any_attacker { return; }
+        // Returns the halogen's rank (4 = F, ..., 1 = I); higher is
+        // more reactive. Non-halogens return 0 so any halogen wins.
+        let rank = |el: Element| -> u8 {
+            match el {
+                Element::F  => 4,
+                Element::Cl => 3,
+                Element::Br => 2,
+                Element::I  => 1,
+                _ => 0,
+            }
+        };
+        const REACTION_HEAT_F: i16 = 200;
+        const REACTION_HEAT_CL: i16 = 120;
+        const REACTION_HEAT_BR: i16 = 60;
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
                 if self.cells[i].is_updated() { continue; }
                 let c = self.cells[i];
-                if c.el != Element::F { continue; }
+                let attacker_rank = rank(c.el);
+                if attacker_rank == 0 { continue; }
+                // Per-halogen base rate. F is the most aggressive
+                // (real F₂ displaces every other halogen on contact);
+                // Br is the least, only displacing I.
+                let base_rate: f32 = match c.el {
+                    Element::F  => 0.30,
+                    Element::Cl => 0.20,
+                    Element::Br => 0.12,
+                    _ => continue,
+                };
+                let reaction_heat = match c.el {
+                    Element::F  => REACTION_HEAT_F,
+                    Element::Cl => REACTION_HEAT_CL,
+                    Element::Br => REACTION_HEAT_BR,
+                    _ => 0,
+                };
                 for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
                     let nx = x + dx;
                     let ny = y + dy;
@@ -7172,9 +8597,9 @@ impl World {
                     let ni = Self::idx(nx, ny);
                     if self.cells[ni].is_updated() { continue; }
                     let n = self.cells[ni];
-                    // Identify metal in the chloride salt.
-                    let metal_el: Element = match n.el {
-                        Element::Salt => Element::Na,
+                    // Identify (metal, bound halogen) in the salt.
+                    let (metal_el, bound_halogen): (Element, Element) = match n.el {
+                        Element::Salt => (Element::Na, Element::Cl),
                         Element::Derived => {
                             let m = {
                                 let reg = DERIVED_COMPOUNDS.read();
@@ -7182,34 +8607,43 @@ impl World {
                                     if cd.constituents.len() != 2 { return None; }
                                     let (e0, _) = cd.constituents[0];
                                     let (e1, _) = cd.constituents[1];
-                                    if e0 == Element::Cl { Some(e1) }
-                                    else if e1 == Element::Cl { Some(e0) }
+                                    if rank(e0) > 0 { Some((e1, e0)) }
+                                    else if rank(e1) > 0 { Some((e0, e1)) }
                                     else { None }
                                 })
                             };
                             match m {
-                                Some(metal) => metal,
+                                Some(pair) => pair,
                                 None => continue,
                             }
                         }
                         _ => continue,
                     };
-                    let mut rate = RATE;
+                    // Only displace if the "metal" is actually a metal —
+                    // otherwise interhalogen compounds (ClF₇, BrCl, etc.)
+                    // get mis-detected as halides and the displacement
+                    // runs derive_or_lookup(F, F) → garbage. Halogen-on-
+                    // halogen displacement isn't real chemistry anyway.
+                    if !is_atomic_metal(metal_el) { continue; }
+                    // Attacker must outrank the bound halogen.
+                    if attacker_rank <= rank(bound_halogen) { continue; }
+                    let mut rate = base_rate;
                     if n.is_frozen() { rate *= 0.02; }
                     if rand::gen_range::<f32>(0.0, 1.0) > rate { continue; }
-                    let Some(fluoride_id) = derive_or_lookup(metal_el, Element::F)
+                    let Some(new_salt_id) = derive_or_lookup(metal_el, c.el)
                         else { continue; };
-                    // Halide cell → metal fluoride.
-                    let mut fluoride = Cell::new(Element::Derived);
-                    fluoride.derived_id = fluoride_id;
-                    fluoride.temp = (n.temp as i32 + REACTION_HEAT as i32).min(5000) as i16;
-                    fluoride.flag |= Cell::FLAG_UPDATED;
-                    self.cells[ni] = fluoride;
-                    // F cell → Cl (displaced halogen escapes as gas).
-                    let mut cl = Cell::new(Element::Cl);
-                    cl.temp = (c.temp as i32 + REACTION_HEAT as i32).min(5000) as i16;
-                    cl.flag |= Cell::FLAG_UPDATED;
-                    self.cells[i] = cl;
+                    // Halide cell → new metal halide (with the attacker).
+                    let mut new_salt = Cell::new(Element::Derived);
+                    new_salt.derived_id = new_salt_id;
+                    new_salt.temp = (n.temp as i32 + reaction_heat as i32).min(5000) as i16;
+                    new_salt.flag |= Cell::FLAG_UPDATED;
+                    self.cells[ni] = new_salt;
+                    // Attacker cell → bound halogen (displaced, freed
+                    // back to its elemental form).
+                    let mut freed = Cell::new(bound_halogen);
+                    freed.temp = (c.temp as i32 + reaction_heat as i32).min(5000) as i16;
+                    freed.flag |= Cell::FLAG_UPDATED;
+                    self.cells[i] = freed;
                     break;
                 }
             }
@@ -7507,19 +8941,70 @@ impl World {
     // as the predicate grows.
     fn dissolve(&mut self) {
         if !self.has(Element::Water) { return; }
-        // Water with room (solute_amt < ABSORB_THRESHOLD) will fill up to
-        // 255 on contact with a salt neighbor, consuming the salt cell.
-        // Diffusion (diffuse_solute) lowers saturation over time so fresh
-        // neighbors appear at the salt/water interface and dissolution
-        // continues until the whole water body equilibrates at 255.
-        const ABSORB_THRESHOLD: u8 = 192;
+        // Per-solute saturation cap and per-event fill step. Different
+        // compound classes have wildly different real-world solubility:
+        // NaCl saturates water at ~360 g/L (basically unlimited cap),
+        // but Mn(OH)₂ has Ksp ~10⁻¹³ (effectively insoluble, only a
+        // tiny equilibrium concentration). Treating both with the same
+        // 255-fill-on-contact rate makes hydrolysis residues vanish
+        // like salt does, which is wrong-physics and gameplay-bad
+        // (Mn metal "dissolves before hitting bottom" because its
+        // residue immediately disappears into solute).
+        //
+        // The per-solute split: salts get the original fast-saturating
+        // behavior, hydrolysis residues get a low cap and small step
+        // so they accumulate slowly and reach saturation early — fresh
+        // residue then piles up as visible powder instead of being
+        // continually absorbed. Mixed wastewater pools (multi-species
+        // contamination) get a slightly higher shared cap since
+        // multiple species can independently contribute.
+        // Gate: when water's solute_amt is below this threshold, it
+        // has "room" to absorb more of this solute. Fill: how much
+        // gets added per successful dissolution event. Separating
+        // these lets salts behave as before (gate at the historical
+        // 192 ABSORB_THRESHOLD, fill 255 = one-shot to saturated)
+        // while hydrolysis residues use a low gate AND a small fill
+        // step so they accumulate gradually and saturate early —
+        // matching real Mn(OH)₂ / Mg(OH)₂ low solubility (Ksp ~10⁻¹³).
+        fn solute_gate_for(n: Cell) -> u8 {
+            if n.el == Element::Salt { return 192; }
+            if n.el == Element::Derived {
+                if derived_is_soluble_salt(n.derived_id) { return 192; }
+                // Hydrolysis residue gate raised to 160 (was 64). Real
+                // Mn(OH)₂/Mg(OH)₂ are much less soluble than salts, but
+                // a 64 gate is too low to read visibly after diffusion
+                // spreads the solute across a pool: dump thousands of
+                // Mn cells, see ~23 saturation per cell because the
+                // small per-cell cap diffuses to a vanishing average.
+                // 160 leaves a clear visible-vs-fully-saturated gap
+                // below salt's 192 (so brine still reads as more
+                // saturated than hydrolyzed-metal water) while giving
+                // residue solute enough headroom to be obvious.
+                if derived_is_hydrolysis_residue(n.derived_id) { return 160; }
+            }
+            0
+        }
+        fn solute_fill_for(n: Cell) -> u8 {
+            if n.el == Element::Salt { return 255; }
+            if n.el == Element::Derived {
+                if derived_is_soluble_salt(n.derived_id) { return 255; }
+                // Match fill to gate so each residue cell saturates one
+                // water cell in a single dissolution event. Without
+                // this, dissolution per cell per frame (≈ rate × fill)
+                // gets outpaced by diffusion (~8 units per cell per
+                // frame), so local concentration at the metal-water
+                // interface never builds — solute spreads across the
+                // whole pool and dilutes to invisibility.
+                if derived_is_hydrolysis_residue(n.derived_id) { return 160; }
+            }
+            0
+        }
         const TRY_P: f32 = 0.20;
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
                 let c = self.cells[i];
                 if c.el != Element::Water { continue; }
-                if c.solute_amt >= ABSORB_THRESHOLD { continue; } // no room
                 if rand::gen_range::<f32>(0.0, 1.0) > TRY_P { continue; }
                 for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
                     let nx = x + dx;
@@ -7528,22 +9013,41 @@ impl World {
                     let ni = Self::idx(nx, ny);
                     let n = self.cells[ni];
                     if n.is_frozen() { continue; }
-                    // Soluble: Salt (bespoke NaCl), or any derived ionic
-                    // metal-halide (FeCl, KCl, MgCl₂, …).
-                    let soluble = n.el == Element::Salt
-                        || (n.el == Element::Derived
-                            && derived_is_soluble_salt(n.derived_id));
-                    if !soluble { continue; }
-                    // Different solute already present — don't mix species.
-                    if c.solute_amt > 0
-                        && (c.solute_el != n.el
-                            || c.solute_derived_id != n.derived_id)
-                    {
-                        continue;
+                    let base_gate = solute_gate_for(n);
+                    if base_gate == 0 { continue; }
+                    // Mixed-wastewater gate: when this water carries a
+                    // different solute, the pool can accumulate beyond
+                    // either single-species gate (independent Ksp
+                    // contributions stack). Bumped to 96 vs single-
+                    // species 64 for hydrolysis residue, but still
+                    // capped well below salts' 192 since we're
+                    // assuming the dominant species is residue-tier.
+                    let same_solute = c.solute_el == n.el
+                        && c.solute_derived_id == n.derived_id;
+                    let mixed = c.solute_amt > 0 && !same_solute;
+                    let gate = if mixed { base_gate.max(96) } else { base_gate };
+                    if c.solute_amt >= gate { continue; }
+                    let fill = solute_fill_for(n);
+                    // Saturate at u8::MAX, not at gate — salts fill to
+                    // 255 in one shot (preserves the "saltwater = full
+                    // brine" visual), residues fill incrementally up
+                    // to gate and stop.
+                    let add = fill.min(255_u8.saturating_sub(c.solute_amt));
+                    if add == 0 { continue; }
+                    // Identity update: empty water adopts the new solute,
+                    // matching water keeps it, mismatched contaminates to
+                    // the Mixed wastewater sentinel (solute_el = Empty +
+                    // solute_amt > 0). Identity is lost in mixed pools
+                    // but saturation still works.
+                    if c.solute_amt == 0 || same_solute {
+                        self.cells[i].solute_el = n.el;
+                        self.cells[i].solute_derived_id = n.derived_id;
+                    } else {
+                        self.cells[i].solute_el = Element::Empty;
+                        self.cells[i].solute_derived_id = 0;
                     }
-                    self.cells[i].solute_el = n.el;
-                    self.cells[i].solute_derived_id = n.derived_id;
-                    self.cells[i].solute_amt = 255;
+                    self.cells[i].solute_amt =
+                        c.solute_amt.saturating_add(add);
                     self.cells[ni] = Cell::EMPTY;
                     break;
                 }
@@ -7560,17 +9064,37 @@ impl World {
         // no fresh water ever reaches the remaining salt.
         //
         // Picks a random neighbor per cell per frame. Transfers half the
-        // gap each event, capped at DIFFUSE_MAX so visual mixing looks
+        // gap each event, capped at *_MAX so visual mixing looks
         // gradual rather than snapping to uniform in a frame.
-        const DIFFUSE_P: f32 = 0.35;
-        const DIFFUSE_MAX: u8 = 24;
+        //
+        // Per-solute split: salts (NaCl, AuCl, MgCl₂, …) diffuse fast
+        // for smooth visible mixing — same as the historical 0.35 × 24
+        // rates. Hydrolysis residues (MgO, CaO, MnO, ScO₃, …) diffuse
+        // slowly so local concentration at a metal-water interface
+        // can build to visible saturation before spreading outward
+        // (matches real liquid-phase ion diffusion which is much
+        // slower than visible mixing speeds anyway). Without the
+        // slow tier for residues, the small-amount-per-event from
+        // their dissolution gets out-paced by spread and the pool
+        // never visibly saturates.
+        const SALT_DIFFUSE_P: f32 = 0.35;
+        const SALT_DIFFUSE_MAX: u8 = 24;
+        const RESIDUE_DIFFUSE_P: f32 = 0.05;
+        const RESIDUE_DIFFUSE_MAX: u8 = 4;
         for y in 0..H as i32 {
             for x in 0..W as i32 {
                 let i = Self::idx(x, y);
                 let c = self.cells[i];
                 if c.el != Element::Water { continue; }
                 if c.solute_amt == 0 { continue; }
-                if rand::gen_range::<f32>(0.0, 1.0) > DIFFUSE_P { continue; }
+                let is_residue = c.solute_el == Element::Derived
+                    && derived_is_hydrolysis_residue(c.solute_derived_id);
+                let (diffuse_p, diffuse_max) = if is_residue {
+                    (RESIDUE_DIFFUSE_P, RESIDUE_DIFFUSE_MAX)
+                } else {
+                    (SALT_DIFFUSE_P, SALT_DIFFUSE_MAX)
+                };
+                if rand::gen_range::<f32>(0.0, 1.0) > diffuse_p { continue; }
                 let (dx, dy) = match rand::gen_range::<i32>(0, 4) {
                     0 => (-1i32, 0i32),
                     1 => (1, 0),
@@ -7583,17 +9107,26 @@ impl World {
                 let ni = Self::idx(nx, ny);
                 let n = self.cells[ni];
                 if n.el != Element::Water { continue; }
-                // Don't mix different solutes — keep a FeCl cell and a
-                // NaCl cell distinguishable even in the same water body.
-                if n.solute_amt > 0
+                // Mismatched solutes — different species adjacent. Don't
+                // refuse the diffusion; instead contaminate both cells to
+                // the Mixed sentinel (solute_el → Empty). The two species
+                // are now lost as a pair, but solute_amt remains additive
+                // and the pool saturates correctly. Same Mixed-tier rule
+                // used by dissolve(): identity sacrificed, saturation cap
+                // preserved.
+                let mismatched = n.solute_amt > 0
                     && (n.solute_el != c.solute_el
-                        || n.solute_derived_id != c.solute_derived_id)
-                {
+                        || n.solute_derived_id != c.solute_derived_id);
+                if mismatched {
+                    self.cells[i].solute_el = Element::Empty;
+                    self.cells[i].solute_derived_id = 0;
+                    self.cells[ni].solute_el = Element::Empty;
+                    self.cells[ni].solute_derived_id = 0;
                     continue;
                 }
                 if n.solute_amt >= c.solute_amt { continue; }
                 let gap = c.solute_amt - n.solute_amt;
-                let transfer = (gap / 2).min(DIFFUSE_MAX).max(1);
+                let transfer = (gap / 2).min(diffuse_max).max(1);
                 self.cells[i].solute_amt -= transfer;
                 self.cells[ni].solute_el = c.solute_el;
                 self.cells[ni].solute_derived_id = c.solute_derived_id;
@@ -8995,8 +10528,25 @@ fn measure_ui_text(text: &str, size: u16) -> TextDimensions {
 #[inline]
 fn color_rgb(c: Cell) -> [u8; 3] {
     // Derived compounds pull their color from the runtime registry.
+    // Hydration-shifting compounds (CoCl₂ blue↔pink) interpolate
+    // between their dry and wet colors based on cell.moisture.
+    let mut hydration_overrides_wet_tint = false;
     let (r, g, b) = if c.el == Element::Derived {
-        derived_color_of(c.derived_id)
+        let base = derived_color_of(c.derived_id);
+        if let Some(hot) = derived_hot(c.derived_id) {
+            if let Some(wet) = hot.hydration_color {
+                let m = (c.moisture as f32 / 255.0).clamp(0.0, 1.0);
+                let mix = |a: u8, b: u8| -> u8 {
+                    ((a as f32) * (1.0 - m) + (b as f32) * m) as u8
+                };
+                hydration_overrides_wet_tint = true;
+                (mix(base.0, wet.0), mix(base.1, wet.1), mix(base.2, wet.2))
+            } else {
+                base
+            }
+        } else {
+            base
+        }
     } else {
         c.el.base_color()
     };
@@ -9034,6 +10584,7 @@ fn color_rgb(c: Cell) -> [u8; 3] {
         && c.el != Element::Water
         && c.el != Element::Empty
         && !is_noble_gas
+        && !hydration_overrides_wet_tint
     {
         let wet = ((c.moisture as f32 - 20.0) / 235.0).clamp(0.0, 1.0) * 0.55;
         r = ((r as f32) * (1.0 - wet)) as u8;
@@ -9041,15 +10592,42 @@ fn color_rgb(c: Cell) -> [u8; 3] {
         b = ((b as f32) * (1.0 - wet * 0.6) + 70.0 * wet) as u8;
     }
     // Dissolved solute tints the water toward the solute's own color. Mixes
-    // up to ~0.55 at saturation — enough to read (saltwater pales, FeCl
-    // water yellows, CuCl turns cyan) without losing the water identity.
+    // up to ~0.75 at saturation — enough to read (saltwater pales, FeCl
+    // water yellows, CuCl turns cyan, MnO water browns) without losing
+    // the water identity. For hydrolysis residues (derived oxide of a
+    // slow-tier metal) we tint toward the *donor metal's* color rather
+    // than the averaged compound color: the dissolved species is
+    // effectively the metal cation, and averaging in the O contribution
+    // dilutes the result toward water's own blue and reads as no tint.
+    // Mixed-solute wastewater (solute_el == Empty + solute_amt > 0) uses
+    // a generic gray-brown tint, signaling the pool is contaminated with
+    // multiple unrecoverable species.
     if c.el == Element::Water && c.solute_amt > 0 {
-        let (sr, sg, sb) = if c.solute_el == Element::Derived {
-            derived_color_of(c.solute_derived_id)
+        let (sr, sg, sb) = if c.solute_el == Element::Empty {
+            (110, 95, 75) // wastewater — muted gray-brown
+        } else if c.solute_el == Element::Derived {
+            // Hydration-shifting solutes (CoCl₂) are always at "fully
+            // wet" when dissolved in water, so use their hydration
+            // color directly — produces the iconic pink CoCl₂
+            // solution. Hydrolysis residues use the donor metal's
+            // color (dissolved species is the metal cation, averaging
+            // in O dilutes toward water blue and reads invisibly).
+            // Other salts/halides use the registered compound color.
+            let hot = derived_hot(c.solute_derived_id);
+            if let Some(wet) = hot.and_then(|h| h.hydration_color) {
+                wet
+            } else if derived_is_hydrolysis_residue(c.solute_derived_id) {
+                let reg = DERIVED_COMPOUNDS.read();
+                reg.get(c.solute_derived_id as usize)
+                    .and_then(|cd| cd.constituents.first().map(|(el, _)| el.base_color()))
+                    .unwrap_or_else(|| derived_color_of(c.solute_derived_id))
+            } else {
+                derived_color_of(c.solute_derived_id)
+            }
         } else {
             c.solute_el.base_color()
         };
-        let t = (c.solute_amt as f32 / 255.0) * 0.55;
+        let t = (c.solute_amt as f32 / 255.0) * 0.75;
         r = ((r as f32) * (1.0 - t) + (sr as f32) * t) as u8;
         g = ((g as f32) * (1.0 - t) + (sg as f32) * t) as u8;
         b = ((b as f32) * (1.0 - t) + (sb as f32) * t) as u8;
@@ -9155,13 +10733,17 @@ fn color_rgb(c: Cell) -> [u8; 3] {
 const TOP_BAR: f32 = 0.0;
 const PANEL_TOP_PAD: f32 = 10.0;
 
-// Paintable compound materials. Wood is intentionally omitted — trees make
-// wood. MoltenGlass is intentionally omitted — you get it by melting sand.
-// Fire is intentionally omitted — it emerges from combustion, driven by the
-// Heat tool raising a fuel's temperature past its ignition threshold.
+// Paintable compound materials. MoltenGlass is intentionally omitted —
+// you get it by melting sand. Fire is intentionally omitted — it
+// emerges from combustion, driven by the Heat tool raising a fuel's
+// temperature past its ignition threshold. Wood was originally
+// omitted (trees grow wood) but added back as a paintable for
+// audit/testing — comparing burn dynamics across Wood vs Leaves vs
+// C is awkward when one of them requires growing a tree first.
 // These live in the periodic-table overlay under the atom grid.
-const COMPOUND_PALETTE: [Element; 18] = [
+const COMPOUND_PALETTE: [Element; 19] = [
     Element::Sand, Element::Water, Element::Stone,
+    Element::Wood,
     Element::CO2, Element::Steam, Element::Lava,
     Element::Obsidian, Element::Seed, Element::Mud, Element::Leaves,
     Element::Oil, Element::Ice, Element::Glass,
@@ -9312,10 +10894,13 @@ fn panel_element_rect(prefab_open: bool, wire_open: bool) -> (f32, f32, f32, f32
     (x, y, w, h)
 }
 
-// Ambient control rows — Temp, O₂, Gravity. Positioned below the element
-// readout with a SIMULATION section header above them. Each row is a hit-
-// target for scroll-on-hover adjustment.
-const PANEL_AMBIENT_COUNT: usize = 3;
+// Ambient control rows — Temp, O₂, Gravity, EMF readout. Positioned
+// below the element readout with a SIMULATION section header above
+// them. First three are hit-targets for scroll-on-hover adjustment.
+// EMF is read-only — shows active galvanic / battery voltage when a
+// circuit is detected, or "—" when nothing is energized. Lets the
+// user immediately see whether their galvanic-cell setup is firing.
+const PANEL_AMBIENT_COUNT: usize = 4;
 fn panel_ambient_rects(prefab_open: bool, wire_open: bool) -> [(f32, f32, f32, f32); PANEL_AMBIENT_COUNT] {
     let el = panel_element_rect(prefab_open, wire_open);
     let x = el.0;
@@ -9589,7 +11174,7 @@ fn draw_compound_detail(el: Element, tx: f32, panel_y: f32) {
     let dim = Color::from_rgba(175, 175, 190, 255);
     let section = Color::from_rgba(130, 140, 170, 255);
 
-    draw_ui_text(&format!("{}    (compound)", el.name()), px, py, 24.0, WHITE);
+    draw_ui_text(&format!("{}    (compound)", el.display_label()), px, py, 24.0, WHITE);
     py += 28.0;
 
     // Physical:
@@ -9609,16 +11194,16 @@ fn draw_compound_detail(el: Element, tx: f32, panel_y: f32) {
     // Thermal phase transitions:
     let mut phase_bits: Vec<String> = Vec::new();
     if let Some(p) = therm.freeze_below {
-        phase_bits.push(format!("freeze → {} below {}°C", p.target.name(), p.threshold));
+        phase_bits.push(format!("freeze → {} below {}°C", p.target.display_label(), p.threshold));
     }
     if let Some(p) = therm.melt_above {
-        phase_bits.push(format!("melt → {} at {}°C", p.target.name(), p.threshold));
+        phase_bits.push(format!("melt → {} at {}°C", p.target.display_label(), p.threshold));
     }
     if let Some(p) = therm.boil_above {
-        phase_bits.push(format!("boil → {} at {}°C", p.target.name(), p.threshold));
+        phase_bits.push(format!("boil → {} at {}°C", p.target.display_label(), p.threshold));
     }
     if let Some(p) = therm.condense_below {
-        phase_bits.push(format!("condense → {} below {}°C", p.target.name(), p.threshold));
+        phase_bits.push(format!("condense → {} below {}°C", p.target.display_label(), p.threshold));
     }
     if let Some(ig) = therm.ignite_above {
         let bt = therm.burn_temp.unwrap_or(0);
@@ -9655,7 +11240,7 @@ fn draw_compound_detail(el: Element, tx: f32, panel_y: f32) {
     if moist.is_source { moist_bits.push("wet source".to_string()); }
     if moist.is_sink   { moist_bits.push("absorbs water".to_string()); }
     if let Some((m, t)) = moist.wet_above {
-        moist_bits.push(format!("→ {} at moisture {}", t.name(), m));
+        moist_bits.push(format!("→ {} at moisture {}", t.display_label(), m));
     }
     if moist_bits.is_empty() && moist.default_moisture == 0 {
         // skip line entirely for dry/inert materials
@@ -10580,7 +12165,10 @@ pub async fn run_game() {
             match i {
                 0 => {
                     // Temp — same step curve as the T+wheel shortcut.
-                    let step: i16 = if shift_scroll { 250 } else { 25 };
+                    // 5°C fine / 50°C shift gives access to chemistry-
+                    // relevant thresholds (e.g. 80°C activation for
+                    // slow-hydrolysis) without forcing big jumps.
+                    let step: i16 = if shift_scroll { 50 } else { 5 };
                     if wheel_y > 0.0 {
                         world.ambient_offset = (world.ambient_offset + step).min(4980);
                     } else if wheel_y < 0.0 {
@@ -10619,8 +12207,11 @@ pub async fn run_game() {
         } else if t_scroll {
             // Hold T + scroll: tweak ambient temperature offset. Displayed
             // ambient = 20°C + offset, so we clamp the offset to cover
-            // -273..=5000°C actual. Shift speeds steps by 10× for fast sweeps.
-            let step: i16 = if shift_scroll { 250 } else { 25 };
+            // -273..=5000°C actual. 5°C fine step lets you hit chemistry
+            // thresholds precisely (the 80°C slow-hydrolysis activation
+            // is reachable with twelve ticks from 20°C ambient); shift
+            // bumps to 50°C for sweeping the full range.
+            let step: i16 = if shift_scroll { 50 } else { 5 };
             if wheel_y > 0.0 {
                 world.ambient_offset = (world.ambient_offset + step).min(4980);
             }
@@ -11572,10 +13163,16 @@ pub async fn run_game() {
             let dim_label = Color::from_rgba(150, 150, 165, 255);
             let value_color = Color::from_rgba(230, 230, 240, 255);
             let ambient_actual = 20 + world.ambient_offset;
+            let emf_label = if world.active_emf > 0.0 {
+                format!("{:.0}V", world.active_emf)
+            } else {
+                "—".to_string()
+            };
             let rows = [
                 ("Temp", format!("{:+}°C", ambient_actual)),
                 ("O₂",   format!("{:.0}%", world.ambient_oxygen * 100.0)),
                 ("Grav", format!("{:.1}×", world.gravity)),
+                ("EMF",  emf_label),
             ];
             for (i, (label, value)) in rows.iter().enumerate() {
                 let r = ar[i];
@@ -11784,7 +13381,7 @@ pub async fn run_game() {
                     let mr_hov = hit_k(mr);
                     draw_panel_button(
                         mr,
-                        &format!("Material: {}", prefab_material.name()),
+                        &format!("Material: {}", prefab_material.display_label()),
                         false, mr_hov,
                     );
                     draw_ui_text(
@@ -11808,7 +13405,7 @@ pub async fn run_game() {
                 );
                 draw_panel_button(
                     mr,
-                    &format!("Material: {}", wire_material.name()),
+                    &format!("Material: {}", wire_material.display_label()),
                     false, mr_hov,
                 );
                 let tr = wire_thickness_rect();
@@ -11866,7 +13463,7 @@ pub async fn run_game() {
                     None => "any (unfiltered)".to_string(),
                     Some((el, did)) => if el == Element::Derived {
                         derived_formula_of(did)
-                    } else { el.name().to_string() },
+                    } else { el.display_label() },
                 };
                 draw_ui_text(&target_text, sr.0 + 10.0, sr.1 + 34.0, 15.0, value_color);
                 let txt = format!("{} / {}", pipet_bucket.len(), PIPET_CAPACITY);
@@ -11898,7 +13495,7 @@ pub async fn run_game() {
                     for &(key, count) in &tally[..shown] {
                         let name = if key.0 == Element::Derived {
                             derived_formula_of(key.1)
-                        } else { key.0.name().to_string() };
+                        } else { key.0.display_label() };
                         let line = format!("{:>4} {}", count, name);
                         draw_ui_text(
                             &line, row_x, row_y, 12.0,
@@ -11975,7 +13572,7 @@ pub async fn run_game() {
                         );
                         let name = if el == Element::Derived {
                             derived_formula_of(did)
-                        } else { el.name().to_string() };
+                        } else { el.display_label() };
                         draw_ui_text(
                             &name, r.0 + 8.0, r.1 + r.3 * 0.5 + 4.0, 12.0,
                             Color::from_rgba(220, 220, 230, 255),
@@ -12014,7 +13611,7 @@ pub async fn run_game() {
                     "{}   B{}",
                     if selected == Element::Derived {
                         derived_formula_of(selected_did)
-                    } else { selected.name().to_string() },
+                    } else { selected.display_label() },
                     brush_radius,
                 ),
                 el_r.0 + 4.0, el_r.1 + el_r.3 - 4.0, 13.0,
@@ -12132,7 +13729,7 @@ pub async fn run_game() {
             let display_name: String = if cell.el == Element::Derived {
                 derived_formula_of(cell.derived_id)
             } else {
-                cell.el.name().to_string()
+                cell.el.display_label()
             };
             let idx_here = gy as usize * W + gx as usize;
             let mut info = format!(
@@ -12153,11 +13750,16 @@ pub async fn run_game() {
                 info.push_str(&format!("  m{}", cell.moisture));
             }
             // Dissolved solute — only shown when a liquid is carrying one.
+            // Mixed-species sentinel (solute_el == Empty + solute_amt > 0)
+            // shows as "Wastewater"; Empty would otherwise fall through
+            // to its "Erase" tool label which reads as a UI bug.
             if cell.solute_amt > 0 {
-                let label = if cell.solute_el == Element::Derived {
+                let label = if cell.solute_el == Element::Empty {
+                    "Wastewater".to_string()
+                } else if cell.solute_el == Element::Derived {
                     derived_formula_of(cell.solute_derived_id)
                 } else {
-                    cell.solute_el.name().to_string()
+                    cell.solute_el.display_label()
                 };
                 info.push_str(&format!("  {} {}", label, cell.solute_amt));
             }
